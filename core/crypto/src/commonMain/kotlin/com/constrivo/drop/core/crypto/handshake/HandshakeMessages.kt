@@ -3,6 +3,7 @@
 package com.constrivo.drop.core.crypto.handshake
 
 import com.constrivo.drop.core.crypto.AeadAlgorithm
+import com.constrivo.drop.core.crypto.Ed25519PublicKeys
 import com.constrivo.drop.core.crypto.cbor.DeterministicCbor
 import com.constrivo.drop.core.crypto.cbor.MalformedCborException
 import kotlinx.serialization.ExperimentalSerializationApi
@@ -32,7 +33,7 @@ internal class HelloMessage(
 ) {
     init {
         require(version >= 0) { "version must be non-negative" }
-        requireSize(identityKey, HandshakeLimits.KEY_SIZE, "identity_pk")
+        requireIdentityKey(identityKey)
         requireSize(commitment, HandshakeLimits.HASH_SIZE, "commitment")
         validatePeerFields(caps, nickname, platform, aead)
         trustedProof?.let { requireSize(it, HandshakeLimits.PROOF_SIZE, "trusted proof") }
@@ -61,7 +62,7 @@ internal class HelloAckMessage(
 ) {
     init {
         require(version >= 0) { "version must be non-negative" }
-        requireSize(identityKey, HandshakeLimits.KEY_SIZE, "identity_pk")
+        requireIdentityKey(identityKey)
         requireSize(ephemeralKey, HandshakeLimits.KEY_SIZE, "eph_pk")
         requireSize(nonce, HandshakeLimits.NONCE_SIZE, "nonce")
         validatePeerFields(caps, nickname, platform, aead)
@@ -131,6 +132,12 @@ private fun requireSize(
     what: String,
 ) {
     require(bytes.size == size) { "$what must be $size bytes, was ${bytes.size}" }
+}
+
+/** A 32-byte Ed25519 key that is not one of the small-order points anyone can sign for ([Ed25519PublicKeys]). */
+private fun requireIdentityKey(identityKey: ByteArray) {
+    requireSize(identityKey, HandshakeLimits.KEY_SIZE, "identity_pk")
+    require(!Ed25519PublicKeys.isSmallOrder(identityKey)) { "identity_pk is a small-order point" }
 }
 
 private fun validatePeerFields(

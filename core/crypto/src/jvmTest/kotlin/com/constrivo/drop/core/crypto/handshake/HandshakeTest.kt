@@ -1,6 +1,7 @@
 package com.constrivo.drop.core.crypto.handshake
 
 import com.constrivo.drop.core.crypto.AeadAlgorithm
+import com.constrivo.drop.core.crypto.CryptoException
 import com.constrivo.drop.core.crypto.JcaCryptoProvider
 import com.constrivo.drop.core.crypto.RawKeyPair
 import com.constrivo.drop.core.crypto.TestFixtures
@@ -73,7 +74,7 @@ class HandshakeTest {
     fun fB2_secureRandomnessHandshakeAgrees() {
         val provider = JcaCryptoProvider()
         val a = HandshakeInitiator(provider, IDENTITY_A, INFO_A)
-        val b = HandshakeResponder(provider, IDENTITY_B, INFO_B)
+        val b = HandshakeResponder(provider, IDENTITY_B, INFO_B, HandshakeGuard())
         val ex = HandshakeHarness.run(a, b)
         assertContentEquals(ex.initiator.sendKey, ex.responder.receiveKey)
         assertEquals(ex.initiator.sas, ex.responder.sas)
@@ -245,14 +246,27 @@ class HandshakeTest {
     }
 
     @Test
-    fun s7_eachStreamGetsOneCipherPerDirection() {
-        val result = HandshakeHarness.run().initiator
+    fun s7_eachStreamGetsOneSenderAndOneOpenedReceiver() {
+        val ex = HandshakeHarness.run()
+        val result = ex.initiator
+        val sender = ex.responder.frameSender(2)
         result.frameSender(2)
-        result.frameReceiver(2)
         assertFailsWith<IllegalStateException> { result.frameSender(2) }
-        assertFailsWith<IllegalStateException> { result.frameReceiver(2) }
         result.frameSender(3)
         assertFailsWith<IllegalArgumentException> { result.frameSender(-1) }
+        assertFailsWith<IllegalArgumentException> { result.frameReceiver(-1) }
+
+        // A receiver takes its stream id when its first frame authenticates; after that no other one can open it.
+        val frame0 = sender.seal(byteArrayOf(0), AAD)
+        val first = result.frameReceiver(2)
+        assertFalse(result.isReceiveStreamOpen(2))
+        first.open(frame0, AAD)
+        assertTrue(result.isReceiveStreamOpen(2))
+        val second = result.frameReceiver(2)
+        assertFailsWith<CryptoException> { second.open(frame0, AAD) }
+        assertFailsWith<CryptoException> { second.open(frame0, AAD) }
+        // The first receiver carries on.
+        assertContentEquals(byteArrayOf(1), first.open(sender.seal(byteArrayOf(1), AAD), AAD))
     }
 
     @Test
@@ -322,6 +336,42 @@ class HandshakeTest {
             val e = assertFailsWith<HandshakeException>(bytes.toHex()) { b.receiveHelloReveal(bytes) }
             assertEquals(HandshakeFailure.MALFORMED_MESSAGE, e.reason)
         }
+    }
+
+    @Test
+    fun smallOrderIdentityKeysAreRefused() {
+        // Under a small-order identity key anyone can sign (raw JCA accepts R = 01 00…00, S = 0 for every message), so
+        // a device with no key could otherwise finish a handshake as that identity.
+        val w = TestFixtures.NEUTRAL_POINT
+        val forged = TestFixtures.FORGED_NEUTRAL_SIGNATURE
+        val goodHello = HelloMessage.decode(initiator().start())
+        for (key in TestFixtures.SMALL_ORDER_KEYS) {
+            val e = assertFailsWith<HandshakeException>(key.toHex()) { responder().receiveHello(helloMap(goodHello, identityKey = key)) }
+            assertEquals(HandshakeFailure.MALFORMED_MESSAGE, e.reason)
+            assertFailsWith<IllegalArgumentException> { goodHello.copy(identityKey = key) }
+        }
+
+        // A HelloAck from identity W with a signature forged over the real transcript.
+        val a = initiator()
+        val hello = a.start()
+        val honest = HelloAckMessage.decode(responder().receiveHello(hello))
+        val entries =
+            arrayOf<Pair<Int, Any?>>(
+                1 to honest.version,
+                2 to w,
+                3 to honest.ephemeralKey,
+                4 to honest.nonce,
+                5 to honest.caps,
+                6 to honest.nickname,
+                7 to honest.platform,
+                8 to honest.aead,
+            )
+        val unsigned = RawCbor.encode(RawCbor.map(*entries))
+        val signedInput = "drop-sig-ack-v1".encodeToByteArray() + transcript(hello, unsigned)
+        assertTrue(TestFixtures.rawJcaEd25519Verify(w, signedInput, forged), "the forgery is valid for plain JCA")
+        assertFalse(crypto.ed25519Verify(w, signedInput, forged))
+        val forgedAck = RawCbor.encode(RawCbor.map(*entries, 10 to forged))
+        assertEquals(HandshakeFailure.MALFORMED_MESSAGE, assertFailsWith<HandshakeException> { a.receiveHelloAck(forgedAck) }.reason)
     }
 
     @Test
@@ -535,6 +585,7 @@ class HandshakeTest {
             TrustedProof.verifyProof(
                 HandshakeHarness.crypto,
                 PAIRING_SECRET,
+                TestFixtures.FIXED_EPOCH,
                 hello.identityKey,
                 hello.commitment,
                 checkNotNull(hello.trustedProof),
@@ -543,6 +594,9 @@ class HandshakeTest {
 
     companion object {
         val PAIRING_SECRET = ByteArray(32) { (0xA0 + it).toByte() }
+
+        /** A frame header `length ‖ type ‖ stream_id`, as associated data. */
+        val AAD = byteArrayOf(0, 0, 0, 17, 0x10, 0, 0, 0, 2)
 
         const val GOLDEN_HELLO =
             "a70101025820d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a035820ba67c4f1d15b27d8b598935d9b089def" +
@@ -563,15 +617,17 @@ class HandshakeTest {
         const val GOLDEN_RECOGNITION_SECRET = "4a0bd1c30fa16adaedadbbe7ef5e7e08230b7fa276dc3a6f1f838589bb3ef521"
         const val GOLDEN_FINISHED_A = "0cb8787526721202ec64db60083de66e4c2102493271e23da8c7522160fed51d"
         const val GOLDEN_FINISHED_B = "0ff13f9bbe6ba705cb53379ca356cdfece3f8840b9b566f7f2bc2de276ae45e2"
+
+        /** [GOLDEN_HELLO] with a trusted proof for epoch [TestFixtures.FIXED_EPOCH] (key 8). */
         const val GOLDEN_HELLO_WITH_PROOF =
             "a80101025820d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a035820ba67c4f1d15b27d8b598935d9b089def" +
-                "94e6be1d54a401323b44c6ef3d218f3a041908190570416e616e7961e280997320506978656c060007010858203665bb9861d4ed496341" +
-                "8ef9f3d9fc1a3551e8edba85ff5d16e28b205ef2230e"
+                "94e6be1d54a401323b44c6ef3d218f3a041908190570416e616e7961e280997320506978656c06000701085820d30e3e58e1b4db705adaa3" +
+                "218ef75e29a8de6ce503e9ea0fc1a9dd17f5ca91c2"
         const val GOLDEN_HELLO_ACK_WITH_TRUST_ACK =
             "aa01010258203d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c035820de9edb7d7b7dc1b4d35b61c2ece43537" +
-                "3f8343c85b78674dadfc7e146f882b4f0450101112131415161718191a1b1c1d1e1f0519108906685468696e6b50616407010801095820" +
-                "a6d3167512dbc20661a98c9d3533fb092c167f8fff0bcb7d3298c9e3882437420a5840a7f74e3e55345ce3b64e895b8c20747d542e9502" +
-                "f4ad4df09bc9286a38953892c21cac8c4da2aa5e02093dddcceed96529c7026b390e88b19f20ea17ac8e1209"
+                "3f8343c85b78674dadfc7e146f882b4f0450101112131415161718191a1b1c1d1e1f0519108906685468696e6b5061640701080109582014" +
+                "a1f2d42e97acbce3fe444b9a299014909466236b78c043183da6ee8a0ea1000a58406eb1554c164e159bcc64964d04f59506ce6c683ac3bf" +
+                "f8a220a95fad6e9a63081a7d087277f23407877162512d199a088224f7860dcd666f612382a88f818405"
 
         fun sha256(bytes: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(bytes)
 

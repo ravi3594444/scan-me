@@ -113,6 +113,8 @@ class JcaCryptoProvider(
         signature: ByteArray,
     ): Boolean {
         if (publicKey.size != 32 || signature.size != 64) return false
+        // JCA verifies without the cofactor and accepts small-order keys, under which anyone can sign.
+        if (Ed25519PublicKeys.isSmallOrder(publicKey)) return false
         return try {
             val key = KeyFactory.getInstance("Ed25519").generatePublic(X509EncodedKeySpec(ED25519_PUBLIC_PREFIX + publicKey))
             Signature.getInstance("Ed25519").run {
@@ -133,52 +135,112 @@ class JcaCryptoProvider(
         return JcaAead(algorithm, key.copyOf())
     }
 
+    /**
+     * One [Cipher] per direction, created on first use and re-initialised with the frame's nonce on every call, so the
+     * hot path does no provider lookup. Calls are serialised on this instance; a [com.constrivo.drop.core.crypto.frame.FrameCipher] stream has one writer
+     * or one reader anyway.
+     */
     private class JcaAead(
         override val algorithm: AeadAlgorithm,
         key: ByteArray,
     ) : Aead {
         private val secretKey =
             SecretKeySpec(key, if (algorithm == AeadAlgorithm.AES_256_GCM) "AES" else "ChaCha20")
+        private var encryptor: Cipher? = null
+        private var decryptor: Cipher? = null
 
+        private fun newCipher(): Cipher =
+            when (algorithm) {
+                AeadAlgorithm.AES_256_GCM -> Cipher.getInstance("AES/GCM/NoPadding")
+                AeadAlgorithm.CHACHA20_POLY1305 -> Cipher.getInstance("ChaCha20-Poly1305")
+            }
+
+        /** The cached cipher for [mode], initialised for [nonce] and [aad]. Call under the instance lock. */
         private fun cipher(
             mode: Int,
             nonce: ByteArray,
+            aad: ByteArray,
         ): Cipher {
             requireSize(nonce, algorithm.nonceSize, "nonce")
-            return when (algorithm) {
-                AeadAlgorithm.AES_256_GCM -> {
-                    Cipher.getInstance("AES/GCM/NoPadding").apply { init(mode, secretKey, GCMParameterSpec(128, nonce)) }
+            val cipher =
+                if (mode == Cipher.ENCRYPT_MODE) {
+                    encryptor ?: newCipher().also { encryptor = it }
+                } else {
+                    decryptor ?: newCipher().also { decryptor = it }
                 }
-
-                AeadAlgorithm.CHACHA20_POLY1305 -> {
-                    Cipher.getInstance("ChaCha20-Poly1305").apply { init(mode, secretKey, IvParameterSpec(nonce)) }
+            val spec =
+                when (algorithm) {
+                    AeadAlgorithm.AES_256_GCM -> GCMParameterSpec(128, nonce)
+                    AeadAlgorithm.CHACHA20_POLY1305 -> IvParameterSpec(nonce)
                 }
+            try {
+                // Every call initialises afresh. SunJCE also refuses to encrypt under the nonce of the previous call.
+                cipher.init(mode, secretKey, spec)
+            } catch (e: GeneralSecurityException) {
+                throw CryptoException("AEAD initialisation failed", e)
             }
+            if (aad.isNotEmpty()) cipher.updateAAD(aad)
+            return cipher
         }
 
         override fun seal(
             nonce: ByteArray,
             plaintext: ByteArray,
             aad: ByteArray,
-        ): ByteArray =
-            cipher(Cipher.ENCRYPT_MODE, nonce).run {
-                if (aad.isNotEmpty()) updateAAD(aad)
-                doFinal(plaintext)
-            }
+        ): ByteArray = synchronized(this) { cipher(Cipher.ENCRYPT_MODE, nonce, aad).doFinal(plaintext) }
 
         override fun open(
             nonce: ByteArray,
             ciphertext: ByteArray,
             aad: ByteArray,
         ): ByteArray =
-            try {
-                cipher(Cipher.DECRYPT_MODE, nonce).run {
-                    if (aad.isNotEmpty()) updateAAD(aad)
-                    doFinal(ciphertext)
+            synchronized(this) {
+                try {
+                    cipher(Cipher.DECRYPT_MODE, nonce, aad).doFinal(ciphertext)
+                } catch (e: GeneralSecurityException) {
+                    throw CryptoException("AEAD authentication failed", e)
                 }
-            } catch (e: GeneralSecurityException) {
-                throw CryptoException("AEAD authentication failed", e)
             }
+
+        override fun seal(
+            nonce: ByteArray,
+            input: ByteArray,
+            inputOffset: Int,
+            inputLength: Int,
+            aad: ByteArray,
+            output: ByteArray,
+            outputOffset: Int,
+        ): Int {
+            Aead.checkRange(input, inputOffset, inputLength, output, outputOffset, inputLength + algorithm.tagSize)
+            return synchronized(this) {
+                try {
+                    // Cipher.doFinal is copy-safe, so the ranges may overlap.
+                    cipher(Cipher.ENCRYPT_MODE, nonce, aad).doFinal(input, inputOffset, inputLength, output, outputOffset)
+                } catch (e: GeneralSecurityException) {
+                    throw CryptoException("AEAD sealing failed", e)
+                }
+            }
+        }
+
+        override fun open(
+            nonce: ByteArray,
+            input: ByteArray,
+            inputOffset: Int,
+            inputLength: Int,
+            aad: ByteArray,
+            output: ByteArray,
+            outputOffset: Int,
+        ): Int {
+            if (inputLength < algorithm.tagSize) throw CryptoException("ciphertext is shorter than an AEAD tag")
+            Aead.checkRange(input, inputOffset, inputLength, output, outputOffset, inputLength - algorithm.tagSize)
+            return synchronized(this) {
+                try {
+                    cipher(Cipher.DECRYPT_MODE, nonce, aad).doFinal(input, inputOffset, inputLength, output, outputOffset)
+                } catch (e: GeneralSecurityException) {
+                    throw CryptoException("AEAD authentication failed", e)
+                }
+            }
+        }
     }
 
     private companion object {

@@ -17,9 +17,10 @@ import com.constrivo.drop.core.crypto.frame.FrameCipher
  * Key confirmation (N2): each side's first encrypted control payload (stream 0, counter 0) is [localFinished]; on
  * receiving the peer's, call [verifyPeerFinished] before acting on anything else from the peer.
  *
- * Frame keys: [frameSender] and [frameReceiver] hand out one [FrameCipher] per (direction, stream id) and refuse a
- * second one, so a (key, nonce) pair can never repeat and a stream cannot be replayed onto a new connection. A new
- * link generation after a reconnect needs a new handshake (N3).
+ * Frame keys: [frameSender] and [frameReceiver] are the only way to use the directional keys, which never leave this
+ * object. A session hands out one sender per stream id, so a (key, nonce) pair can never repeat, and accepts one
+ * opened stream per stream id, so a stream cannot be replayed onto a new connection. A new link generation after a
+ * reconnect needs a new handshake (N3).
  */
 class HandshakeResult internal constructor(
     private val crypto: CryptoProvider,
@@ -35,7 +36,14 @@ class HandshakeResult internal constructor(
     val peerNickname: String,
     /** The peer's verified platform code (architecture §5.1). */
     val peerPlatform: Int,
-    /** The six-digit short authentication string, the same on both devices unless someone is in the middle (F-B3). */
+    /**
+     * The six-digit short authentication string, the same on both devices unless someone is in the middle (F-B3).
+     *
+     * When the peer is not yet trusted, show it as soon as this result exists, on both sides, before and regardless
+     * of the Finished exchange: a code that only appears after Finished would let a man in the middle drop the
+     * session unseen whenever its guess is wrong. Never retry an untrusted handshake automatically; each retry is a
+     * fresh guess (architecture §6 note, [PairingAttemptLimiter]).
+     */
     val sas: String,
     /** The negotiated frame AEAD (architecture §7.1). */
     val aead: AeadAlgorithm,
@@ -70,11 +78,14 @@ class HandshakeResult internal constructor(
     /** `device_id` of the peer: SHA-256(identity_pk)[0..16] (architecture §5.3). */
     val peerDeviceId: ByteArray get() = peerDeviceIdBytes.copyOf()
 
-    /** The key this device seals frames with (`k_A→B` for the initiator, `k_B→A` for the responder). */
-    val sendKey: ByteArray get() = sendKeyBytes.copyOf()
+    /**
+     * The key this device seals frames with (`k_A→B` for the initiator, `k_B→A` for the responder). Internal (tests
+     * and golden vectors): a cipher built from the raw key outside [frameSender] would restart the nonce counter.
+     */
+    internal val sendKey: ByteArray get() = sendKeyBytes.copyOf()
 
-    /** The key this device opens the peer's frames with. */
-    val receiveKey: ByteArray get() = receiveKeyBytes.copyOf()
+    /** The key this device opens the peer's frames with. Internal, like [sendKey]. */
+    internal val receiveKey: ByteArray get() = receiveKeyBytes.copyOf()
 
     /**
      * `HKDF(k_session, "drop-recog-v1")`. Store it as the pairing's recognition secret only when this session creates
@@ -130,20 +141,26 @@ class HandshakeResult internal constructor(
     }
 
     /**
-     * The opener for [streamId] under [receiveKey].
+     * An opener for [streamId] under [receiveKey].
      *
-     * @throws IllegalStateException if an opener for [streamId] was already created in this session.
+     * The stream id is taken only when the opener's first frame authenticates, so a forged or corrupted first frame
+     * on a new connection (the opener then fails closed) does not use up the id: the protocol layer drops that
+     * connection and calls this again for the next one. Opening creates no nonce, so several openers may wait for a
+     * first frame at once; the first to authenticate one wins, and any other opener of that stream id then refuses
+     * every frame with [com.constrivo.drop.core.crypto.CryptoException]. Once a stream has been opened, a new
+     * connection for the same id (for example a replay of the old one) always fails.
+     *
      * @throws IllegalArgumentException if [streamId] is negative.
      */
     fun frameReceiver(streamId: Int): FrameCipher {
         require(streamId >= 0) { "stream id must be non-negative, was $streamId" }
-        lock.withLock {
-            check(receiveStreams.add(streamId)) {
-                "stream $streamId already has a receiver in this session; a new link generation needs a new handshake (N3)"
-            }
+        return FrameCipher.opener(crypto, aead, receiveKeyBytes, streamId) {
+            lock.withLock { receiveStreams.add(streamId) }
         }
-        return FrameCipher.opener(crypto, aead, receiveKeyBytes, streamId)
     }
+
+    /** True once an opener of [streamId] has authenticated its first frame in this session. */
+    fun isReceiveStreamOpen(streamId: Int): Boolean = lock.withLock { streamId in receiveStreams }
 
     override fun toString(): String = "HandshakeResult(role=$role, peer=${peerNickname.take(16)}, aead=$aead)"
 }

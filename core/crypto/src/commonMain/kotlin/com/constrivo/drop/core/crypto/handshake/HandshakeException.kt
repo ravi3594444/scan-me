@@ -25,8 +25,18 @@ enum class HandshakeFailure {
     /** The peer claims this device's own identity key (a reflected or looped-back handshake). */
     REFLECTED_IDENTITY,
 
-    /** This device is in Trusted-only mode and the `Hello` carried no valid proof of a pairing (§5.3). */
+    /**
+     * This device is in Trusted-only mode and the `Hello` carried no valid proof of a pairing (§5.3): none, one under
+     * another secret or from another epoch, or one this device has already accepted (a replay).
+     */
     TRUST_PROOF_REQUIRED,
+
+    /**
+     * Refused before anything about this device was sent: too many untrusted handshakes ended unverified recently,
+     * or another one is in flight ([PairingAttemptLimiter]), or the trusted-proof replay cache is full
+     * ([HandshakeGuard]). Not the peer's fault as such; try again later.
+     */
+    RATE_LIMITED,
 
     /** The peer's `HelloAck` carried a trust ack although no proof was sent. */
     UNEXPECTED_TRUST_ACK,

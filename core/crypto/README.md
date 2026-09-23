@@ -9,8 +9,8 @@ Package `com.constrivo.drop.core.crypto`. Kotlin Multiplatform: pure logic in `s
 
 | Package | What | Main types |
 | --- | --- | --- |
-| `crypto` | Primitives and identity | `CryptoProvider` (+ `JcaCryptoProvider`), `Aead`, `AeadAlgorithm`, `IdentityKey`, `SoftwareIdentityKeyStore`, `SecretStorage`, `InMemorySecretStorage`, `deviceId()`, `CryptoException` |
-| `crypto.handshake` | Commit-then-reveal handshake as pure state machines | `HandshakeInitiator`, `HandshakeResponder`, `HandshakeResult`, `LocalPeerInfo`, `ExpectedPeer`, `TrustedPeerLookup`, `HandshakeException` / `HandshakeFailure` |
+| `crypto` | Primitives and identity | `CryptoProvider` (+ `JcaCryptoProvider`), `Aead`, `AeadAlgorithm`, `Ed25519PublicKeys`, `IdentityKey`, `SoftwareIdentityKeyStore`, `SecretStorage`, `InMemorySecretStorage`, `deviceId()`, `CryptoException` |
+| `crypto.handshake` | Commit-then-reveal handshake as pure state machines, plus the device-wide guard | `HandshakeInitiator`, `HandshakeResponder`, `HandshakeResult`, `HandshakeGuard`, `PairingAttemptLimiter`, `HandshakeClock`, `LocalPeerInfo`, `ExpectedPeer`, `TrustedPeerLookup`, `HandshakeException` / `HandshakeFailure` |
 | `crypto.frame` | Per-stream AEAD with counter nonces | `FrameCipher`, `FrameLimitException` |
 | `crypto.qr` | Signed "scan to send" payload | `QrPayloadCodec`, `QrPayload`, `QrLink`, `QrPayloadException` / `QrFailure` |
 | `crypto.trust` | Pairing proofs and the shared advertising secret | `TrustedProof`, `AdvertisingSecret`, `AdvertisingSecretStore` |
@@ -22,9 +22,13 @@ A session in five lines:
 val a = HandshakeInitiator(crypto, identity, LocalPeerInfo.forDevice(crypto, caps, "Pixel", platform = 0))
 val hello = a.start()                       // → peer
 val reveal = a.receiveHelloAck(helloAck)    // ← peer's HelloAck, → reveal
-val session = a.result                      // keys, SAS, verified peer info
+val session = a.result                      // keys, SAS (show it now if the peer is untrusted), verified peer info
 val control = session.frameSender(0)        // first frame: control.seal(session.localFinished(), header)
 ```
+
+The responder side takes the device's one `HandshakeGuard` (create it at start-up, share it across every
+responder and transport): it caps untrusted handshakes that end unverified, so a man in the middle cannot probe for a
+matching SAS, and refuses replayed trusted proofs. Call `responder.abort()` when a connection closes mid-handshake.
 
 Golden vectors for every message, the key schedule and the QR payload are in `src/jvmTest`; change them only
 together with the architecture notes.

@@ -5,6 +5,7 @@ import com.constrivo.drop.core.crypto.AeadAlgorithm
 import com.constrivo.drop.core.crypto.CryptoException
 import com.constrivo.drop.core.crypto.CryptoProvider
 import com.constrivo.drop.core.crypto.TestFixtures
+import com.constrivo.drop.core.crypto.handshake.HandshakeGuard
 import com.constrivo.drop.core.crypto.handshake.HandshakeHarness
 import com.constrivo.drop.core.crypto.handshake.HandshakeInitiator
 import com.constrivo.drop.core.crypto.handshake.HandshakeResponder
@@ -96,6 +97,7 @@ class FrameCipherTest {
                 recorder,
                 TestFixtures.IDENTITY_B,
                 HandshakeHarness.INFO_B,
+                HandshakeGuard(),
                 randomness = TestFixtures.fixedRandomness(TestFixtures.EPHEMERAL_B, TestFixtures.NONCE_B),
             )
         val ex = HandshakeHarness.run(initiator, responder)
@@ -200,6 +202,103 @@ class FrameCipherTest {
         // The initiator's own receiver uses k_B→A and must not open its own frames (reflection).
         assertFailsWith<CryptoException> { ex.initiator.frameReceiver(2).open(frame, aad) }
         assertContentEquals(ByteArray(8), ex.responder.frameReceiver(2).open(frame, aad))
+    }
+
+    @Test
+    fun forgedFirstFrameDoesNotUseUpTheStreamId() {
+        val ex = HandshakeHarness.run()
+        val sender = ex.initiator.frameSender(2)
+        // Someone opens a connection for stream 2 first and sends garbage: that opener fails closed ...
+        val forged = ex.responder.frameReceiver(2)
+        assertFailsWith<CryptoException> { forged.open(ByteArray(40) { 7 }, aad) }
+        assertFalse(ex.responder.isReceiveStreamOpen(2))
+        // ... and the real peer's connection for stream 2 still opens.
+        val real = ex.responder.frameReceiver(2)
+        val frames = (0 until 3).map { sender.seal(byteArrayOf(it.toByte()), aad) }
+        assertContentEquals(byteArrayOf(0), real.open(frames[0], aad))
+        assertTrue(ex.responder.isReceiveStreamOpen(2))
+        // Once the stream is open, a new connection for it (here a replay of the genuine frames) is refused.
+        val replay = ex.responder.frameReceiver(2)
+        assertFailsWith<CryptoException> { replay.open(frames[0], aad) }
+        assertFailsWith<CryptoException> { replay.open(frames[1], aad) }
+        assertContentEquals(byteArrayOf(1), real.open(frames[1], aad))
+        // Other stream ids are independent.
+        val other = ex.responder.frameReceiver(3)
+        assertContentEquals(byteArrayOf(9), other.open(ex.initiator.frameSender(3).seal(byteArrayOf(9), aad), aad))
+    }
+
+    @Test
+    fun concurrentOpenersOfOneStreamFirstToAuthenticateWins() {
+        val ex = HandshakeHarness.run()
+        val frame0 = ex.initiator.frameSender(4).seal(ByteArray(3), aad)
+        val first = ex.responder.frameReceiver(4)
+        val second = ex.responder.frameReceiver(4)
+        second.open(frame0, aad)
+        assertFailsWith<CryptoException> { first.open(frame0, aad) }
+    }
+
+    @Test
+    fun offsetFormsMatchTheAllocatingFormsAndShareTheCounter() {
+        for (algorithm in AeadAlgorithm.entries) {
+            val (sealer, opener) = pair(algorithm)
+            val (twinSealer, _) = pair(algorithm)
+            val payload = ByteArray(1000) { (it * 3).toByte() }
+            val buffer = ByteArray(2048)
+            payload.copyInto(buffer, 100)
+
+            // Frame 0: in place, at an offset.
+            val written = sealer.seal(buffer, 100, payload.size, aad, buffer, 100)
+            assertEquals(payload.size + 16, written)
+            assertContentEquals(twinSealer.seal(payload, aad), buffer.copyOfRange(100, 100 + written))
+            // Frame 1: allocating form on the same cipher.
+            val frame1 = sealer.seal(payload, aad)
+            assertContentEquals(twinSealer.seal(payload, aad), frame1)
+            assertEquals(2, sealer.nextCounter)
+
+            // Open frame 0 in place, frame 1 into another array.
+            val opened = opener.open(buffer, 100, written, aad, buffer, 100)
+            assertEquals(payload.size, opened)
+            assertContentEquals(payload, buffer.copyOfRange(100, 100 + opened))
+            val out = ByteArray(payload.size + 5)
+            assertEquals(payload.size, opener.open(frame1, 0, frame1.size, aad, out, 5))
+            assertContentEquals(payload, out.copyOfRange(5, out.size))
+            assertEquals(2, opener.nextCounter)
+            assertEquals(FrameCipher.MAX_PLAINTEXT_BYTES - 2 * payload.size, opener.bytesRemaining)
+        }
+    }
+
+    @Test
+    fun offsetFormsRejectBadRangesWithoutUsingACounter() {
+        val (sealer, opener) = pair(AeadAlgorithm.AES_256_GCM)
+        val input = ByteArray(10)
+        assertFailsWith<IllegalArgumentException> { sealer.seal(input, 5, 6, aad, ByteArray(64), 0) }
+        assertFailsWith<IllegalArgumentException> { sealer.seal(input, -1, 5, aad, ByteArray(64), 0) }
+        assertFailsWith<IllegalArgumentException> { sealer.seal(input, 0, 10, aad, ByteArray(25), 0) }
+        assertFailsWith<IllegalArgumentException> { sealer.seal(input, 0, 10, aad, ByteArray(26), 1) }
+        assertEquals(0, sealer.nextCounter)
+        val frame = sealer.seal(input, aad)
+        assertFailsWith<IllegalArgumentException> { opener.open(frame, 0, frame.size + 1, aad, ByteArray(64), 0) }
+        assertFailsWith<IllegalArgumentException> { opener.open(frame, 0, frame.size, aad, ByteArray(9), 0) }
+        // A programming error does not fail the stream; the frame still opens.
+        assertEquals(10, opener.open(frame, 0, frame.size, aad, ByteArray(10), 0))
+        // A frame shorter than a tag is a peer error: it fails the stream like the allocating form.
+        val (_, opener2) = pair(AeadAlgorithm.AES_256_GCM)
+        assertFailsWith<CryptoException> { opener2.open(frame, 0, 15, aad, ByteArray(0), 0) }
+        assertFailsWith<CryptoException> { opener2.open(sealer.seal(input, aad), aad) }
+    }
+
+    @Test
+    fun offsetFormsKeepTheLimitsAndFailClosed() {
+        val aead = crypto.aead(AeadAlgorithm.CHACHA20_POLY1305, key)
+        val sealer = FrameCipher(aead, 2, FrameCipher.Mode.SEAL, maxPlaintextBytes = 10)
+        val opener = FrameCipher(aead, 2, FrameCipher.Mode.OPEN, maxPlaintextBytes = 10)
+        val buffer = ByteArray(64)
+        val n = sealer.seal(buffer, 0, 8, aad, buffer, 0)
+        assertFailsWith<FrameLimitException> { sealer.seal(buffer, 0, 3, aad, buffer, 32) }
+        assertEquals(8, opener.open(buffer, 0, n, aad, ByteArray(8), 0))
+        val corrupt = sealer.seal(ByteArray(2), aad).also { it[0] = (it[0].toInt() xor 1).toByte() }
+        assertFailsWith<CryptoException> { opener.open(corrupt, 0, corrupt.size, aad, ByteArray(2), 0) }
+        assertFailsWith<CryptoException> { opener.open(ByteArray(18), aad) }
     }
 
     @Test

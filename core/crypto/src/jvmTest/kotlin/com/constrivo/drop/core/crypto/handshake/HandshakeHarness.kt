@@ -2,6 +2,7 @@ package com.constrivo.drop.core.crypto.handshake
 
 import com.constrivo.drop.core.crypto.AeadAlgorithm
 import com.constrivo.drop.core.crypto.CryptoProvider
+import com.constrivo.drop.core.crypto.FakeClock
 import com.constrivo.drop.core.crypto.IdentityKey
 import com.constrivo.drop.core.crypto.TestFixtures
 
@@ -20,8 +21,13 @@ object HandshakeHarness {
         info: LocalPeerInfo = INFO_A,
         expectedPeer: ExpectedPeer? = null,
         randomness: HandshakeRandomness = TestFixtures.fixedRandomness(TestFixtures.EPHEMERAL_A, TestFixtures.NONCE_A),
-    ): HandshakeInitiator = HandshakeInitiator(crypto, identity, info, expectedPeer, randomness)
+        clock: HandshakeClock = FakeClock(),
+    ): HandshakeInitiator = HandshakeInitiator(crypto, identity, info, expectedPeer, randomness, clock)
 
+    /**
+     * A responder. By default each one gets its own [HandshakeGuard] at the golden time, so tests that are not about
+     * rate limiting or replays are not affected by them; tests about those share one guard between responders.
+     */
     fun responder(
         identity: IdentityKey = TestFixtures.IDENTITY_B,
         info: LocalPeerInfo = INFO_B,
@@ -29,7 +35,9 @@ object HandshakeHarness {
         requireTrustedProof: Boolean = false,
         expectedPeerIdentity: ByteArray? = null,
         randomness: HandshakeRandomness = TestFixtures.fixedRandomness(TestFixtures.EPHEMERAL_B, TestFixtures.NONCE_B),
-    ): HandshakeResponder = HandshakeResponder(crypto, identity, info, trustedPeers, requireTrustedProof, expectedPeerIdentity, randomness)
+        guard: HandshakeGuard = HandshakeGuard(FakeClock()),
+    ): HandshakeResponder =
+        HandshakeResponder(crypto, identity, info, guard, trustedPeers, requireTrustedProof, expectedPeerIdentity, randomness)
 
     /** The three messages and both results of one successful exchange. */
     class Exchange(

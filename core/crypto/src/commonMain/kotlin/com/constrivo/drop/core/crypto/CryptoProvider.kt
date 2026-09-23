@@ -40,6 +40,10 @@ interface CryptoProvider {
         message: ByteArray,
     ): ByteArray
 
+    /**
+     * True if [signature] is a valid Ed25519 signature of [message] under [publicKey]. False for wrong sizes and for
+     * the small-order keys in [Ed25519PublicKeys], under which anyone can sign.
+     */
     fun ed25519Verify(
         publicKey: ByteArray,
         message: ByteArray,
@@ -94,7 +98,10 @@ enum class AeadAlgorithm(
     }
 }
 
-/** Authenticated encryption with associated data. Nonces must never repeat for one key. */
+/**
+ * Authenticated encryption with associated data. Nonces must never repeat for one key. Implementations must be
+ * thread-safe.
+ */
 interface Aead {
     val algorithm: AeadAlgorithm
 
@@ -112,8 +119,67 @@ interface Aead {
         aad: ByteArray = EMPTY,
     ): ByteArray
 
+    /**
+     * Seals `input[inputOffset, inputOffset + inputLength)` into [output] at [outputOffset] and returns the number
+     * of bytes written, `inputLength + tagSize`. The ranges may overlap (in-place sealing). The default
+     * implementation copies; providers override it to avoid the allocations.
+     */
+    fun seal(
+        nonce: ByteArray,
+        input: ByteArray,
+        inputOffset: Int,
+        inputLength: Int,
+        aad: ByteArray,
+        output: ByteArray,
+        outputOffset: Int,
+    ): Int {
+        checkRange(input, inputOffset, inputLength, output, outputOffset, inputLength + algorithm.tagSize)
+        val sealed = seal(nonce, input.copyOfRange(inputOffset, inputOffset + inputLength), aad)
+        sealed.copyInto(output, outputOffset)
+        return sealed.size
+    }
+
+    /**
+     * Opens `input[inputOffset, inputOffset + inputLength)` into [output] at [outputOffset] and returns the number of
+     * plaintext bytes written, `inputLength - tagSize`. The ranges may overlap. If authentication fails this throws
+     * [CryptoException], and the output range may hold partial data that must not be used.
+     */
+    fun open(
+        nonce: ByteArray,
+        input: ByteArray,
+        inputOffset: Int,
+        inputLength: Int,
+        aad: ByteArray,
+        output: ByteArray,
+        outputOffset: Int,
+    ): Int {
+        if (inputLength < algorithm.tagSize) throw CryptoException("ciphertext is shorter than an AEAD tag")
+        checkRange(input, inputOffset, inputLength, output, outputOffset, inputLength - algorithm.tagSize)
+        val opened = open(nonce, input.copyOfRange(inputOffset, inputOffset + inputLength), aad)
+        opened.copyInto(output, outputOffset)
+        return opened.size
+    }
+
     companion object {
         val EMPTY = ByteArray(0)
+
+        /**
+         * Checks that `input[inputOffset, +inputLength)` and `output[outputOffset, +outputLength)` lie inside their
+         * arrays. @throws IllegalArgumentException if not.
+         */
+        internal fun checkRange(
+            input: ByteArray,
+            inputOffset: Int,
+            inputLength: Int,
+            output: ByteArray,
+            outputOffset: Int,
+            outputLength: Int,
+        ) {
+            require(inputOffset >= 0 && inputLength >= 0 && inputLength <= input.size - inputOffset) { "input range out of bounds" }
+            require(outputOffset >= 0 && outputLength >= 0 && outputLength <= output.size - outputOffset) {
+                "output needs $outputLength bytes at offset $outputOffset, array has ${output.size}"
+            }
+        }
     }
 }
 

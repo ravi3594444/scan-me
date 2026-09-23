@@ -15,18 +15,27 @@ import com.constrivo.drop.core.crypto.trust.TrustedProof
  * commitment (N1). `B` signs `Hello ‖ HelloAck` and verifies `A`'s signature over all three messages (N2).
  *
  * Use: pass the `Hello` to [receiveHello] → send the returned `HelloAck`; pass the `HelloReveal` to
- * [receiveHelloReveal] → the verified [HandshakeResult]. Each instance runs one handshake. Any
- * [HandshakeException] leaves it failed. Calls out of order throw [IllegalStateException]. Not thread-safe.
+ * [receiveHelloReveal] → the verified [HandshakeResult]. If the connection closes or times out in between, call
+ * [abort]. Each instance runs one handshake. Any [HandshakeException] leaves it failed. Calls out of order throw
+ * [IllegalStateException]. Not thread-safe.
  *
+ * Untrusted handshakes (no valid trusted proof) go through [HandshakeGuard.attempts]: an initiator learns every SAS
+ * input from the `HelloAck`, before it reveals anything, so each untrusted `HelloAck` is one SAS guess for a man in
+ * the middle, and the device-wide limiter caps how many of them end unverified ([PairingAttemptLimiter]).
+ *
+ * @param guard the device's one [HandshakeGuard], shared by all responders: attempt limiter, proof replay cache
+ *   and clock.
  * @param trustedPeers the recognition secrets stored at pairing, used to check a `Hello`'s trusted proof.
  * @param requireTrustedProof true in Trusted-only visibility (architecture §5.3): a `Hello` without a valid proof
- *   is refused with [HandshakeFailure.TRUST_PROOF_REQUIRED] before anything about this device is sent.
+ *   (missing, wrong, stale or replayed) is refused with [HandshakeFailure.TRUST_PROOF_REQUIRED] before anything
+ *   about this device is sent.
  * @param expectedPeerIdentity on a reconnect (N3), the identity key the initiator must have.
  */
 class HandshakeResponder(
     private val crypto: CryptoProvider,
     private val identity: IdentityKey,
     private val local: LocalPeerInfo,
+    private val guard: HandshakeGuard,
     private val trustedPeers: TrustedPeerLookup = TrustedPeerLookup.NONE,
     private val requireTrustedProof: Boolean = false,
     expectedPeerIdentity: ByteArray? = null,
@@ -42,6 +51,7 @@ class HandshakeResponder(
     private var ack: HelloAckMessage? = null
     private var ackBytes: ByteArray? = null
     private var peerProvedTrust = false
+    private var permit: PairingAttemptLimiter.Permit? = null
     private var completed: HandshakeResult? = null
 
     init {
@@ -60,12 +70,25 @@ class HandshakeResponder(
      * Checks the initiator's `Hello` and returns the signed `HelloAck` to send.
      *
      * @throws HandshakeException if the message is malformed, of another version, from an unexpected or reflected
-     *   identity, or lacks a required trusted proof.
+     *   identity, lacks a required trusted proof, or is refused by the attempt limiter
+     *   ([HandshakeFailure.RATE_LIMITED]).
      * @throws CryptoException if a local primitive fails.
      */
     fun receiveHello(bytes: ByteArray): ByteArray {
         check(state == State.AWAITING_HELLO) { "not waiting for Hello (state $state)" }
         return guarded { processHello(bytes.copyOf()) }
+    }
+
+    /**
+     * Ends this handshake unfinished: call when the connection closes, errors or times out before
+     * [receiveHelloReveal] has succeeded. An untrusted handshake that already sent its `HelloAck` counts as a failed
+     * attempt ([PairingAttemptLimiter]). Idempotent; no effect once the handshake is complete.
+     */
+    fun abort() {
+        if (state == State.COMPLETE) return
+        state = State.FAILED
+        wipeEphemeral()
+        settlePermit(succeeded = false)
     }
 
     /**
@@ -94,13 +117,58 @@ class HandshakeResponder(
             throw HandshakeException(HandshakeFailure.PEER_IDENTITY_MISMATCH, "initiator is not the expected device")
         }
         val secret = hello.trustedProof?.let { trustedPeers.recognitionSecretFor(hello.identityKey.copyOf()) }
+        val epoch =
+            secret?.let {
+                TrustedProof.acceptedEpoch(
+                    crypto,
+                    it,
+                    guard.clock.unixSeconds(),
+                    hello.identityKey,
+                    hello.commitment,
+                    checkNotNull(hello.trustedProof),
+                )
+            }
         val proofValid =
-            secret != null &&
-                TrustedProof.verifyProof(crypto, secret, hello.identityKey, hello.commitment, checkNotNull(hello.trustedProof))
+            epoch != null &&
+                when (guard.rememberProof(hello.identityKey, hello.commitment)) {
+                    HandshakeGuard.ProofUse.FIRST -> true
+
+                    HandshakeGuard.ProofUse.REPLAYED -> false
+
+                    HandshakeGuard.ProofUse.CACHE_FULL -> throw HandshakeException(
+                        HandshakeFailure.RATE_LIMITED,
+                        "too many trusted handshakes to remember; try again later",
+                    )
+                }
         if (requireTrustedProof && !proofValid) {
             throw HandshakeException(HandshakeFailure.TRUST_PROOF_REQUIRED, "Trusted-only: Hello has no valid trusted proof")
         }
+        // An untrusted HelloAck hands the initiator every SAS input, so each one is a guess: limit them.
+        val permit =
+            if (proofValid) {
+                null
+            } else {
+                guard.attempts.tryAcquire()
+                    ?: throw HandshakeException(HandshakeFailure.RATE_LIMITED, "untrusted handshakes are rate-limited; try again later")
+            }
+        try {
+            val bytes = buildAck(hello, helloBytes, identityKey, if (proofValid) checkNotNull(secret) else null, epoch ?: 0L)
+            this.permit = permit
+            return bytes
+        } catch (e: Exception) {
+            permit?.cancelled()
+            throw e
+        }
+    }
 
+    /** Signs and stores the `HelloAck`; [secret] is the pairing's recognition secret if the proof was accepted. */
+    private fun buildAck(
+        hello: HelloMessage,
+        helloBytes: ByteArray,
+        identityKey: ByteArray,
+        secret: ByteArray?,
+        epoch: Long,
+    ): ByteArray {
         val pair = randomness.ephemeralKeyPair()
         val nonceB = randomness.nonce()
         check(pair.publicKey.size == HandshakeLimits.KEY_SIZE && pair.privateKey.size == HandshakeLimits.KEY_SIZE) {
@@ -117,7 +185,7 @@ class HandshakeResponder(
                 nickname = local.nickname,
                 platform = local.platform,
                 aead = local.aeadPreference.wireId,
-                trustAck = if (proofValid) TrustedProof.ack(crypto, checkNotNull(secret), identityKey, hello.commitment) else null,
+                trustAck = secret?.let { TrustedProof.ack(crypto, it, epoch, identityKey, hello.commitment) },
             )
         val signed = KeySchedule.transcriptHash(crypto, helloBytes, unsigned.encode())
         val message = unsigned.withSignature(identity.sign(KeySchedule.ackSignatureInput(signed)))
@@ -127,7 +195,7 @@ class HandshakeResponder(
         this.helloBytes = helloBytes
         ack = message
         ackBytes = bytes
-        peerProvedTrust = proofValid
+        peerProvedTrust = secret != null
         state = State.AWAITING_REVEAL
         return bytes.copyOf()
     }
@@ -188,6 +256,7 @@ class HandshakeResponder(
             completed = result
             state = State.COMPLETE
             wipeEphemeral()
+            settlePermit(succeeded = true)
             return result
         } finally {
             sharedSecret.fill(0)
@@ -199,11 +268,18 @@ class HandshakeResponder(
             block()
         } catch (e: Exception) {
             // Peer errors arrive as HandshakeException; anything else is a local failure. Either way this
-            // handshake is over.
+            // handshake is over, and one that sent an untrusted HelloAck counts as a failed attempt.
             state = State.FAILED
             wipeEphemeral()
+            settlePermit(succeeded = false)
             throw e
         }
+
+    private fun settlePermit(succeeded: Boolean) {
+        val held = permit ?: return
+        permit = null
+        if (succeeded) held.succeeded() else held.failed()
+    }
 
     private fun wipeEphemeral() {
         ephemeral?.privateKey?.fill(0)

@@ -133,6 +133,26 @@ class QrPayloadTest {
     }
 
     @Test
+    fun smallOrderIdentityKeyIsRefused() {
+        // Identity W = 01 00…00 with the signature anyone can make for it: a "verified" code without a private key.
+        val w = TestFixtures.NEUTRAL_POINT
+        val unsigned = RawCbor.map(1 to 1, 2 to crypto.deviceId(w), 3 to w, 4 to ephemeralId)
+        val input = "drop-qr-v1".encodeToByteArray() + RawCbor.encode(unsigned)
+        assertTrue(TestFixtures.rawJcaEd25519Verify(w, input, TestFixtures.FORGED_NEUTRAL_SIGNATURE), "the forgery is valid for plain JCA")
+        val forged =
+            RawCbor.encode(
+                RawCbor.map(1 to 1, 2 to crypto.deviceId(w), 3 to w, 4 to ephemeralId, 7 to TestFixtures.FORGED_NEUTRAL_SIGNATURE),
+            )
+        assertEquals(QrFailure.MALFORMED, assertFailsWith<QrPayloadException> { codec.verify(forged, now) }.reason)
+        val text = Base64.getUrlEncoder().withoutPadding().encodeToString(forged)
+        assertEquals(QrFailure.MALFORMED, assertFailsWith<QrPayloadException> { codec.parse(text, now) }.reason)
+        for (key in TestFixtures.SMALL_ORDER_KEYS) {
+            val bytes = RawCbor.encode(RawCbor.map(1 to 1, 2 to crypto.deviceId(key), 3 to key, 4 to ephemeralId, 7 to ByteArray(64)))
+            assertEquals(QrFailure.MALFORMED, assertFailsWith<QrPayloadException>(key.toHex()) { codec.verify(bytes, now) }.reason)
+        }
+    }
+
+    @Test
     fun deviceIdMustMatchTheIdentityKey() {
         val unsigned = QrPayloadWire(QrPayload.VERSION, ByteArray(16) { 7 }, IDENTITY_A.publicKey, ephemeralId)
         val e = assertFailsWith<QrPayloadException> { codec.verify(sign(unsigned), now) }

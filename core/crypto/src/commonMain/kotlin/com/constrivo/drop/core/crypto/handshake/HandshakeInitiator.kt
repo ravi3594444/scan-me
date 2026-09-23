@@ -26,9 +26,14 @@ import com.constrivo.drop.core.crypto.trust.TrustedProof
  * then [result] is available. Each instance runs one handshake. Any [HandshakeException] leaves it failed.
  * Calls out of order throw [IllegalStateException]. Not thread-safe.
  *
+ * The initiator's SAS is fixed once [receiveHelloAck] returns, before the responder learns `eph_pk_A`; a man in the
+ * middle acting as responder learns it from the `HelloReveal`. So the UI shows [HandshakeResult.sas] as soon as the
+ * result exists, and never retries an untrusted handshake automatically: each retry would be another silent guess.
+ *
  * @param expectedPeer the device the caller means to reach (resolved beacon, scanned QR code, or reconnect, N3);
  *   the handshake fails if the responder's identity differs. With a recognition secret the `Hello` carries a
- *   trusted proof.
+ *   trusted proof for the current epoch.
+ * @param clock wall-clock time for the trusted proof's epoch (architecture §5.3).
  */
 class HandshakeInitiator(
     private val crypto: CryptoProvider,
@@ -36,6 +41,7 @@ class HandshakeInitiator(
     private val local: LocalPeerInfo,
     private val expectedPeer: ExpectedPeer? = null,
     private val randomness: HandshakeRandomness = HandshakeRandomness.secure(crypto),
+    private val clock: HandshakeClock = HandshakeClock.SYSTEM,
 ) {
     private enum class State { NEW, AWAITING_HELLO_ACK, COMPLETE, FAILED }
 
@@ -44,6 +50,7 @@ class HandshakeInitiator(
     private var nonceA: ByteArray? = null
     private var helloBytes: ByteArray? = null
     private var hello: HelloMessage? = null
+    private var proofEpoch = 0L
     private var completed: HandshakeResult? = null
 
     /** True once [receiveHelloAck] has succeeded. */
@@ -64,8 +71,9 @@ class HandshakeInitiator(
         }
         check(nonce.size == HandshakeLimits.NONCE_SIZE) { "nonce must be ${HandshakeLimits.NONCE_SIZE} bytes" }
         val commitment = KeySchedule.commitment(crypto, pair.publicKey, nonce)
-        val proof =
-            expectedPeer?.recognitionSecretBytes?.let { TrustedProof.proof(crypto, it, identityKey, commitment) }
+        val secret = expectedPeer?.recognitionSecretBytes
+        val epoch = if (secret != null) TrustedProof.epochOf(clock.unixSeconds()) else 0L
+        val proof = secret?.let { TrustedProof.proof(crypto, it, epoch, identityKey, commitment) }
         val message =
             HelloMessage(
                 version = HandshakeLimits.VERSION,
@@ -82,6 +90,7 @@ class HandshakeInitiator(
         nonceA = nonce.copyOf()
         hello = message
         helloBytes = bytes
+        proofEpoch = epoch
         state = State.AWAITING_HELLO_ACK
         return bytes.copyOf()
     }
@@ -138,7 +147,7 @@ class HandshakeInitiator(
                 }
 
                 else -> {
-                    TrustedProof.verifyAck(crypto, secret, ack.identityKey, hello.commitment, trustAck)
+                    TrustedProof.verifyAck(crypto, secret, proofEpoch, ack.identityKey, hello.commitment, trustAck)
                 }
             }
 

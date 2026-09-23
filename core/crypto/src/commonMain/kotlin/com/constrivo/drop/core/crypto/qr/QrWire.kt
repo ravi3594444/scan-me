@@ -2,6 +2,7 @@
 
 package com.constrivo.drop.core.crypto.qr
 
+import com.constrivo.drop.core.crypto.Ed25519PublicKeys
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.cbor.CborLabel
@@ -25,6 +26,7 @@ internal class QrPayloadWire(
         require(version >= 0) { "version must be non-negative" }
         require(deviceId.size == QrPayload.DEVICE_ID_SIZE) { "id must be ${QrPayload.DEVICE_ID_SIZE} bytes" }
         require(identityKey.size == QrPayload.KEY_SIZE) { "identity_pk must be ${QrPayload.KEY_SIZE} bytes" }
+        require(!Ed25519PublicKeys.isSmallOrder(identityKey)) { "identity_pk is a small-order point" }
         require(ephemeralId.size == QrPayload.EPHEMERAL_ID_SIZE) { "eph_id must be ${QrPayload.EPHEMERAL_ID_SIZE} bytes" }
         require(expiresAt == null || expiresAt > 0) { "exp must be a positive unix time" }
         require(link == null || expiresAt != null) { "a code with link details must expire" }

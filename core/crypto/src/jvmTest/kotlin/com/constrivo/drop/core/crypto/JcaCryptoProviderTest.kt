@@ -101,6 +101,60 @@ class JcaCryptoProviderTest {
     }
 
     @Test
+    fun smallOrderEd25519KeysNeverVerify() {
+        val message = "any message".encodeToByteArray()
+        for (key in TestFixtures.SMALL_ORDER_KEYS) {
+            assertTrue(Ed25519PublicKeys.isSmallOrder(key), key.toHex())
+            // Signatures anyone can make for such a key: R = the neutral element or the key itself, S = 0.
+            val forgeries = listOf(TestFixtures.NEUTRAL_POINT + ByteArray(32), key + ByteArray(32), ByteArray(64))
+            for (signature in forgeries) assertFalse(crypto.ed25519Verify(key, message, signature), key.toHex())
+        }
+        // The attack is real on this JDK: raw JCA accepts the forgery for the neutral element.
+        assertTrue(TestFixtures.rawJcaEd25519Verify(TestFixtures.NEUTRAL_POINT, message, TestFixtures.NEUTRAL_POINT + ByteArray(32)))
+
+        for (honest in listOf(TestFixtures.IDENTITY_A.publicKey, TestFixtures.IDENTITY_B.publicKey, crypto.generateEd25519().publicKey)) {
+            assertFalse(Ed25519PublicKeys.isSmallOrder(honest))
+        }
+        assertFalse(Ed25519PublicKeys.isSmallOrder(ByteArray(31)))
+        assertFalse(Ed25519PublicKeys.isSmallOrder(TestFixtures.NEUTRAL_POINT.copyOf().also { it[1] = 1 }))
+    }
+
+    @Test
+    fun aeadInstanceIsReusableAfterAFailureAndRefusesARepeatedSealNonce() {
+        for (alg in AeadAlgorithm.entries) {
+            val aead = crypto.aead(alg, crypto.randomBytes(32))
+            val n1 = ByteArray(12) { 1 }
+            val n2 = ByteArray(12) { 2 }
+            val sealed = aead.seal(n1, ByteArray(20), Aead.EMPTY)
+            assertFailsWith<CryptoException> { aead.open(n1, sealed.copyOf().also { it[0] = 9 }, Aead.EMPTY) }
+            assertContentEquals(ByteArray(20), aead.open(n1, sealed, Aead.EMPTY))
+            aead.seal(n2, ByteArray(1), Aead.EMPTY)
+            // The cached cipher remembers the last nonce, and SunJCE refuses to seal under it again.
+            assertFailsWith<CryptoException> { aead.seal(n2, ByteArray(1), Aead.EMPTY) }
+            assertFailsWith<CryptoException> { aead.seal(n2, ByteArray(1), Aead.EMPTY) }
+            aead.seal(n1.copyOf().also { it[0] = 7 }, ByteArray(1), Aead.EMPTY)
+            assertContentEquals(ByteArray(20), aead.open(n1, sealed, Aead.EMPTY))
+        }
+    }
+
+    @Test
+    fun aeadOffsetFormsAreCopySafe() {
+        for (alg in AeadAlgorithm.entries) {
+            val aead = crypto.aead(alg, ByteArray(32) { 5 })
+            val nonce = ByteArray(12) { 3 }
+            val plaintext = ByteArray(300) { it.toByte() }
+            val expected = crypto.aead(alg, ByteArray(32) { 5 }).seal(nonce, plaintext, byteArrayOf(1))
+            val buffer = ByteArray(400).also { plaintext.copyInto(it, 50) }
+            assertEquals(316, aead.seal(nonce, buffer, 50, 300, byteArrayOf(1), buffer, 40))
+            assertContentEquals(expected, buffer.copyOfRange(40, 356))
+            assertEquals(300, aead.open(nonce, buffer, 40, 316, byteArrayOf(1), buffer, 60))
+            assertContentEquals(plaintext, buffer.copyOfRange(60, 360))
+            assertFailsWith<CryptoException> { aead.open(nonce, buffer, 0, 15, byteArrayOf(1), buffer, 0) }
+            assertFailsWith<IllegalArgumentException> { aead.seal(ByteArray(12) { 4 }, buffer, 0, 300, Aead.EMPTY, ByteArray(315), 0) }
+        }
+    }
+
+    @Test
     fun deviceIdIsFirst16BytesOfSha256() {
         val pk = crypto.generateEd25519().publicKey
         assertContentEquals(crypto.sha256(pk).copyOf(16), crypto.deviceId(pk))

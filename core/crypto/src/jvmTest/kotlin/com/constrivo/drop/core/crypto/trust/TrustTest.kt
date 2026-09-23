@@ -68,24 +68,57 @@ class TrustTest {
     fun trustedProofMatchesItsDefinition() {
         val secret = ByteArray(32) { (0xA0 + it).toByte() }
         val identity = TestFixtures.IDENTITY_A.publicKey
+        val responder = TestFixtures.IDENTITY_B.publicKey
         val commitment = "ba67c4f1d15b27d8b598935d9b089def94e6be1d54a401323b44c6ef3d218f3a".hexToBytes()
-        val expected = hmac(secret, "drop-proof-v1".encodeToByteArray() + identity + commitment)
-        val proof = TrustedProof.proof(crypto, secret, identity, commitment)
+        val epoch = TestFixtures.FIXED_EPOCH
+        val epochBytes = "00000000001e5918".hexToBytes()
+        assertEquals(0x1e5918L, epoch)
+        val expected = hmac(secret, "drop-proof-v1".encodeToByteArray() + epochBytes + identity + commitment)
+        val proof = TrustedProof.proof(crypto, secret, epoch, identity, commitment)
         assertContentEquals(expected, proof)
         // The golden Hello-with-proof carries exactly this value (HandshakeTest.GOLDEN_HELLO_WITH_PROOF, key 8).
-        assertEquals("3665bb9861d4ed4963418ef9f3d9fc1a3551e8edba85ff5d16e28b205ef2230e", proof.toHex())
-        assertTrue(TrustedProof.verifyProof(crypto, secret, identity, commitment, proof))
-        assertFalse(TrustedProof.verifyProof(crypto, secret, TestFixtures.IDENTITY_B.publicKey, commitment, proof))
-        assertFalse(TrustedProof.verifyProof(crypto, secret, identity, ByteArray(32), proof))
-        assertFalse(TrustedProof.verifyProof(crypto, ByteArray(32), identity, commitment, proof))
-        assertFalse(TrustedProof.verifyProof(crypto, secret, identity, commitment, proof.copyOf(31)))
-        assertFalse(TrustedProof.verifyProof(crypto, secret.copyOf(16), identity, commitment, proof))
+        assertEquals("d30e3e58e1b4db705adaa3218ef75e29a8de6ce503e9ea0fc1a9dd17f5ca91c2", proof.toHex())
+        assertTrue(TrustedProof.verifyProof(crypto, secret, epoch, identity, commitment, proof))
+        assertFalse(TrustedProof.verifyProof(crypto, secret, epoch + 1, identity, commitment, proof), "bound to its epoch")
+        assertFalse(TrustedProof.verifyProof(crypto, secret, epoch, responder, commitment, proof))
+        assertFalse(TrustedProof.verifyProof(crypto, secret, epoch, identity, ByteArray(32), proof))
+        assertFalse(TrustedProof.verifyProof(crypto, ByteArray(32), epoch, identity, commitment, proof))
+        assertFalse(TrustedProof.verifyProof(crypto, secret, epoch, identity, commitment, proof.copyOf(31)))
+        assertFalse(TrustedProof.verifyProof(crypto, secret.copyOf(16), epoch, identity, commitment, proof))
+        assertFalse(TrustedProof.verifyProof(crypto, secret, -1, identity, commitment, proof))
 
-        val ack = TrustedProof.ack(crypto, secret, TestFixtures.IDENTITY_B.publicKey, commitment)
-        assertContentEquals(hmac(secret, "drop-proof-ack-v1".encodeToByteArray() + TestFixtures.IDENTITY_B.publicKey + commitment), ack)
-        assertTrue(TrustedProof.verifyAck(crypto, secret, TestFixtures.IDENTITY_B.publicKey, commitment, ack))
-        assertFalse(TrustedProof.verifyAck(crypto, secret, TestFixtures.IDENTITY_B.publicKey, commitment, proof), "proof ≠ ack")
-        assertFailsWith<IllegalArgumentException> { TrustedProof.proof(crypto, ByteArray(31), identity, commitment) }
+        val ack = TrustedProof.ack(crypto, secret, epoch, responder, commitment)
+        assertContentEquals(hmac(secret, "drop-proof-ack-v1".encodeToByteArray() + epochBytes + responder + commitment), ack)
+        assertEquals("14a1f2d42e97acbce3fe444b9a299014909466236b78c043183da6ee8a0ea100", ack.toHex())
+        assertTrue(TrustedProof.verifyAck(crypto, secret, epoch, responder, commitment, ack))
+        assertFalse(TrustedProof.verifyAck(crypto, secret, epoch - 1, responder, commitment, ack))
+        assertFalse(TrustedProof.verifyAck(crypto, secret, epoch, responder, commitment, proof), "proof ≠ ack")
+        assertFailsWith<IllegalArgumentException> { TrustedProof.proof(crypto, ByteArray(31), epoch, identity, commitment) }
+        assertFailsWith<IllegalArgumentException> { TrustedProof.proof(crypto, secret, -1, identity, commitment) }
+    }
+
+    @Test
+    fun trustedProofEpochIsTheBeaconEpochWithOneEpochTolerance() {
+        assertEquals(TestFixtures.FIXED_EPOCH, TrustedProof.epochOf(TestFixtures.FIXED_UNIX_SECONDS))
+        assertEquals(0, TrustedProof.epochOf(899))
+        assertEquals(1, TrustedProof.epochOf(900))
+        assertEquals(45 * 60, TrustedProof.REPLAY_WINDOW_SECONDS)
+
+        val secret = ByteArray(32) { 3 }
+        val identity = TestFixtures.IDENTITY_A.publicKey
+        val commitment = ByteArray(32) { 4 }
+        val epoch = TestFixtures.FIXED_EPOCH
+        val proof = TrustedProof.proof(crypto, secret, epoch, identity, commitment)
+        val start = epoch * TrustedProof.EPOCH_SECONDS
+
+        fun acceptedAt(now: Long) = TrustedProof.acceptedEpoch(crypto, secret, now, identity, commitment, proof)
+        // Accepted from the start of the previous epoch to the end of the next one.
+        assertEquals(epoch, acceptedAt(start - 900))
+        assertEquals(epoch, acceptedAt(start))
+        assertEquals(epoch, acceptedAt(start + 2 * 900 - 1))
+        assertEquals(null, acceptedAt(start - 900 - 1))
+        assertEquals(null, acceptedAt(start + 2 * 900))
+        assertEquals(null, TrustedProof.acceptedEpoch(crypto, ByteArray(32), start, identity, commitment, proof))
     }
 
     private fun hmac(

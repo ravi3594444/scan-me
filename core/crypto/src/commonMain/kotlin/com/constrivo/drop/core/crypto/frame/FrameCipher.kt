@@ -24,9 +24,12 @@ import com.constrivo.drop.core.crypto.SynchronizedLock
  * even with 8 streams sharing one directional key (2^41 bytes, about 2^37 AES blocks, per key).
  *
  * Fail closed: after any failure an opener refuses every further frame; the stream must be torn down.
- * Exactly one sealer and one opener may exist per (key, stream id) — use
- * [com.constrivo.drop.core.crypto.handshake.HandshakeResult.frameSender] and
- * [com.constrivo.drop.core.crypto.handshake.HandshakeResult.frameReceiver], which enforce that.
+ * The only way to get a cipher is [com.constrivo.drop.core.crypto.handshake.HandshakeResult.frameSender] and
+ * [com.constrivo.drop.core.crypto.handshake.HandshakeResult.frameReceiver]: a session hands out one sealer per stream
+ * id, so a (key, nonce) pair cannot repeat, and accepts one opened stream per stream id.
+ *
+ * Each operation comes in two forms: one that allocates the result, and one that works on caller-supplied arrays
+ * (offset and length) for the data path, so a 64 KiB block needs no payload-sized allocation per frame.
  *
  * [seal] is safe to call from several threads (each call reserves a distinct counter), but frames must reach the
  * wire in counter order, so a stream should have one writer. [open] must be called in wire order by one reader.
@@ -39,6 +42,11 @@ class FrameCipher internal constructor(
     val mode: Mode,
     private val maxFrames: Long = MAX_FRAMES,
     private val maxPlaintextBytes: Long = MAX_PLAINTEXT_BYTES,
+    /**
+     * Openers only: called once, after the first frame authenticates and before its plaintext is returned. False
+     * means another opener already holds this stream id in the session, and the frame is refused.
+     */
+    private val claimOnFirstFrame: (() -> Boolean)? = null,
 ) {
     /** Sender or receiver half of a stream. */
     enum class Mode { SEAL, OPEN }
@@ -52,6 +60,7 @@ class FrameCipher internal constructor(
         require(streamId >= 0) { "stream id must be non-negative, was $streamId" }
         require(maxFrames in 1..MAX_FRAMES) { "maxFrames out of range" }
         require(maxPlaintextBytes in 0..MAX_PLAINTEXT_BYTES) { "maxPlaintextBytes out of range" }
+        require(claimOnFirstFrame == null || mode == Mode.OPEN) { "only openers claim their stream on the first frame" }
     }
 
     /** The AEAD algorithm in use. */
@@ -76,30 +85,58 @@ class FrameCipher internal constructor(
         plaintext: ByteArray,
         aad: ByteArray,
     ): ByteArray {
-        check(mode == Mode.SEAL) { "this FrameCipher opens frames; it cannot seal" }
-        val frameCounter =
-            lock.withLock {
-                if (counter >= maxFrames) throw FrameLimitException("stream $streamId has sealed its $maxFrames frames")
-                if (plaintext.size > maxPlaintextBytes - bytes) {
-                    throw FrameLimitException("stream $streamId would exceed $maxPlaintextBytes payload bytes")
-                }
-                bytes += plaintext.size
-                counter++
-            }
+        val frameCounter = reserveSealCounter(plaintext.size)
         return aead.seal(nonce(streamId, frameCounter), plaintext, aad)
+    }
+
+    /**
+     * Like [seal], without allocating: encrypts `input[inputOffset, inputOffset + inputLength)` into [output] at
+     * [outputOffset] and returns the bytes written, `inputLength + 16`. The ranges may overlap (in-place sealing).
+     *
+     * @throws IllegalArgumentException if a range lies outside its array (no counter is used).
+     * @throws FrameLimitException if the frame or byte limit would be exceeded.
+     * @throws IllegalStateException if this is an opener.
+     */
+    fun seal(
+        input: ByteArray,
+        inputOffset: Int,
+        inputLength: Int,
+        aad: ByteArray,
+        output: ByteArray,
+        outputOffset: Int,
+    ): Int {
+        Aead.checkRange(input, inputOffset, inputLength, output, outputOffset, inputLength + aead.algorithm.tagSize)
+        val frameCounter = reserveSealCounter(inputLength)
+        return aead.seal(nonce(streamId, frameCounter), input, inputOffset, inputLength, aad, output, outputOffset)
+    }
+
+    private fun reserveSealCounter(plaintextSize: Int): Long {
+        check(mode == Mode.SEAL) { "this FrameCipher opens frames; it cannot seal" }
+        return lock.withLock {
+            if (counter >= maxFrames) throw FrameLimitException("stream $streamId has sealed its $maxFrames frames")
+            if (plaintextSize > maxPlaintextBytes - bytes) {
+                throw FrameLimitException("stream $streamId would exceed $maxPlaintextBytes payload bytes")
+            }
+            bytes += plaintextSize
+            counter++
+        }
     }
 
     /**
      * Decrypts the next frame of this stream (the one with counter [nextCounter]).
      *
      * @throws CryptoException if authentication fails (wrong key, stream, AAD, or a replayed, reordered or
-     *   corrupted frame), the frame is shorter than a tag, a limit is exceeded, or an earlier frame failed.
+     *   corrupted frame), the frame is shorter than a tag, a limit is exceeded, an earlier frame failed, or the
+     *   session already has an opened stream with this id.
      * @throws IllegalStateException if this is a sealer.
      */
     fun open(
         ciphertext: ByteArray,
         aad: ByteArray,
-    ): ByteArray = lock.withLock { openLocked(null, ciphertext, aad) }
+    ): ByteArray =
+        lock.withLock {
+            openLocked(null, ciphertext.size, aad) { nonce -> aead.open(nonce, ciphertext, aad) }
+        }
 
     /**
      * Like [open], for transports that carry the counter explicitly: [counter] must equal [nextCounter].
@@ -110,13 +147,43 @@ class FrameCipher internal constructor(
         counter: Long,
         ciphertext: ByteArray,
         aad: ByteArray,
-    ): ByteArray = lock.withLock { openLocked(counter, ciphertext, aad) }
+    ): ByteArray =
+        lock.withLock {
+            openLocked(counter, ciphertext.size, aad) { nonce -> aead.open(nonce, ciphertext, aad) }
+        }
 
-    private fun openLocked(
-        claimedCounter: Long?,
-        ciphertext: ByteArray,
+    /**
+     * Like [open], without allocating: decrypts `input[inputOffset, inputOffset + inputLength)` into [output] at
+     * [outputOffset] and returns the plaintext length, `inputLength - 16`. The ranges may overlap. If this throws, the
+     * output range may hold partial data that must not be used.
+     *
+     * @throws IllegalArgumentException if a range lies outside its array (the stream is not failed).
+     * @throws CryptoException as for [open].
+     */
+    fun open(
+        input: ByteArray,
+        inputOffset: Int,
+        inputLength: Int,
         aad: ByteArray,
-    ): ByteArray {
+        output: ByteArray,
+        outputOffset: Int,
+    ): Int {
+        require(inputOffset >= 0 && inputLength >= 0 && inputLength <= input.size - inputOffset) { "input range out of bounds" }
+        if (inputLength >= aead.algorithm.tagSize) {
+            Aead.checkRange(input, inputOffset, inputLength, output, outputOffset, inputLength - aead.algorithm.tagSize)
+        }
+        return lock.withLock {
+            openLocked(null, inputLength, aad) { nonce -> aead.open(nonce, input, inputOffset, inputLength, aad, output, outputOffset) }
+        }
+    }
+
+    /** Checks the counter and limits, opens with [decrypt] under the current nonce, then advances. Call under [lock]. */
+    private inline fun <T> openLocked(
+        claimedCounter: Long?,
+        ciphertextSize: Int,
+        aad: ByteArray,
+        decrypt: (nonce: ByteArray) -> T,
+    ): T {
         check(mode == Mode.OPEN) { "this FrameCipher seals frames; it cannot open" }
         if (failed) throw CryptoException("stream $streamId already failed; tear it down")
         try {
@@ -124,22 +191,27 @@ class FrameCipher internal constructor(
                 throw CryptoException("stream $streamId expected frame $counter, got $claimedCounter (replay or reorder)")
             }
             if (counter >= maxFrames) throw FrameLimitException("stream $streamId has opened its $maxFrames frames")
-            val payloadSize = ciphertext.size - aead.algorithm.tagSize
+            val payloadSize = ciphertextSize - aead.algorithm.tagSize
             if (payloadSize < 0) throw CryptoException("frame on stream $streamId is shorter than an AEAD tag")
             if (payloadSize > maxPlaintextBytes - bytes) {
                 throw FrameLimitException("stream $streamId would exceed $maxPlaintextBytes payload bytes")
             }
             val plaintext =
                 try {
-                    aead.open(nonce(streamId, counter), ciphertext, aad)
+                    decrypt(nonce(streamId, counter))
                 } catch (e: CryptoException) {
                     throw CryptoException(
                         "frame $counter on stream $streamId failed authentication (replayed, reordered or corrupted)",
                         e,
                     )
                 }
+            if (counter == 0L && claimOnFirstFrame != null && !claimOnFirstFrame.invoke()) {
+                throw CryptoException(
+                    "stream $streamId is already open in this session; a new link generation needs a new handshake (N3)",
+                )
+            }
             counter++
-            bytes += plaintext.size
+            bytes += payloadSize
             return plaintext
         } catch (e: CryptoException) {
             failed = true
@@ -157,21 +229,25 @@ class FrameCipher internal constructor(
         /** Nonce length for both AEADs. */
         const val NONCE_SIZE: Int = 12
 
-        /** A sealer for [streamId] under [key] (the local → peer directional key). */
-        fun sealer(
+        /**
+         * A sealer for [streamId] under [key] (the local → peer directional key). Internal: a second sealer for the
+         * same key and stream would repeat nonces, so callers go through `HandshakeResult.frameSender`.
+         */
+        internal fun sealer(
             crypto: CryptoProvider,
             algorithm: AeadAlgorithm,
             key: ByteArray,
             streamId: Int,
         ): FrameCipher = FrameCipher(crypto.aead(algorithm, key), streamId, Mode.SEAL)
 
-        /** An opener for [streamId] under [key] (the peer → local directional key). */
-        fun opener(
+        /** An opener for [streamId] under [key] (the peer → local directional key); see [claimOnFirstFrame]. */
+        internal fun opener(
             crypto: CryptoProvider,
             algorithm: AeadAlgorithm,
             key: ByteArray,
             streamId: Int,
-        ): FrameCipher = FrameCipher(crypto.aead(algorithm, key), streamId, Mode.OPEN)
+            claimOnFirstFrame: (() -> Boolean)? = null,
+        ): FrameCipher = FrameCipher(crypto.aead(algorithm, key), streamId, Mode.OPEN, claimOnFirstFrame = claimOnFirstFrame)
 
         /** The 12-byte nonce `u32 stream_id ‖ u64 counter`, big-endian. */
         fun nonce(
