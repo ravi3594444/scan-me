@@ -55,7 +55,14 @@ value class Capabilities(
     }
 }
 
-/** Platform glyph on the radar; 3 bits in the beacon (architecture §5.1 offset 24). */
+/**
+ * Platform glyph on the radar; 3 bits in the beacon (architecture §5.1, byte 13 bits 5–3) and the `plat` key of the
+ * mDNS record (§5.4).
+ *
+ * Decoding is lenient: a beacon code or `plat` name this build does not know (a platform added by a later app, say a
+ * tablet) decodes to [UNKNOWN] and the device is shown with a generic glyph, so older scanners still see newer
+ * devices. Encoding is strict: [UNKNOWN] is never sent.
+ */
 enum class DevicePlatform(
     val code: Int,
     val wireName: String,
@@ -64,12 +71,26 @@ enum class DevicePlatform(
     LAPTOP(1, "laptop"),
     DESKTOP(2, "desktop"),
     BROWSER_PROXY(3, "browser"),
+
+    /** A platform this build does not know (beacon codes 4–7, other `plat` names). Received only, never sent. */
+    UNKNOWN(-1, ""),
     ;
 
-    companion object {
-        fun fromCode(code: Int): DevicePlatform? = entries.firstOrNull { it.code == code }
+    /** False only for [UNKNOWN]: whether this platform can be advertised. */
+    val isKnown: Boolean get() = this != UNKNOWN
 
-        fun fromWire(name: String): DevicePlatform? = entries.firstOrNull { it.wireName == name }
+    companion object {
+        /** Highest code the 3-bit beacon field can carry. */
+        const val MAX_CODE: Int = 7
+
+        /** The platform of beacon code [code] (`0`–`7`); a code this build does not know is [UNKNOWN]. */
+        fun fromCode(code: Int): DevicePlatform {
+            require(code in 0..MAX_CODE) { "platform code $code does not fit 3 bits" }
+            return entries.firstOrNull { it.isKnown && it.code == code } ?: UNKNOWN
+        }
+
+        /** The platform with wire name [name]; a name this build does not know is [UNKNOWN]. */
+        fun fromWire(name: String): DevicePlatform = entries.firstOrNull { it.isKnown && it.wireName == name } ?: UNKNOWN
     }
 }
 

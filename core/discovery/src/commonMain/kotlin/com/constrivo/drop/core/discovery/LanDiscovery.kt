@@ -2,7 +2,10 @@ package com.constrivo.drop.core.discovery
 
 import kotlinx.coroutines.flow.Flow
 
-/** A DNS-SD service instance of type [AppIdentity.MDNS_SERVICE_TYPE] with its TXT keys (architecture §5.4). */
+/**
+ * A DNS-SD service instance of type [AppIdentity.MDNS_SERVICE_TYPE] with its TXT keys (architecture §5.4).
+ * Build announcements with [MdnsRecord.toLanService] and read browsed TXT records with [MdnsRecord.fromTxt].
+ */
 data class LanService(
     val instanceName: String,
     val host: String,
