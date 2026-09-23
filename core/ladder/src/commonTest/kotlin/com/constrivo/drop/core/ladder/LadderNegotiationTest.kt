@@ -1,5 +1,8 @@
 package com.constrivo.drop.core.ladder
 
+import com.constrivo.drop.core.discovery.Capabilities
+import com.constrivo.drop.core.discovery.Capabilities.Flag
+import com.constrivo.drop.core.discovery.NetworkHint
 import com.constrivo.drop.core.ladder.Caps.onWifi
 import com.constrivo.drop.core.ladder.Side.LOCAL
 import com.constrivo.drop.core.ladder.Side.PEER
@@ -9,6 +12,7 @@ import com.constrivo.drop.core.protocol.LinkOption
 import com.constrivo.drop.core.protocol.TransferRole.RECEIVER
 import com.constrivo.drop.core.protocol.TransferRole.SENDER
 import com.constrivo.drop.core.protocol.WifiCredentials
+import kotlin.random.Random
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -27,14 +31,35 @@ class LadderNegotiationTest {
         receiverFacts: LinkFacts,
         senderSees: LinkFacts = receiverFacts,
         receiverSees: LinkFacts = senderFacts,
+    ): Triple<LinkAgreement, LinkIntent?, LinkAgreement> =
+        exchange(
+            LadderInput(senderFacts, senderSees, SENDER),
+            LadderInput(receiverFacts, receiverSees, RECEIVER),
+        ) { error("the sender generated early") }
+
+    /** The whole exchange from each device's own [LadderInput]. */
+    private fun exchange(
+        senderInput: LadderInput,
+        receiverInput: LadderInput,
+        senderGenerates: () -> WifiCredentials,
     ): Triple<LinkAgreement, LinkIntent?, LinkAgreement> {
-        val senderPlan = plan(senderFacts, senderSees, SENDER)
+        val senderPlan = LadderPlanner.plan(senderInput)
         val offered = if (senderPlan.groupOwner == LOCAL) TEST_CREDENTIALS else null
-        val options = LadderNegotiation.offerOptions(senderPlan, offered)
-        val decision = LadderNegotiation.accept(plan(receiverFacts, receiverSees, RECEIVER), options) { receiverCredentials }
-        val sender = LadderNegotiation.adopt(senderPlan, offered, decision.intent) { error("the sender generated early") }
+        val options = LadderNegotiation.offerOptions(senderPlan, offered, "192.168.1.20", 5000)
+        val decision = LadderNegotiation.accept(LadderPlanner.plan(receiverInput), options) { receiverCredentials }
+        val sender = LadderNegotiation.adopt(senderPlan, offered, decision.intent, senderGenerates)
         return Triple(sender, decision.intent, decision.agreement)
     }
+
+    /** The Wi-Fi rungs as (mode, physical host), the host named as the sender (`S`) or the receiver (`R`). */
+    private fun rungs(
+        agreement: LinkAgreement,
+        isSender: Boolean,
+    ): List<Pair<LinkMode, String>> =
+        agreement.plan.candidates.filter { it.mode.isWifi }.map { candidate ->
+            val hostIsSender = (candidate.host == LOCAL) == isSender
+            candidate.mode to if (hostIsSender) "S" else "R"
+        }
 
     @Test
     fun s5_senderIsGroupOwnerAndSharesItsCredentialsInTheOffer() {
@@ -82,6 +107,93 @@ class LadderNegotiationTest {
         assertEquals(ElectionReason.AGREED, receiver.plan.groupOwnerElection?.reason)
         assertEquals(PEER, sender.plan.groupOwner)
         assertEquals(receiverCredentials, sender.p2pCredentials)
+        // The hotspot goes with the agreed group owner, so the two never both wait to join it.
+        assertEquals(LOCAL, receiver.plan.hotspotHost)
+        assertEquals(PEER, sender.plan.hotspotHost)
+        assertEquals(rungs(sender, isSender = true), rungs(receiver, isSender = false))
+    }
+
+    @Test
+    fun s5_aHotspotHostThatMayNotHostLeavesItOutOfTheOffer() {
+        // Neither phone has Wi-Fi Direct; the sender wins the hotspot election on battery but its hotspot is in use.
+        val (sender, intent, receiver) =
+            exchange(
+                phone(Caps.NO_WIFI_DIRECT, battery = 90, hostingAllowed = false),
+                phone(Caps.NO_WIFI_DIRECT, battery = 10),
+                receiverSees = phone(Caps.NO_WIFI_DIRECT, battery = 90),
+            )
+        assertNull(intent)
+        assertEquals(listOf(LinkMode.BLUETOOTH), sender.plan.candidates.map { it.mode })
+        assertEquals(listOf(LinkMode.BLUETOOTH), receiver.plan.candidates.map { it.mode })
+    }
+
+    @Test
+    fun n6_theReceiverKeepsTheLanTheSenderFoundOverMdns() {
+        // Only the Mac sees the phone's mDNS record (multicast filtered the other way), and their hints differ.
+        val (sender, intent, receiver) =
+            exchange(
+                LadderInput(laptop(Caps.MAC, HOME_ROUTER), phone(Caps.FLAGSHIP, OFFICE_ROUTER), SENDER, lanReachable = true),
+                LadderInput(phone(Caps.FLAGSHIP, OFFICE_ROUTER), laptop(Caps.MAC, HOME_ROUTER), RECEIVER, lanReachable = false),
+            ) { TEST_CREDENTIALS }
+        assertEquals(LinkIntent(LinkKind.P2P, receiverCredentials), intent)
+        val expected = listOf(LinkMode.LAN, LinkMode.P2P_LEGACY, LinkMode.HOTSPOT, LinkMode.BLUETOOTH)
+        assertEquals(expected, sender.plan.candidates.map { it.mode })
+        assertEquals(expected, receiver.plan.candidates.map { it.mode })
+        // The other way round the receiver sees a LAN the sender did not offer: nobody probes it.
+        val (s2, _, r2) =
+            exchange(
+                LadderInput(laptop(Caps.MAC, HOME_ROUTER), phone(Caps.FLAGSHIP, OFFICE_ROUTER), SENDER, lanReachable = false),
+                LadderInput(phone(Caps.FLAGSHIP, OFFICE_ROUTER), laptop(Caps.MAC, HOME_ROUTER), RECEIVER, lanReachable = true),
+            ) { TEST_CREDENTIALS }
+        assertEquals(-1, s2.plan.indexOf(LinkMode.LAN))
+        assertEquals(-1, r2.plan.indexOf(LinkMode.LAN))
+    }
+
+    @Test
+    fun fE2_bothDevicesRunTheSameRungsWithTheSameHostsAfterTheExchange() {
+        // Each device knows its own hosting permission, radios and mDNS view; the peer's view of them is the default.
+        val random = Random(20260923)
+        val flags = listOf(Flag.WIFI_5GHZ, Flag.WIFI_6_OR_NEWER, Flag.WIFI_DIRECT, Flag.CAN_HOST_P2P_5GHZ, Flag.CAN_HOST_LOCAL_HOTSPOT)
+        val hints = listOf(NetworkHint.NONE, HOME_ROUTER, OFFICE_ROUTER)
+        repeat(3_000) {
+            fun device(): Pair<LinkFacts, RadioState> {
+                var caps = Capabilities.NONE
+                for (flag in flags) if (random.nextBoolean()) caps += flag
+                if (random.nextInt(3) == 0) caps = caps.onWifi(random.nextBoolean())
+                val battery = if (random.nextBoolean()) random.nextInt(0, 101) else null
+                val hint = hints[random.nextInt(hints.size)]
+                val facts =
+                    if (random.nextInt(4) == 0) {
+                        laptop(if (random.nextBoolean()) Caps.MAC else Caps.WINDOWS, hint)
+                    } else {
+                        phone(caps, hint, battery, hostingAllowed = random.nextInt(4) != 0)
+                    }
+                val radio = RadioState(wifiEnabled = random.nextInt(8) != 0, bluetoothEnabled = random.nextInt(8) != 0)
+                return facts to radio
+            }
+            val (a, aRadio) = device()
+            val (b, bRadio) = device()
+            // What each device publishes about itself: everything but the private hosting permission.
+            val aSeen = a.copy(hostingAllowed = true)
+            val bSeen = b.copy(hostingAllowed = true)
+            val (sender, _, receiver) =
+                exchange(
+                    LadderInput(a, bSeen, SENDER, localRadio = aRadio, lanReachable = random.nextBoolean()),
+                    LadderInput(b, aSeen, RECEIVER, localRadio = bRadio, lanReachable = random.nextBoolean()),
+                ) { TEST_CREDENTIALS }
+            val s = rungs(sender, isSender = true)
+            val r = rungs(receiver, isSender = false)
+            val facts = "sender $a $aRadio, receiver $b $bRadio"
+            // The LAN is probed by both or by neither, and a rung both run has the same host on both.
+            assertEquals(s.any { it.first == LinkMode.LAN }, r.any { it.first == LinkMode.LAN }, "LAN of $facts")
+            for (kind in listOf(LinkKind.P2P, LinkKind.HOTSPOT)) {
+                val sHost = s.firstOrNull { it.first.kind == kind }
+                val rHost = r.firstOrNull { it.first.kind == kind }
+                if (sHost != null && rHost != null) assertEquals(sHost, rHost, "$kind of $facts")
+            }
+            // Only a device that may not host can leave the other waiting on a rung (it cannot say so in the Accept).
+            if (a.hostingAllowed && b.hostingAllowed) assertEquals(s, r, "rungs of $facts")
+        }
     }
 
     @Test

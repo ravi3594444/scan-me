@@ -37,12 +37,16 @@ data class RadioState(
  * Both devices must plan from the **same** facts, or their elections can disagree: use the capabilities exchanged in
  * the verified handshake (N2) for both sides, including this device's own published value, not private knowledge the
  * peer lacks. A value only one side knows (for example this device's battery while the peer's is unknown) is skipped
- * by the election, so it cannot make the two sides diverge.
+ * by the election, so it cannot make the two sides diverge. [hostingAllowed] and this device's [RadioState] are such
+ * private facts: they never change which device is elected, only drop a rung this device cannot play, and the
+ * `Offer` / `Accept` exchange ([LadderNegotiation]) carries the consequences to the peer.
  *
  * @property batteryPercent 0–100, or null when unknown. The election compares battery only when both are known.
  * @property stationBand read from capability bits 11 and 13 unless given (spec change N9).
  * @property hostingAllowed false when this device cannot host now (the hotspot or a P2P group is in use, tethering is
- *   on). Platform rules still apply on top: only phones host (N8, N10).
+ *   on); for the peer, true unless it said otherwise. Platform rules still apply on top: only phones host (N8, N10).
+ *   The Wi-Fi Direct group owner is negotiated with it in mind (S5); for the hotspot it only drops the rung when the
+ *   elected host may not host ([LadderPlanner]).
  */
 data class LinkFacts(
     val capabilities: Capabilities,
@@ -70,6 +74,12 @@ data class LinkFacts(
          * Facts for a computer that opens the browser receive page (F-D6): no app, no Bluetooth, joins the phone's
          * group or hotspot as a legacy WPA2 client (N8). 5 GHz is assumed, since nearly every laptop sold since 2013 has
          * it; pass other [capabilities] when the user said otherwise.
+         *
+         * The plan for a browser ([LadderPlan.isBrowserPlan]) orders the rungs the phone hosts, but [LadderRunner]
+         * does not run it: no app answers `LinkReady`, and a person reads the QR code and joins the network by hand,
+         * which takes far longer than the ladder's 6 s. The browser receive path (WP9) hosts the first rung directly
+         * with [WifiLinkProvider.host], shows its credentials, waits for the first HTTP request with its own timeout,
+         * and tears the link down itself.
          */
         fun browser(capabilities: Capabilities = Capabilities.of(Flag.WIFI_5GHZ)): LinkFacts =
             LinkFacts(capabilities = capabilities, platform = DevicePlatform.BROWSER_PROXY)
@@ -80,8 +90,9 @@ data class LinkFacts(
  * Everything the planner reads (architecture §4).
  *
  * @property localRole whether this device sends or receives; the election's last tie-break picks the receiver.
- * @property lanReachable the peer has a live mDNS record on this device's network (§5.4). Together with equal network
- *   hints it decides whether the LAN is tried: hints are only a weak prior (§5.1 note, N6), so either signal is enough.
+ * @property lanReachable the peer has a live mDNS record on this device's network (§5.4): for the verified peer,
+ *   `NearbyDevice.lanEndpoints` is not empty. It is the real same-network test (N6) and always puts the LAN on the
+ *   ladder; equal network hints alone put it there only when the probe cannot delay a joiner ([LadderPlanner]).
  * @property peerName the peer's nickname, for hint parameters (`{Name}`, design §8.2).
  */
 data class LadderInput(
@@ -118,10 +129,12 @@ data class LadderInput(
     /** Joins a WPA2 network by SSID and passphrase: every device with Wi-Fi (desktop OS join, `WifiNetworkSpecifier`). */
     internal fun canJoinAsLegacyClient(side: Side): Boolean = wifiOn(side)
 
-    /** Hosts a local-only hotspot: phones only (§8: desktops cannot, the phone hosts). */
-    internal fun canHostHotspot(side: Side): Boolean {
+    /**
+     * Hosts a local-only hotspot by the facts both devices share (§8: phones only, desktops cannot), leaving out
+     * [LinkFacts.hostingAllowed], which only the device itself knows ([LadderPlanner] applies it afterwards).
+     */
+    internal fun canHostHotspotBySharedFacts(side: Side): Boolean {
         val facts = facts(side)
-        return facts.platform == DevicePlatform.PHONE && Flag.CAN_HOST_LOCAL_HOTSPOT in facts.capabilities &&
-            facts.hostingAllowed && wifiOn(side)
+        return facts.platform == DevicePlatform.PHONE && Flag.CAN_HOST_LOCAL_HOTSPOT in facts.capabilities && wifiOn(side)
     }
 }

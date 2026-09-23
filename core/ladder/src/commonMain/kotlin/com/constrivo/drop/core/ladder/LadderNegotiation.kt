@@ -48,9 +48,18 @@ data class AcceptDecision(
  * 2. Receiver: [accept] with its own plan and the offered options; the returned intent goes into `Accept`.
  * 3. Sender: [adopt] with the `Accept`'s intent.
  *
- * Both devices then pass [LinkAgreement.plan] and [LinkAgreement.config] to a [LadderRunner]. The hotspot host is not
- * negotiated: both devices elect it from the same facts (its credentials come from the system and always travel in
- * `LinkReady`, N15).
+ * Both devices then pass [LinkAgreement.plan] and [LinkAgreement.config] to a [LadderRunner], and run the same rungs
+ * with the same hosts:
+ * - **LAN.** Kept on both exactly when the sender offered it. The offer is the sender's evidence (its mDNS view or the
+ *   hints, N6); mDNS visibility is often one-sided (multicast filtering, a browse not finished yet), so the receiver
+ *   never drops an offered LAN on its own view, and never adds one the sender did not offer.
+ * - **Wi-Fi Direct.** The group owner as above; the receiver's choice is final.
+ * - **Hotspot.** Not negotiated on the wire: it follows the agreed group owner when that one can host a hotspot, and is
+ *   otherwise elected from the facts both devices share ([LadderPlanner]). A sender that may not host the hotspot it
+ *   was elected for leaves it out of the `Offer`, so the receiver drops it too. A receiver in that position drops it
+ *   from its own plan; when the `Accept` names Wi-Fi Direct the sender cannot tell, and its hotspot rung then times out
+ *   waiting for the host's `LinkReady` while Bluetooth carries the data. The hotspot's credentials come from the system
+ *   and always travel in `LinkReady` (N15).
  */
 object LadderNegotiation {
     /**
@@ -97,7 +106,8 @@ object LadderNegotiation {
 
     /**
      * Receiver: decides the links from its own [plan] and the sender's [offered] options.
-     * - Only rungs the sender offered stay (options of kinds this build does not know are skipped).
+     * - Only rungs the sender offered stay (options of kinds this build does not know are skipped), and an offered LAN
+     *   always stays: the sender found the LAN, and both devices must probe the same one.
      * - Wi-Fi Direct: the receiver's election stands. When it elected the sender but the sender offered no (valid)
      *   credentials, the sender elected the receiver, so their facts differ: the receiver then hosts if it can, and
      *   otherwise the sender hosts and announces its credentials in `LinkReady`.
@@ -111,9 +121,10 @@ object LadderNegotiation {
     ): AcceptDecision {
         val kinds = offered.mapNotNull { it.linkKind }.toSet() + LinkKind.BLUETOOTH
         val senderCredentials = offered.firstOrNull { it.linkKind == LinkKind.P2P }?.credentials?.let(::validOrNull)
-        var agreed = LadderPlanner.plan(plan.input, PlanConstraints(kinds = kinds))
+        val constraints = PlanConstraints(kinds = kinds, lan = LinkKind.LAN in kinds)
+        var agreed = LadderPlanner.plan(plan.input, constraints)
         if (agreed.groupOwner == Side.PEER && senderCredentials == null) {
-            val receiverHosts = LadderPlanner.plan(plan.input, PlanConstraints(kinds = kinds, groupOwner = Side.LOCAL))
+            val receiverHosts = LadderPlanner.plan(plan.input, constraints.copy(groupOwner = Side.LOCAL))
             if (receiverHosts.groupOwner == Side.LOCAL) agreed = receiverHosts
         }
         val credentials =
@@ -131,12 +142,13 @@ object LadderNegotiation {
     }
 
     /**
-     * Sender: adopts the receiver's [intent] (`Accept.link`, null when absent).
+     * Sender: adopts the receiver's [intent] (`Accept.link`, null when absent) for the [plan] it offered from.
+     * - Only rungs it offered can stay, and the LAN stays exactly when it was offered (the receiver keeps it too).
      * - null or LAN: no direct rung (the LAN, if offered, and Bluetooth stay).
      * - Wi-Fi Direct with credentials: the receiver hosts with them. If they are invalid the rung is dropped.
      * - Wi-Fi Direct without credentials: this device hosts, with [offeredCredentials], or with new ones from
      *   [newCredentials] that it announces in `LinkReady`.
-     * - Hotspot: no Wi-Fi Direct rung; the hotspot host follows the shared election.
+     * - Hotspot: no Wi-Fi Direct rung. The hotspot host follows the agreed group owner, or the shared election.
      */
     fun adopt(
         plan: LadderPlan,
@@ -144,37 +156,41 @@ object LadderNegotiation {
         intent: LinkIntent?,
         newCredentials: () -> WifiCredentials,
     ): LinkAgreement {
+        val offered = plan.candidates.map { it.kind }.toSet() + LinkKind.BLUETOOTH
+        val lanOffered = LinkKind.LAN in offered
         val base = setOf(LinkKind.LAN, LinkKind.BLUETOOTH)
+
+        fun replan(
+            kinds: Set<LinkKind>,
+            groupOwner: Side? = null,
+        ): LadderPlan = LadderPlanner.plan(plan.input, PlanConstraints(kinds = kinds intersect offered, groupOwner, lan = lanOffered))
+
         return when (intent?.linkKind) {
             LinkKind.P2P -> {
                 val receiverCredentials = intent.credentials
                 if (receiverCredentials != null) {
                     val valid = validOrNull(receiverCredentials)
                     val kinds = base + LinkKind.HOTSPOT + (if (valid != null) setOf(LinkKind.P2P) else emptySet())
-                    val agreed = LadderPlanner.plan(plan.input, PlanConstraints(kinds = kinds, groupOwner = Side.PEER))
+                    val agreed = replan(kinds, groupOwner = Side.PEER)
                     LinkAgreement(agreed, valid.takeIf { agreed.groupOwner == Side.PEER })
                 } else {
-                    val agreed =
-                        LadderPlanner.plan(
-                            plan.input,
-                            PlanConstraints(kinds = base + LinkKind.P2P + LinkKind.HOTSPOT, groupOwner = Side.LOCAL),
-                        )
+                    val agreed = replan(base + LinkKind.P2P + LinkKind.HOTSPOT, groupOwner = Side.LOCAL)
                     if (agreed.groupOwner != Side.LOCAL) {
                         LinkAgreement(agreed, null)
                     } else {
-                        val offered = offeredCredentials?.let(::validOrNull)
-                        val credentials = offered ?: P2pCredentials.requireValidGroup(newCredentials())
-                        LinkAgreement(agreed, credentials, announceCredentials = offered == null)
+                        val own = offeredCredentials?.let(::validOrNull)
+                        val credentials = own ?: P2pCredentials.requireValidGroup(newCredentials())
+                        LinkAgreement(agreed, credentials, announceCredentials = own == null)
                     }
                 }
             }
 
             LinkKind.HOTSPOT -> {
-                LinkAgreement(LadderPlanner.plan(plan.input, PlanConstraints(kinds = base + LinkKind.HOTSPOT)), null)
+                LinkAgreement(replan(base + LinkKind.HOTSPOT), null)
             }
 
             else -> {
-                LinkAgreement(LadderPlanner.plan(plan.input, PlanConstraints(kinds = base)), null)
+                LinkAgreement(replan(base), null)
             }
         }
     }

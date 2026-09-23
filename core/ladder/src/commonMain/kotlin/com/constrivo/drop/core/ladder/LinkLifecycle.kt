@@ -1,6 +1,7 @@
 package com.constrivo.drop.core.ladder
 
 import com.constrivo.drop.core.protocol.HintCode
+import com.constrivo.drop.core.protocol.LinkKind
 import com.constrivo.drop.core.protocol.ProtocolConstants
 
 /** Where the ladder is (architecture §4). */
@@ -41,6 +42,12 @@ enum class AttemptStatus {
     /** LAN measured below 10 MB/s: it keeps carrying data while a direct link is set up, and is used if none comes up. */
     STANDBY,
 
+    /**
+     * Follower only (the sender, [LadderPlan.localIsAuthority] false): up end to end on this device and waiting for the
+     * authority to select it or another link ([LinkEvent.PeerSelected]). A follower never accepts a link on its own.
+     */
+    READY,
+
     /** Accepted: this link carries the data. */
     ACTIVE,
 
@@ -51,10 +58,13 @@ enum class AttemptStatus {
     STOPPED,
     ;
 
-    /** Undecided and running: the only states in which a deadline or measurement window can be armed. */
-    val isLive: Boolean get() = this == STARTING || this == VERIFYING || this == MEASURING
+    /** Undecided and running: no other direct rung starts beside it, and a joiner that leaves its network waits for it. */
+    val isLive: Boolean get() = this == STARTING || this == VERIFYING || this == MEASURING || this == READY
 
     val isEnded: Boolean get() = this == FAILED || this == STOPPED
+
+    /** Up end to end on this device, so the engine can lose it ([LinkEvent.LinkLost]). */
+    val isUp: Boolean get() = this == VERIFYING || this == MEASURING || this == STANDBY || this == READY || this == ACTIVE
 }
 
 /** Why a rung stopped (also the reason of a [LinkEffect.StopCandidate]). */
@@ -90,9 +100,13 @@ enum class LinkEndReason {
 /**
  * State of one rung.
  *
- * @property tries formations started so far (2 after the one re-form).
+ * @property candidate the rung as it is brought up now: the plan's, except that a Wi-Fi Direct group re-formed after its
+ *   accepted link was lost asks for 2.4 GHz (T-04).
+ * @property tries formations started so far, at most [LinkLifecycle.MAX_FORMATIONS]; the current formation is attempt
+ *   `tries - 1` (its link generation, [LadderGenerations]).
  * @property freqMhz the measured channel, from this device's provider or the peer's `LinkReady`.
- * @property measuredBytes LAN only: bytes moved during the measurement window.
+ * @property measuredBytes LAN only: bytes moved during the measurement window (the authority's meter decides).
+ * @property acceptedAtMillis when the current formation was accepted, if it was.
  */
 data class LinkAttempt(
     val candidate: LinkCandidate,
@@ -103,11 +117,21 @@ data class LinkAttempt(
     val freqMhz: Int? = null,
     val measuredBytes: Long = 0,
     val endReason: LinkEndReason? = null,
+    val acceptedAtMillis: Long? = null,
+)
+
+/** A link generation chosen by the authority: rung [index], formation [attempt] (`tries - 1`). */
+data class LinkSelection(
+    val index: Int,
+    val attempt: Int,
 )
 
 /** Timers the reducer asks for; each comes back as [LinkEvent.TimerFired]. */
 sealed interface LinkTimer {
-    /** Rung [index] must be up by then (LAN connect, Wi-Fi Direct formation, hotspot start and join). */
+    /**
+     * Rung [index] must be up by then (LAN connect, Wi-Fi Direct formation, hotspot start and join); on the follower,
+     * a rung that is up must be selected by then ([LadderTimeouts.selectionGraceMillis]).
+     */
     data class Deadline(
         val index: Int,
     ) : LinkTimer
@@ -128,6 +152,9 @@ sealed interface LinkTimer {
  * The timeouts of architecture §4 and §7.8; the defaults are the [ProtocolConstants] values.
  *
  * @property lanMinBytesPerSecond the LAN must move this much on average over the measurement window (10 MB/s).
+ * @property selectionGraceMillis follower only: how long past its own deadline a rung that is up waits for the
+ *   authority's selection. It covers the skew between the two devices' deadlines and the control message's latency,
+ *   since the authority may accept a link whose channel it never learnt at its own deadline.
  */
 data class LadderTimeouts(
     val lanConnectMillis: Long = ProtocolConstants.LAN_CONNECT_TIMEOUT_MS,
@@ -137,11 +164,12 @@ data class LadderTimeouts(
     val hotspotMillis: Long = ProtocolConstants.HOTSPOT_TIMEOUT_MS,
     val idleTeardownMillis: Long = ProtocolConstants.LINK_IDLE_TEARDOWN_MS,
     val restoreBudgetMillis: Long = ProtocolConstants.WIFI_RESTORE_BUDGET_MS,
+    val selectionGraceMillis: Long = DEFAULT_SELECTION_GRACE_MS,
 ) {
     init {
         require(
             lanConnectMillis > 0 && lanMeasureMillis > 0 && lanMinBytesPerSecond > 0 && p2pFormationMillis > 0 &&
-                hotspotMillis > 0 && idleTeardownMillis > 0 && restoreBudgetMillis > 0,
+                hotspotMillis > 0 && idleTeardownMillis > 0 && restoreBudgetMillis > 0 && selectionGraceMillis > 0,
         ) { "timeouts and the LAN threshold must be positive" }
         require(lanMinBytesPerSecond <= Long.MAX_VALUE / lanMeasureMillis) { "LAN threshold overflows" }
     }
@@ -160,6 +188,11 @@ data class LadderTimeouts(
             LinkMode.HOTSPOT -> hotspotMillis
             LinkMode.BLUETOOTH -> throw IllegalArgumentException("Bluetooth is not set up by the ladder")
         }
+
+    companion object {
+        /** Default [selectionGraceMillis]: 2 s. */
+        const val DEFAULT_SELECTION_GRACE_MS: Long = 2_000
+    }
 }
 
 /**
@@ -173,6 +206,8 @@ data class LadderTimeouts(
  * @property timers running timers and their deadlines; a [LinkEvent.TimerFired] for a timer not in here, or before its
  *   deadline, is stale and ignored.
  * @property transferRunning a transfer uses the link; when false the 60 s idle timer runs.
+ * @property pendingSelection follower only: the authority selected a formation that is not up here yet; it is
+ *   accepted as soon as it is.
  * @property restoreOverdue the previous network was not back within the 5 s budget (F-E11), for the log.
  */
 data class LinkLifecycleState(
@@ -183,6 +218,7 @@ data class LinkLifecycleState(
     val hints: List<LadderHint> = emptyList(),
     val timers: Map<LinkTimer, Long> = emptyMap(),
     val transferRunning: Boolean = true,
+    val pendingSelection: LinkSelection? = null,
     val startedAtMillis: Long,
     val updatedAtMillis: Long = startedAtMillis,
     val activeAtMillis: Long? = null,
@@ -215,15 +251,21 @@ data class LinkLifecycleState(
 /** Inputs of [LinkLifecycle.reduce]. Events naming a rung index that does not exist are ignored. */
 sealed interface LinkEvent {
     /**
-     * Rung [index] is up end to end: its first data stream connected and authenticated. [freqMhz] is the measured
-     * channel when known (null or 0 otherwise).
+     * Rung [index] is up end to end: its first data stream connected and authenticated. [freqMhz] is the channel both
+     * devices know at this point, null or 0 when neither knows it: the host's measurement, else the joiner's, each
+     * device holding its own and the one in the peer's `LinkReady` ([LadderRunner] computes it). Both devices therefore
+     * take the same re-form decision without another message.
      */
     data class Connected(
         val index: Int,
         val freqMhz: Int? = null,
     ) : LinkEvent
 
-    /** The channel of rung [index] was measured (this device's provider, or the peer's `LinkReady.freq_mhz`). */
+    /**
+     * The channel of rung [index] was measured after it connected (this device's provider, or a repeated `LinkReady`
+     * from the peer). It updates the badge and band hint and completes a pending verification, but never re-forms a
+     * group: only [Connected] carries the frequency both devices share.
+     */
     data class FrequencyReported(
         val index: Int,
         val freqMhz: Int,
@@ -248,6 +290,15 @@ sealed interface LinkEvent {
     /** The link of rung [index] went down (socket closed, group removed, out of range). */
     data class LinkLost(
         val index: Int,
+    ) : LinkEvent
+
+    /**
+     * Follower only: the authority (the receiver) selected formation [attempt] of rung [index] to carry the data
+     * ([LadderRunner.onPeerSelected]). It is accepted now if it is up here, or as soon as it connects.
+     */
+    data class PeerSelected(
+        val index: Int,
+        val attempt: Int,
     ) : LinkEvent
 
     /** A timer requested with [LinkEffect.StartTimer] fired. */
@@ -291,6 +342,16 @@ sealed interface LinkEffect {
         val index: Int?,
     ) : LinkEffect
 
+    /**
+     * Authority only: tell the peer that formation [attempt] of rung [index] carries the data
+     * ([LadderSession.sendLinkSelected]), so that it accepts the same link and cancels the same losers. Comes right
+     * after the [UseLink] and before the losers' [StopCandidate]s.
+     */
+    data class AnnounceSelection(
+        val index: Int,
+        val attempt: Int,
+    ) : LinkEffect
+
     data class StartTimer(
         val timer: LinkTimer,
         val atMillis: Long,
@@ -320,22 +381,36 @@ data class LinkTransition(
  * caller passes the current time; timers are requested as effects and come back as events.
  *
  * Rules:
+ * - **One authority.** Both devices run this reducer, but only the receiver ([LadderPlan.localIsAuthority], S5)
+ *   decides which link carries the data: it measures the LAN, accepts a link, and cancels the losers, and announces
+ *   each acceptance ([LinkEffect.AnnounceSelection]). The sender follows: a link that is up there waits
+ *   ([AttemptStatus.READY], or the LAN carrying data unmeasured) until [LinkEvent.PeerSelected] names it or another
+ *   one, and the sender never supersedes a rung on its own measurement. Everything else (timeouts, failures, the order
+ *   of the rungs, re-forms, teardown) follows from what both devices see, so the two stay in step without further
+ *   messages.
  * - **Order.** Rungs start in plan order. The LAN starts first; a [LinkMode.P2P] rung starts beside it (N9 race), a
  *   rung whose joiner leaves its network waits for the LAN verdict. Only one direct rung (Wi-Fi Direct or hotspot)
  *   runs at a time; the next one starts when it fails. The first link accepted wins and every other running rung is
  *   stopped ([LinkEndReason.SUPERSEDED]). While nothing is accepted the Bluetooth stream carries the transfer.
- * - **LAN (F-E4).** 1 s to connect, then it carries data for a 1 s measurement: 10 MB moved in the window accepts it
- *   (at once, when reached early); less puts it on standby with `lan_slow` ("Switching to a direct link...") while a
- *   direct rung is tried. A standby LAN keeps carrying data, is stopped when a joiner must leave the network, and is
- *   accepted when no direct rung is left, since it still beats Bluetooth.
+ * - **LAN (F-E4).** 1 s to connect, then it carries data for a 1 s measurement on the authority's meter (bytes
+ *   received): 10 MB in the window accepts it (at once, when reached early); less puts it on standby with `lan_slow`
+ *   ("Switching to a direct link...") while a direct rung is tried. A standby LAN keeps carrying data, is stopped when
+ *   a joiner must leave the network, and is accepted when no direct rung is left, since it still beats Bluetooth.
  * - **Wi-Fi Direct (§9).** 6 s to come up. A channel of 4900 MHz or more, or a pair that cannot do 5 GHz, accepts it.
  *   Otherwise the group is re-formed exactly once, and the second 2.4 GHz result is accepted with its hint:
  *   `sta_band24` when the host's station pins the channel (N9), `band24` otherwise, `peer_band24_only` when the peer
- *   has no 5 GHz ([BandHints]). A frequency that never arrives accepts the link at the deadline with an unknown band.
+ *   has no 5 GHz ([BandHints]). The re-form is decided from the channel in [LinkEvent.Connected], which both devices
+ *   share; a channel learnt only later accepts the link as it is, and one that never arrives accepts it at the
+ *   deadline with an unknown band.
  * - **Hotspot.** 6 s to start and be joined; accepted as it comes, since apps cannot choose its band (N8).
- * - **Fall-through.** A rung that fails or times out gives way to the next one; with none left the transfer stays on
- *   Bluetooth (`bt_fallback` when Wi-Fi is off on one device), or the ladder is [LadderPhase.UNREACHABLE]. An accepted
- *   link that is lost is replaced by the next untried rung the same way.
+ * - **Fall-through.** A rung that fails or times out gives way to the next one; with none left a LAN that was stopped
+ *   while it worked (slow, or lost before a verdict) gets one more try, and then the transfer stays on Bluetooth
+ *   (`bt_fallback` when Wi-Fi is off on one device), or the ladder is [LadderPhase.UNREACHABLE].
+ * - **Loss.** When the accepted link is lost, every Wi-Fi rung that still has a spare formation (each gets
+ *   [MAX_FORMATIONS] per run, which keeps two link generations per rung kind) and did not fail for good (no provider,
+ *   bad credentials) is tried again in plan order: the race loser, a slow LAN, a rung that timed out earlier, and the
+ *   lost link itself. A lost Wi-Fi Direct group is re-formed on 2.4 GHz, whose range is longer, and accepted with its
+ *   hint (T-04).
  * - **Teardown (F-E11).** On `Complete` or `Cancel` with nothing queued, or after 60 s without a transfer (counted
  *   from a pre-warmed start, or from the end of the last transfer when more are queued), every link is stopped and
  *   [LinkEffect.RestoreNetwork] runs; the restore should finish within 5 s.
@@ -382,6 +457,7 @@ class LinkLifecycle(
                 is LinkEvent.ThroughputSample -> tx.sample(event.index, event.bytes)
                 is LinkEvent.Failed -> tx.failed(event.index, event.reason)
                 is LinkEvent.LinkLost -> tx.lost(event.index)
+                is LinkEvent.PeerSelected -> tx.peerSelected(event.index, event.attempt)
                 is LinkEvent.TimerFired -> tx.timerFired(event.timer)
                 LinkEvent.TransferStarted -> tx.transferStarted()
                 is LinkEvent.TransferEnded -> tx.transferEnded(event.moreQueued)
@@ -403,6 +479,9 @@ class LinkLifecycle(
 
         private val plan: LadderPlan get() = state.plan
 
+        /** This device decides which link carries the data (the receiver, S5). */
+        private val authority: Boolean get() = plan.localIsAuthority
+
         private fun attempt(index: Int): LinkAttempt = state.attempts[index]
 
         private fun valid(index: Int): Boolean = index in state.attempts.indices
@@ -423,23 +502,34 @@ class LinkLifecycle(
             if (!valid(index)) return false
             val a = attempt(index)
             if (a.status != AttemptStatus.STARTING) return false
-            val up = a.copy(connectedAtMillis = now, freqMhz = validFrequency(freqMhz) ?: a.freqMhz)
+            val shared = validFrequency(freqMhz)
+            val up = a.copy(connectedAtMillis = now, freqMhz = shared ?: a.freqMhz)
+            val selected = state.pendingSelection == LinkSelection(index, a.tries - 1)
+            if (selected) state = state.copy(pendingSelection = null)
             when (a.candidate.mode) {
                 LinkMode.LAN -> {
                     cancelTimer(LinkTimer.Deadline(index))
                     set(index, up.copy(status = AttemptStatus.MEASURING, measuredBytes = 0))
-                    startTimer(LinkTimer.Measure(index), now + timeouts.lanMeasureMillis)
+                    // The follower carries data on it unmeasured and waits for the authority's verdict.
+                    if (authority) startTimer(LinkTimer.Measure(index), now + timeouts.lanMeasureMillis)
                     useLink(index)
+                    if (selected) accept(index)
                 }
 
                 LinkMode.HOTSPOT -> {
                     set(index, up)
-                    accept(index)
+                    if (authority || selected) accept(index) else awaitSelection(index)
                 }
 
                 LinkMode.P2P, LinkMode.P2P_LEGACY -> {
                     set(index, up)
-                    verify(index)
+                    when {
+                        selected -> accept(index)
+                        shared != null && needsReform(up, shared) -> reform(index)
+                        !authority -> awaitSelection(index)
+                        !up.candidate.requestFiveGhz || up.freqMhz != null -> accept(index)
+                        else -> set(index, up.copy(status = AttemptStatus.VERIFYING))
+                    }
                 }
 
                 LinkMode.BLUETOOTH -> {
@@ -457,13 +547,14 @@ class LinkLifecycle(
             val freq = validFrequency(freqMhz) ?: return false
             val a = attempt(index)
             when (a.status) {
-                AttemptStatus.STARTING, AttemptStatus.MEASURING, AttemptStatus.STANDBY -> {
+                AttemptStatus.STARTING, AttemptStatus.MEASURING, AttemptStatus.STANDBY, AttemptStatus.READY -> {
                     set(index, a.copy(freqMhz = freq))
                 }
 
+                // Only the authority verifies; a channel learnt after the connection accepts the link as it is.
                 AttemptStatus.VERIFYING -> {
                     set(index, a.copy(freqMhz = freq))
-                    verify(index)
+                    accept(index)
                 }
 
                 AttemptStatus.ACTIVE -> {
@@ -487,7 +578,8 @@ class LinkLifecycle(
             if (a.status != AttemptStatus.MEASURING) return false
             val total = if (Long.MAX_VALUE - a.measuredBytes < bytes) Long.MAX_VALUE else a.measuredBytes + bytes
             set(index, a.copy(measuredBytes = total))
-            if (total >= timeouts.lanMinBytes) accept(index)
+            // The follower's meter counts something else (bytes sent) and never decides.
+            if (authority && total >= timeouts.lanMinBytes) accept(index)
             return true
         }
 
@@ -497,7 +589,7 @@ class LinkLifecycle(
         ): Boolean {
             if (!valid(index)) return false
             return when (attempt(index).status) {
-                AttemptStatus.STARTING, AttemptStatus.VERIFYING, AttemptStatus.MEASURING, AttemptStatus.STANDBY -> {
+                AttemptStatus.STARTING, AttemptStatus.VERIFYING, AttemptStatus.MEASURING, AttemptStatus.STANDBY, AttemptStatus.READY -> {
                     stop(index, reason, AttemptStatus.FAILED)
                     advance()
                     true
@@ -521,8 +613,30 @@ class LinkLifecycle(
             if (status == AttemptStatus.ACTIVE) {
                 setBandHint(null)
                 state = state.copy(phase = LadderPhase.CONNECTING)
+                reviveAfterLoss(index)
             }
             advance()
+            return true
+        }
+
+        fun peerSelected(
+            index: Int,
+            selectedAttempt: Int,
+        ): Boolean {
+            if (authority || !valid(index) || !isRunning()) return false
+            val a = attempt(index)
+            if (!a.candidate.mode.isWifi || selectedAttempt !in 0 until MAX_FORMATIONS) return false
+            val current = a.tries - 1
+            if (selectedAttempt == current && a.status in SELECTABLE) {
+                accept(index)
+                return true
+            }
+            // Not up here yet (or a formation still to come): accept it the moment it connects.
+            val stale = selectedAttempt < current || (selectedAttempt == current && (a.status.isEnded || a.status == AttemptStatus.ACTIVE))
+            if (stale) return false
+            val selection = LinkSelection(index, selectedAttempt)
+            if (state.pendingSelection == selection) return false
+            state = state.copy(pendingSelection = selection)
             return true
         }
 
@@ -535,7 +649,8 @@ class LinkLifecycle(
                     val index = timer.index
                     if (!valid(index)) return false
                     when (attempt(index).status) {
-                        AttemptStatus.STARTING -> {
+                        // Not up in time, or (follower) up but never selected by the authority.
+                        AttemptStatus.STARTING, AttemptStatus.READY -> {
                             stop(index, LinkEndReason.TIMEOUT, AttemptStatus.FAILED)
                             advance()
                         }
@@ -615,7 +730,15 @@ class LinkLifecycle(
                 return
             }
             if (lanLive) return
-            if (standby != null) accept(standby) else fallBack()
+            if (standby != null) {
+                accept(standby)
+                return
+            }
+            if (lan != null && reviveStoppedLan(lan)) {
+                advance()
+                return
+            }
+            fallBack()
         }
 
         private fun startAttempt(index: Int) {
@@ -631,28 +754,31 @@ class LinkLifecycle(
                     freqMhz = null,
                     measuredBytes = 0,
                     endReason = null,
+                    acceptedAtMillis = null,
                 ),
             )
             effects += LinkEffect.StartCandidate(index, a.candidate, attempt = tries - 1)
             startTimer(LinkTimer.Deadline(index), now + timeouts.connectTimeout(a.candidate.mode))
         }
 
-        /** The §9 check: 5 GHz or above, or 5 GHz impossible for the pair; otherwise one re-form, then accept. */
-        private fun verify(index: Int) {
-            val a = attempt(index)
-            val freq = a.freqMhz
-            when {
-                freq == null -> set(index, a.copy(status = AttemptStatus.VERIFYING))
-                WifiBand.isFiveGhzOrAbove(freq) || !a.candidate.requestFiveGhz -> accept(index)
-                a.tries < MAX_FORMATIONS -> reform(index)
-                else -> accept(index)
-            }
-        }
+        /** The §9 check on the channel both devices share: 2.4 GHz when 5 GHz was asked for, with a formation to spare. */
+        private fun needsReform(
+            a: LinkAttempt,
+            sharedFreqMhz: Int,
+        ): Boolean = a.candidate.requestFiveGhz && !WifiBand.isFiveGhzOrAbove(sharedFreqMhz) && a.tries < MAX_FORMATIONS
 
         private fun reform(index: Int) {
             cancelTimer(LinkTimer.Deadline(index))
             effects += LinkEffect.StopCandidate(index, LinkEndReason.REFORM)
             startAttempt(index)
+        }
+
+        /** Follower: rung [index] is up here; it waits for the authority's selection, a little past its own deadline. */
+        private fun awaitSelection(index: Int) {
+            val deadline = state.timers[LinkTimer.Deadline(index)] ?: now
+            cancelTimer(LinkTimer.Deadline(index))
+            set(index, attempt(index).copy(status = AttemptStatus.READY))
+            startTimer(LinkTimer.Deadline(index), maxOf(deadline, now) + timeouts.selectionGraceMillis)
         }
 
         private fun slowLan(index: Int) {
@@ -662,18 +788,56 @@ class LinkLifecycle(
             advance()
         }
 
+        /**
+         * The accepted link [lostIndex] went down: every Wi-Fi rung with a spare formation that did not fail for good
+         * gets another try, in plan order ("Loss" in the class comment). Both devices see the loss and hold the same
+         * formation counts, so they revive the same rungs.
+         */
+        private fun reviveAfterLoss(lostIndex: Int) {
+            for (index in state.attempts.indices) {
+                val a = attempt(index)
+                if (!a.candidate.mode.isWifi || !a.status.isEnded || a.endReason in PERMANENT_FAILURES) continue
+                if (a.tries >= MAX_FORMATIONS) continue
+                // T-04: a group lost at the edge of range comes back on 2.4 GHz, which reaches further.
+                val candidate =
+                    if (index == lostIndex && a.candidate.kind == LinkKind.P2P) {
+                        a.candidate.copy(requestFiveGhz = false)
+                    } else {
+                        a.candidate
+                    }
+                set(index, a.copy(candidate = candidate, status = AttemptStatus.PENDING))
+            }
+        }
+
+        /**
+         * Nothing else is left: a LAN that was stopped while it worked (slow, for a joiner that had to leave the network,
+         * or lost before any verdict, which is how the follower sees that stop) is tried once more, since it beats
+         * Bluetooth.
+         */
+        private fun reviveStoppedLan(lan: Int): Boolean {
+            val a = attempt(lan)
+            val stoppedWhileWorking =
+                a.status.isEnded &&
+                    (a.endReason == LinkEndReason.SLOW || (a.endReason == LinkEndReason.LOST && a.acceptedAtMillis == null))
+            if (!stoppedWhileWorking || a.tries >= MAX_FORMATIONS) return false
+            set(lan, a.copy(status = AttemptStatus.PENDING))
+            return true
+        }
+
         private fun accept(index: Int) {
             cancelTimer(LinkTimer.Deadline(index))
             cancelTimer(LinkTimer.Measure(index))
-            set(index, attempt(index).copy(status = AttemptStatus.ACTIVE))
+            val a = attempt(index)
+            set(index, a.copy(status = AttemptStatus.ACTIVE, acceptedAtMillis = now))
             useLink(index)
+            if (authority) effects += LinkEffect.AnnounceSelection(index, a.tries - 1)
             for (other in state.attempts.indices) {
                 val status = attempt(other).status
                 if (other != index && (status.isLive || status == AttemptStatus.STANDBY)) {
                     stop(other, LinkEndReason.SUPERSEDED, AttemptStatus.STOPPED)
                 }
             }
-            state = state.copy(phase = LadderPhase.ACTIVE, activeAtMillis = now)
+            state = state.copy(phase = LadderPhase.ACTIVE, activeAtMillis = now, pendingSelection = null)
             removeHint(HintCode.LAN_SLOW)
             removeHint(HintCode.BT_FALLBACK)
             setBandHint(bandHint(index))
@@ -697,7 +861,13 @@ class LinkLifecycle(
             }
             useLink(null)
             for (timer in state.timers.keys.toList()) cancelTimer(timer)
-            state = state.copy(phase = LadderPhase.TEARING_DOWN, teardownStartedAtMillis = now, hints = emptyList())
+            state =
+                state.copy(
+                    phase = LadderPhase.TEARING_DOWN,
+                    teardownStartedAtMillis = now,
+                    hints = emptyList(),
+                    pendingSelection = null,
+                )
             effects += LinkEffect.RestoreNetwork
             startTimer(LinkTimer.Restore, now + timeouts.restoreBudgetMillis)
         }
@@ -712,6 +882,9 @@ class LinkLifecycle(
             cancelTimer(LinkTimer.Deadline(index))
             cancelTimer(LinkTimer.Measure(index))
             set(index, attempt(index).copy(status = status, endReason = reason))
+            if (state.pendingSelection?.index == index && state.pendingSelection?.attempt == attempt(index).tries - 1) {
+                state = state.copy(pendingSelection = null)
+            }
             effects += LinkEffect.StopCandidate(index, reason)
         }
 
@@ -767,10 +940,17 @@ class LinkLifecycle(
     }
 
     companion object {
-        /** The first formation plus the one re-form of §9. */
+        /** Formations per rung and ladder run: the first plus one more (the §9 re-form, or a retry after a loss). */
         const val MAX_FORMATIONS: Int = 2
 
         private val BAND_CODES = setOf(HintCode.BAND24, HintCode.PEER_BAND24_ONLY, HintCode.STATION_BAND24)
+
+        /** Failures another try cannot fix on this device. */
+        private val PERMANENT_FAILURES = setOf(LinkEndReason.UNSUPPORTED, LinkEndReason.INVALID_CREDENTIALS)
+
+        /** Follower states in which the authority's selection is accepted at once. */
+        private val SELECTABLE =
+            setOf(AttemptStatus.READY, AttemptStatus.VERIFYING, AttemptStatus.MEASURING, AttemptStatus.STANDBY)
 
         /** A usable channel frequency, or null for an unknown one (`LinkReady.freq_mhz` = 0) or garbage. */
         internal fun validFrequency(freqMhz: Int?): Int? = freqMhz?.takeIf { it in 1..MAX_FREQ_MHZ }

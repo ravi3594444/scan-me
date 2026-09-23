@@ -150,18 +150,30 @@ class HintRulesTest {
         val mine = LadderHint.stationBand24(Side.LOCAL, null)
         val message = mine.toMessage()
         assertEquals(Hint(HintCode.STATION_BAND24, mapOf(LadderHint.PARAM_SIDE to LadderHint.SIDE_LOCAL)), message)
-        // On the peer's screen it is the other device's network.
+        // On the peer's screen it is the other device's network, named as the peer knows it; a name on the wire
+        // (the sender's name for the receiving device itself) is ignored.
         val theirs =
             LadderHint.fromMessage(
                 Hint(
                     HintCode.STATION_BAND24,
                     mapOf(
                         LadderHint.PARAM_SIDE to LadderHint.SIDE_LOCAL,
-                        LadderHint.PARAM_NAME to "Ravi",
+                        LadderHint.PARAM_NAME to "Asha",
                     ),
                 ),
+                peerName = "Ravi",
             )
         assertEquals("Ravi's Wi\u2011Fi network is on 2.4 GHz", theirs?.englishText)
+        // The peer's own station, seen from here, needs no name.
+        val mine2 =
+            LadderHint.fromMessage(
+                LadderHint.stationBand24(Side.PEER, "Asha").toMessage(),
+                peerName = "Ravi",
+            )
+        assertEquals("Your Wi\u2011Fi network is on 2.4 GHz", mine2?.englishText)
+        assertEquals(mapOf(LadderHint.PARAM_SIDE to LadderHint.SIDE_PEER), LadderHint.stationBand24(Side.PEER, "Asha").toMessage().params)
+        // "My peer supports 2.4 GHz only" describes the receiving device, which shows no band hint of its own.
+        assertNull(LadderHint.fromMessage(LadderHint.peerBand24Only("Asha").toMessage(), peerName = "Ravi"))
         assertEquals("The other device's Wi\u2011Fi network is on 2.4 GHz", LadderHint.stationBand24(Side.PEER, null).englishText)
         assertEquals("The other device supports 2.4 GHz only", LadderHint.peerBand24Only(null).englishText)
         assertEquals(LadderHint.sdcard(), LadderHint.fromMessage(LadderHint.sdcard().toMessage()))

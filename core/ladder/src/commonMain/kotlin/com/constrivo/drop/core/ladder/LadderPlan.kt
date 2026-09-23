@@ -1,6 +1,8 @@
 package com.constrivo.drop.core.ladder
 
+import com.constrivo.drop.core.discovery.DevicePlatform
 import com.constrivo.drop.core.protocol.LinkKind
+import com.constrivo.drop.core.protocol.TransferRole
 
 /**
  * How a rung of the ladder is brought up (architecture §4 and §8, with spec changes N8 and N10). [kind] is the link
@@ -94,6 +96,12 @@ enum class ElectionReason {
 
     /** Imposed by the receiver's `Accept` (S5: the receiver's choice is final). */
     AGREED,
+
+    /**
+     * Hotspot only: the Wi-Fi Direct group owner hosts the hotspot too. The group owner is settled by the `Offer` /
+     * `Accept` exchange (S5), so both devices agree on the hotspot host without negotiating it separately.
+     */
+    GROUP_OWNER,
 }
 
 /** The outcome of an election: [host] hosts, for [reason]. */
@@ -109,6 +117,9 @@ data class Election(
  * Candidate order is LAN, then one Wi-Fi Direct rung ([LinkMode.P2P] or [LinkMode.P2P_LEGACY]), then the local-only
  * hotspot, then Bluetooth; any of them may be missing. Bluetooth is not a link that is set up: it is the head-start
  * stream, listed last to say that it may carry the whole transfer.
+ *
+ * A plan whose peer is a browser ([isBrowserPlan], N8) is not run by [LadderRunner]: the browser receive path (WP9)
+ * hosts its rungs itself through [WifiLinkProvider.host], shows the QR code, and waits for the first HTTP request.
  *
  * @property groupOwnerElection who hosts the Wi-Fi Direct group and why (null without a Wi-Fi Direct rung). The group
  *   owner generates the SSID and passphrase (S5).
@@ -138,6 +149,22 @@ data class LadderPlan(
         if (p2p >= 0) require(candidates[p2p].host == groupOwnerElection?.host) { "the Wi-Fi Direct rung is hosted by the group owner" }
         if (hotspot >= 0) require(candidates[hotspot].host == hotspotElection?.host) { "the hotspot rung is hosted by its host" }
     }
+
+    /**
+     * The device that decides which link carries the data: the receiver, whose choice is final (S5) and whose meter
+     * sees the bytes that actually arrive. It measures the LAN, accepts links and cancels the losers, and tells the
+     * sender ([LinkEffect.AnnounceSelection]); the sender follows ([LinkLifecycle], "One authority").
+     */
+    val authority: Side get() = input.receiverSide
+
+    /** This device is the [authority]. */
+    val localIsAuthority: Boolean get() = input.localRole == TransferRole.RECEIVER
+
+    /**
+     * The peer is a browser (F-D6, N8): no app answers `LinkReady` and a person joins the network by hand, so the plan
+     * is hosted by the browser receive path (WP9), not run by [LadderRunner].
+     */
+    val isBrowserPlan: Boolean get() = input.peer.platform == DevicePlatform.BROWSER_PROXY
 
     /** The side that hosts the Wi-Fi Direct group, if there is one; it generates the credentials (S5). */
     val groupOwner: Side? get() = groupOwnerElection?.host

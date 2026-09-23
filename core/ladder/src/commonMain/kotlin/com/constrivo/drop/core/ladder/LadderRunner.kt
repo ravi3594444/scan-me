@@ -40,6 +40,14 @@ interface LadderSession {
         link: ActiveLink,
         peer: LinkReady,
     )
+
+    /**
+     * This device is the ladder's authority (the receiver, [LadderPlan.authority]) and moved the data to the link of
+     * [generation]: tell the peer, whose engine passes it to [LadderRunner.onPeerSelected] so that both devices use the
+     * same link and cancel the same losers (N9). The engine sends the N13 `ControlMoved` naming [generation], which it
+     * sends anyway when the control stream moves onto that link, as soon as the link's control stream is open.
+     */
+    suspend fun sendLinkSelected(generation: Int)
 }
 
 /**
@@ -199,6 +207,27 @@ sealed interface LadderLogEvent {
         val kind: String,
     ) : LadderLogEvent
 
+    /** This device, the authority, selected the link of [generation] and told the peer ([LadderSession.sendLinkSelected]). */
+    data class SelectionAnnounced(
+        override val atMillis: Long,
+        val index: Int,
+        val mode: LinkMode,
+        val generation: Int,
+    ) : LadderLogEvent
+
+    /** Telling the peer about the selection failed; the peer's rung then times out and the link is lost. */
+    data class SelectionError(
+        override val atMillis: Long,
+        val generation: Int,
+        val message: String?,
+    ) : LadderLogEvent
+
+    /** A selection from the peer that this device cannot use (it is the authority, or the generation is not this run's). */
+    data class PeerSelectionIgnored(
+        override val atMillis: Long,
+        val generation: Int,
+    ) : LadderLogEvent
+
     /** A link's teardown threw; the restore carries on with the rest. */
     data class TeardownError(
         override val atMillis: Long,
@@ -226,12 +255,22 @@ sealed interface LadderLogEvent {
  *
  * Each rung runs as: host or join with the provider; announce it with `LinkReady` (with the measured frequency, and
  * credentials the peer does not have yet); wait for the peer's `LinkReady` of the same generation; open the first data
- * stream through [session]; report it connected. The engine then moves data to [LadderState.dataLink] and feeds
- * [onThroughputSample] (needed for the LAN check), [onLinkLost] and the transfer events.
+ * stream through [session]; report it connected, with the channel both devices now know (the host's, else the
+ * joiner's). The engine then moves data to [LadderState.dataLink] and feeds [onThroughputSample] (needed for the LAN
+ * check), [onFrequency], [onLinkLost] and the transfer events.
+ *
+ * Both devices run a runner, and the receiver's decides ([LadderPlan.authority]): it accepts links and cancels the
+ * losers, and announces each acceptance through [LadderSession.sendLinkSelected]; the sender's runner waits for that
+ * announcement ([onPeerSelected]) before it moves data to a link or cancels anything.
+ *
+ * Browser plans ([LadderPlan.isBrowserPlan]) are refused: the browser receive path (WP9) hosts those itself.
  *
  * All inputs are thread-safe. Time comes from [clock] and the dispatcher of [scope]; tests pass a virtual clock and
- * dispatcher. Call [start] once. End the run with [onTransferEnded] or [close] before cancelling [scope]: a cancelled
- * scope skips the teardown.
+ * dispatcher. Call [start] once. The teardown and the network restore run in [scope]: end the run with
+ * [closeAndAwait] (or [onTransferEnded] / [close] followed by [awaitClosed]) and cancel [scope] only after it
+ * returned, or a legacy joiner can stay on the phone's network (F-E11).
+ *
+ * @throws IllegalArgumentException from the constructor for a browser plan.
  */
 class LadderRunner(
     val plan: LadderPlan,
@@ -261,6 +300,7 @@ class LadderRunner(
     private val timerJobs = HashMap<LinkTimer, Job>()
 
     init {
+        require(!plan.isBrowserPlan) { "a browser plan is hosted by the browser receive path, not run by the ladder runner" }
         scope.launch {
             for (input in inputs) handle(input)
         }
@@ -271,17 +311,59 @@ class LadderRunner(
         inputs.trySend(Input.Start)
     }
 
-    /** The peer announced a link (§7.2). Messages that belong to no rung of this run are logged and dropped. */
+    /**
+     * The peer announced a link (§7.2). Messages that belong to no rung of this run are logged and dropped. A repeated
+     * `LinkReady` for a generation already announced reports that link's channel again ([onFrequency]).
+     */
     fun onPeerLinkReady(message: LinkReady) {
         val kind = LadderGenerations.kindOf(config.generationBase, message.generation)
         if (kind == null || message.linkKind != kind) {
             emit(LadderLogEvent.PeerLinkReadyIgnored(now(), message.generation, message.kind))
             return
         }
-        peerReady.update { it + (message.generation to message) }
+        var repeated = false
+        peerReady.update {
+            repeated = message.generation in it
+            if (repeated) it else it + (message.generation to message)
+        }
+        if (repeated) {
+            LinkLifecycle.validFrequency(message.freqMhz)?.let { inputs.trySend(Input.GenerationFrequency(message.generation, it)) }
+        }
     }
 
-    /** [bytes] moved over the [kind] link since the previous sample (the engine's 250 ms samples, §7.4). */
+    /**
+     * The peer, the authority, moved the data to the link of [generation] (its [LadderSession.sendLinkSelected], carried
+     * by N13 `ControlMoved`). This device accepts that link as soon as it is up here and cancels the others. Ignored on
+     * the authority itself and for generations outside this run.
+     */
+    fun onPeerSelected(generation: Int) {
+        val kind = LadderGenerations.kindOf(config.generationBase, generation)
+        val index = kind?.let { k -> plan.candidates.indexOfFirst { it.kind == k } } ?: -1
+        if (plan.localIsAuthority || index < 0) {
+            emit(LadderLogEvent.PeerSelectionIgnored(now(), generation))
+            return
+        }
+        val attempt = (generation - config.generationBase) % LinkLifecycle.MAX_FORMATIONS
+        inputs.trySend(Input.Event(LinkEvent.PeerSelected(index, attempt)))
+    }
+
+    /**
+     * The channel of the [kind] link changed or became known after it came up (Android group information delivered
+     * after the connection, a channel switch). It updates the badge and the band hint (T-04).
+     */
+    fun onFrequency(
+        kind: LinkKind,
+        freqMhz: Int,
+    ) {
+        LinkLifecycle.validFrequency(freqMhz)?.let { inputs.trySend(Input.KindFrequency(kind, it)) }
+    }
+
+    /**
+     * [bytes] moved over the [kind] link since the previous sample (the engine's 250 ms samples, §7.4). Only the
+     * authority's samples decide the LAN check: the receiver reports the bytes that arrived on the link, counted as
+     * they arrive rather than per verified chunk, since a 4 MiB chunk is 40% of the 10 MB threshold. The sender's
+     * samples are kept for the log only.
+     */
     fun onThroughputSample(
         kind: LinkKind,
         bytes: Long,
@@ -307,11 +389,17 @@ class LadderRunner(
         inputs.trySend(Input.Event(LinkEvent.TransferEnded(cancelled, moreQueued)))
     }
 
-    /** Tears everything down now and restores the previous network. */
+    /** Tears everything down now and restores the previous network, in [scope]; see [closeAndAwait]. */
     fun close() = onTransferEnded(cancelled = true)
 
     /** Suspends until the previous network is back ([LadderPhase.CLOSED]). */
     suspend fun awaitClosed(): LadderState = state.first { it.phase == LadderPhase.CLOSED }
+
+    /** [close], then [awaitClosed]: once this returns, the scope may be cancelled without skipping the restore. */
+    suspend fun closeAndAwait(): LadderState {
+        close()
+        return awaitClosed()
+    }
 
     // ---- Actor ----
 
@@ -336,9 +424,22 @@ class LadderRunner(
         data class Lost(
             val kind: LinkKind,
         ) : Input
+
+        data class KindFrequency(
+            val kind: LinkKind,
+            val freqMhz: Int,
+        ) : Input
+
+        data class GenerationFrequency(
+            val generation: Int,
+            val freqMhz: Int,
+        ) : Input
     }
 
-    /** One formation of one rung; [link] is set once the provider returned it (read after [job] completes, or by the actor). */
+    /**
+     * One formation of one rung; [link] is set as soon as the provider hands the link over (`onUp`), so a teardown
+     * after [job] completes finds it even when the provider's return was lost to cancellation.
+     */
     private class AttemptHandle(
         val index: Int,
         val candidate: LinkCandidate,
@@ -369,8 +470,23 @@ class LadderRunner(
             }
 
             is Input.Lost -> {
-                val index = state?.attempts?.indexOfFirst { it.candidate.kind == input.kind && it.status in UP }
+                val index = state?.attempts?.indexOfFirst { it.candidate.kind == input.kind && it.status.isUp }
                 if (index != null && index >= 0) reduce(LinkEvent.LinkLost(index))
+            }
+
+            is Input.KindFrequency -> {
+                val index =
+                    state?.attempts?.indexOfFirst {
+                        it.candidate.kind == input.kind && it.status != AttemptStatus.PENDING && !it.status.isEnded
+                    }
+                if (index != null && index >= 0) reduce(LinkEvent.FrequencyReported(index, input.freqMhz))
+            }
+
+            is Input.GenerationFrequency -> {
+                val kind = LadderGenerations.kindOf(config.generationBase, input.generation) ?: return
+                val attempt = (input.generation - config.generationBase) % LinkLifecycle.MAX_FORMATIONS
+                val index = state?.attempts?.indexOfFirst { it.candidate.kind == kind && it.tries - 1 == attempt }
+                if (index != null && index >= 0) reduce(LinkEvent.FrequencyReported(index, input.freqMhz))
             }
         }
     }
@@ -400,6 +516,7 @@ class LadderRunner(
             is LinkEffect.StartCandidate -> startAttempt(effect)
             is LinkEffect.StopCandidate -> stopAttempt(effect.index, effect.reason)
             is LinkEffect.UseLink -> Unit
+            is LinkEffect.AnnounceSelection -> announce(effect)
             is LinkEffect.StartTimer -> startTimer(effect.timer, effect.atMillis)
             is LinkEffect.CancelTimer -> timerJobs.remove(effect.timer)?.cancel()
             LinkEffect.RestoreNetwork -> restore()
@@ -458,6 +575,21 @@ class LadderRunner(
         }
     }
 
+    private fun announce(effect: LinkEffect.AnnounceSelection) {
+        val mode = plan.candidates[effect.index].mode
+        val generation = LadderGenerations.of(config.generationBase, mode, effect.attempt)
+        emit(LadderLogEvent.SelectionAnnounced(now(), effect.index, mode, generation))
+        scope.launch {
+            try {
+                session.sendLinkSelected(generation)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                emit(LadderLogEvent.SelectionError(now(), generation, e.message ?: e::class.simpleName))
+            }
+        }
+    }
+
     private fun startTimer(
         timer: LinkTimer,
         atMillis: Long,
@@ -502,7 +634,8 @@ class LadderRunner(
                         } else {
                             null
                         }
-                    provider.host(HostRequest(candidate.mode, credentials, candidate.requestFiveGhz, config.persistent, handle.attempt))
+                    val request = HostRequest(candidate.mode, credentials, candidate.requestFiveGhz, config.persistent, handle.attempt)
+                    provider.host(request) { handle.link.value = it }
                 } else {
                     val credentials =
                         when (candidate.mode) {
@@ -523,7 +656,7 @@ class LadderRunner(
                             }
                         }
                     val known = peerReady.value[generation]
-                    provider.join(
+                    val request =
                         JoinRequest(
                             candidate.mode,
                             credentials,
@@ -532,13 +665,12 @@ class LadderRunner(
                             known?.address,
                             known?.port,
                             handle.attempt,
-                        ),
-                    )
+                        )
+                    provider.join(request) { handle.link.value = it }
                 }
             handle.link.value = link
 
             val ownFreq = LinkLifecycle.validFrequency(link.frequencyMhz)
-            if (ownFreq != null) report(LinkEvent.FrequencyReported(index, ownFreq))
             val announced =
                 when {
                     role != LinkRole.HOST || !candidate.mode.isDirect -> {
@@ -562,9 +694,10 @@ class LadderRunner(
 
             val peer = awaitPeer(generation)
             val peerFreq = LinkLifecycle.validFrequency(peer.freqMhz)
-            if (ownFreq == null && peerFreq != null) report(LinkEvent.FrequencyReported(index, peerFreq))
             session.openStream(link, peer)
-            report(LinkEvent.Connected(index, ownFreq ?: peerFreq))
+            // Both devices hold both measurements now; the host's comes first, so both take the same re-form decision.
+            val shared = if (role == LinkRole.HOST) ownFreq ?: peerFreq else peerFreq ?: ownFreq
+            report(LinkEvent.Connected(index, shared))
         } catch (e: CancellationException) {
             throw e
         } catch (e: LinkCredentialsException) {
@@ -630,6 +763,5 @@ class LadderRunner(
 
     private companion object {
         const val EVENT_BUFFER = 256
-        val UP = setOf(AttemptStatus.VERIFYING, AttemptStatus.MEASURING, AttemptStatus.STANDBY, AttemptStatus.ACTIVE)
     }
 }

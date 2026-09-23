@@ -42,7 +42,10 @@ data class HostRequest(
  *   `WiFiAdapter.ConnectAsync`, CoreWLAN `associate`, NetworkManager `AddAndActivateConnection`); [LinkMode.LAN] binds
  *   to the current network.
  * @property credentials the host's SSID and passphrase; null for the LAN.
- * @property hostAddress and [hostPort] where the host accepts streams, from its `LinkReady`, when known.
+ * @property hostAddress and [hostPort] where the host accepts streams, from its `LinkReady`, when known. For the LAN
+ *   this is the address the sender announced after the handshake authenticated it, so no unauthenticated mDNS
+ *   endpoint is dialled here: trying each `NearbyDevice.lanEndpoints` entry behind the identity check is the
+ *   handshake's job (WP4, WP7), before the ladder runs.
  */
 data class JoinRequest(
     val mode: LinkMode,
@@ -70,7 +73,10 @@ interface ActiveLink {
     val mode: LinkMode
     val role: LinkRole
 
-    /** The measured channel in MHz (`WifiP2pGroup.getFrequency()`, the joined network's frequency), or null if unknown. */
+    /**
+     * The measured channel in MHz when the link came up (`WifiP2pGroup.getFrequency()`, the joined network's
+     * frequency), or null if unknown then. A channel learnt or changed later goes to [LadderRunner.onFrequency].
+     */
     val frequencyMhz: Int?
 
     /** Host only: the credentials joiners use (the system-generated ones for a hotspot, N15). Null when joining. */
@@ -104,8 +110,16 @@ interface ActiveLink {
  * (Android: host and join for Wi-Fi Direct and hotspot; Windows, macOS and Linux: join only, N8 and N10).
  *
  * Both calls suspend until the link is up on this device or fails. The ladder cancels them when a candidate times out
- * or loses a race (N9); a provider must then undo whatever it started (remove the half-formed group, release the
- * network request) before the cancellation completes. [join] keeps retrying while the host is not up yet.
+ * or loses a race (N9). [join] keeps retrying while the host is not up yet.
+ *
+ * Ownership of the link passes to the ladder through `onUp`, never through the return value alone:
+ * - Call `onUp` with the [ActiveLink] as soon as it exists (group formed, hotspot started, network joined), from any
+ *   thread, before resuming the caller. From then on the ladder owns the link and tears it down, even when the call
+ *   is cancelled before it returns: a result resumed through `withContext` or `suspendCancellableCoroutine` is
+ *   dropped by prompt cancellation, and would otherwise leave a group up or a desktop on the phone's network (F-E11).
+ *   Then return the same link.
+ * - Cancelled before `onUp`: undo whatever was started (remove the half-formed group, release the network request)
+ *   before the cancellation completes. After `onUp` do not tear the link down on cancellation; the ladder does.
  */
 interface WifiLinkProvider {
     val kind: LinkKind
@@ -115,9 +129,18 @@ interface WifiLinkProvider {
         role: LinkRole,
     ): Boolean
 
-    /** Hosts the link (group owner, hotspot host, LAN listener). The result reports the real band. */
-    suspend fun host(request: HostRequest): ActiveLink
+    /**
+     * Hosts the link (group owner, hotspot host, LAN listener). The result reports the real band. [onUp] receives the
+     * link as soon as it exists (see the interface comment).
+     */
+    suspend fun host(
+        request: HostRequest,
+        onUp: (ActiveLink) -> Unit,
+    ): ActiveLink
 
-    /** Joins a link the peer hosts. */
-    suspend fun join(request: JoinRequest): ActiveLink
+    /** Joins a link the peer hosts. [onUp] receives the link as soon as it exists (see the interface comment). */
+    suspend fun join(
+        request: JoinRequest,
+        onUp: (ActiveLink) -> Unit,
+    ): ActiveLink
 }

@@ -8,9 +8,13 @@ import com.constrivo.drop.core.protocol.LinkKind
  * devices' facts to an ordered [LadderPlan].
  *
  * Rungs, in order:
- * 1. **LAN** when both network hints are equal and non-zero, or the peer's mDNS record is live on this network
- *    ([LadderInput.lanReachable]). The hint is only a weak prior (N6), so either signal is enough. Different or zero
- *    hints without an mDNS record skip the LAN at once: two phones on mobile data go straight to Wi-Fi Direct (T-15).
+ * 1. **LAN** when the peer's mDNS record is live on this network ([LadderInput.lanReachable], N6: the real
+ *    same-network test), or when both network hints are equal and non-zero and the LAN probe can run beside the
+ *    Wi-Fi Direct formation (the direct rung's joiner keeps its network) or no direct rung follows. Equal hints are a
+ *    weak prior (192.168.1.1 and 192.168.43.1 collide), so they never hold up a joiner that must leave its network:
+ *    such a rung waits for the LAN verdict, which a collision would stretch to the full 1 s connect timeout. Different
+ *    or zero hints without an mDNS record skip the LAN at once: two phones on mobile data go straight to Wi-Fi Direct
+ *    (T-15).
  * 2. **Wi-Fi Direct** when one device can host a group (a phone with Wi-Fi Direct, Wi-Fi on, hosting allowed) and the
  *    other can join it. A phone with Wi-Fi Direct joins as a Wi-Fi Direct client ([LinkMode.P2P]); every other device
  *    with Wi-Fi (macOS, Windows, Linux, a browser's computer, a phone without Wi-Fi Direct) joins the phone's group as a
@@ -20,12 +24,19 @@ import com.constrivo.drop.core.protocol.LinkKind
  *    with Wi-Fi (N8: its band is not app-selectable).
  * 4. **Bluetooth** when both devices have Bluetooth on (not towards a browser or a wired desktop).
  *
- * Host election ([electHost]) for the group and the hotspot, first rule that decides:
+ * Host election ([electHost]) for the group, first rule that decides:
  * 1. never a device whose station interface is on 2.4 GHz when the other can host (N9);
  * 2. the device that can host 5 GHz: verified (capability bit 4) over 5 GHz-capable over 2.4 GHz only;
  * 3. Wi-Fi 6 or newer (bit 2);
  * 4. more battery, when both levels are known;
  * 5. otherwise the receiver.
+ *
+ * The hotspot is hosted by the group owner when it can host one ([ElectionReason.GROUP_OWNER]): the group owner is
+ * negotiated (S5), so both devices agree on it even when one of them may not host right now (the agreed owner counts
+ * even when this device then cannot run the group it agreed to host). Otherwise the same rules
+ * elect the hotspot host from the facts both devices share (capabilities and platform), leaving out
+ * [LinkFacts.hostingAllowed], which only the device itself knows. A host that may not host now then drops the rung
+ * at once instead of electing the other device on its own: the other device could not know, and both would join.
  *
  * The LAN probe runs in parallel with Wi-Fi Direct formation when the joiner stays on its network
  * ([LadderPlan.parallelLanProbe], N9).
@@ -39,12 +50,6 @@ object LadderPlanner {
         constraints: PlanConstraints,
     ): LadderPlan {
         val candidates = ArrayList<LinkCandidate>(4)
-
-        val hint = input.local.networkHint
-        val sameHint = !hint.isNone && hint == input.peer.networkHint
-        if ((sameHint || input.lanReachable) && constraints.allows(LinkKind.LAN)) {
-            candidates += LinkCandidate(LinkMode.LAN, host = input.senderSide)
-        }
 
         val groupOwner =
             if (!constraints.allows(LinkKind.P2P)) {
@@ -66,12 +71,10 @@ object LadderPlanner {
                 )
         }
 
-        val hotspotHost =
-            if (!constraints.allows(LinkKind.HOTSPOT)) {
-                null
-            } else {
-                electHost(input) { side -> input.canHostHotspot(side) && input.canJoinAsLegacyClient(side.other) }
-            }
+        // The agreed group owner, even when this device cannot run the group it agreed to host, so that both devices
+        // derive the hotspot host from the same side.
+        val agreedOwner = constraints.groupOwner ?: groupOwner?.host
+        val hotspotHost = if (constraints.allows(LinkKind.HOTSPOT)) electHotspotHost(input, agreedOwner) else null
         if (hotspotHost != null) {
             candidates +=
                 LinkCandidate(
@@ -81,6 +84,15 @@ object LadderPlanner {
                 )
         }
 
+        val hint = input.local.networkHint
+        val sameHint = !hint.isNone && hint == input.peer.networkHint
+        val firstDirect = candidates.firstOrNull { it.mode.isDirect }
+        val probeRunsBeside = firstDirect == null || !firstDirect.mode.joinerLeavesNetwork
+        val lan = constraints.lan ?: (input.lanReachable || (sameHint && probeRunsBeside))
+        if (lan && constraints.allows(LinkKind.LAN)) {
+            candidates.add(0, LinkCandidate(LinkMode.LAN, host = input.senderSide))
+        }
+
         val bluetooth = input.bluetoothOn(Side.LOCAL) && input.bluetoothOn(Side.PEER) && constraints.allows(LinkKind.BLUETOOTH)
         if (bluetooth) candidates += LinkCandidate(LinkMode.BLUETOOTH)
 
@@ -88,6 +100,20 @@ object LadderPlanner {
         val initialHints =
             if (bluetooth && candidates.none { it.mode.isWifi } && wifiOff) listOf(LadderHint.btFallback()) else emptyList()
         return LadderPlan(input, candidates, groupOwner, hotspotHost, initialHints)
+    }
+
+    /**
+     * The hotspot host (class comment): the group owner when it can host a hotspot, otherwise elected from the facts
+     * both devices share; null when nobody can, or when the elected device may not host now.
+     */
+    private fun electHotspotHost(
+        input: LadderInput,
+        groupOwner: Side?,
+    ): Election? {
+        val canHost = { side: Side -> input.canHostHotspotBySharedFacts(side) && input.canJoinAsLegacyClient(side.other) }
+        val elected =
+            if (groupOwner != null && canHost(groupOwner)) Election(groupOwner, ElectionReason.GROUP_OWNER) else electHost(input, canHost)
+        return elected?.takeIf { input.facts(it.host).hostingAllowed }
     }
 
     /**
@@ -140,12 +166,14 @@ object LadderPlanner {
 }
 
 /**
- * Limits a re-plan to what both devices agreed on (S5, [LadderNegotiation]): only rungs of [kinds] (null: all), and
- * the Wi-Fi Direct group hosted by [groupOwner] when set.
+ * Limits a re-plan to what both devices agreed on (S5, [LadderNegotiation]): only rungs of [kinds] (null: all), the
+ * Wi-Fi Direct group hosted by [groupOwner] when set, and the LAN rung kept or dropped as [lan] says (null: from the
+ * evidence).
  */
 internal data class PlanConstraints(
     val kinds: Set<LinkKind>? = null,
     val groupOwner: Side? = null,
+    val lan: Boolean? = null,
 ) {
     fun allows(kind: LinkKind): Boolean = kinds == null || kind in kinds
 

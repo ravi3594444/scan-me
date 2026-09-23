@@ -77,8 +77,12 @@ data class LadderHint(
             }
         }
 
-    /** The `Hint` control message for this hint (§7.2). */
-    fun toMessage(transferId: TransferId? = null): Hint = Hint(code, params, transferId)
+    /**
+     * The `Hint` control message for this hint (§7.2). Names are never sent: [PARAM_NAME] is a nickname as this device
+     * knows it, and the receiving device resolves its own ([fromMessage]). Band hints (`band24`, `peer_band24_only`,
+     * `sta_band24`) need not be sent at all, since each device derives its own from the link ([BandHints]).
+     */
+    fun toMessage(transferId: TransferId? = null): Hint = Hint(code, params - PARAM_NAME, transferId)
 
     companion object {
         /** The other device's nickname (`{Name}` in design §8.2). */
@@ -93,17 +97,28 @@ data class LadderHint(
         const val SIDE_PEER: String = "peer"
 
         /**
-         * The hint of a received `Hint` message, or null for a code this build does not know (the UI skips those,
-         * §7.2 forward compatibility). A message's `side` is from the sender's point of view, so it is flipped.
+         * The hint of a `Hint` message received from the peer called [peerName], seen from this device, or null when
+         * there is nothing to show here: a code this build does not know (the UI skips those, §7.2 forward
+         * compatibility), or `peer_band24_only`, which then describes this device, and the 2.4 GHz-only device shows no
+         * band hint ([BandHints]). The message's `side` is from the sender's point of view, so it is flipped, and a
+         * name in the message is ignored: it would be the sender's name for this device. The name, where the copy
+         * needs one, is [peerName].
          */
-        fun fromMessage(message: Hint): LadderHint? {
+        fun fromMessage(
+            message: Hint,
+            peerName: String? = null,
+        ): LadderHint? {
             val code = message.hintCode ?: return null
-            val params =
+            if (code == HintCode.PEER_BAND24_ONLY) return null
+            val side =
                 when (message.params[PARAM_SIDE]) {
-                    SIDE_LOCAL -> message.params + (PARAM_SIDE to SIDE_PEER)
-                    SIDE_PEER -> message.params + (PARAM_SIDE to SIDE_LOCAL)
-                    else -> message.params
+                    SIDE_LOCAL -> SIDE_PEER
+                    SIDE_PEER -> SIDE_LOCAL
+                    else -> null
                 }
+            var params = message.params - PARAM_NAME
+            if (side != null) params = params + (PARAM_SIDE to side)
+            if (code == HintCode.STATION_BAND24 && side == SIDE_PEER) params = params + nameParam(peerName)
             return LadderHint(code, params)
         }
 

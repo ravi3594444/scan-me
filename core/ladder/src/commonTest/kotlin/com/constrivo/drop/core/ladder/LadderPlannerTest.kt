@@ -136,11 +136,34 @@ class LadderPlannerTest {
                 requestFiveGhz = true,
             ),
             Case(
-                "N9: a Mac on the same LAN waits for the LAN verdict (joining would leave the LAN)",
-                input(phone(Caps.FLAGSHIP.onWifi(true), HOME_ROUTER), laptop(Caps.MAC.onWifi(true), HOME_ROUTER)),
+                "N9: a Mac seen over mDNS waits for the LAN verdict (joining would leave the LAN)",
+                input(phone(Caps.FLAGSHIP.onWifi(true), HOME_ROUTER), laptop(Caps.MAC.onWifi(true), HOME_ROUTER), lanReachable = true),
                 listOf(LAN to LOCAL, P2P_LEGACY to LOCAL, HOTSPOT to LOCAL, BLUETOOTH to null),
                 parallel = false,
                 requestFiveGhz = true,
+            ),
+            Case(
+                "N6: equal hints without mDNS do not hold up a Mac's legacy join (hints collide, 192.168.1.1)",
+                input(phone(Caps.FLAGSHIP.onWifi(true), HOME_ROUTER), laptop(Caps.MAC.onWifi(true), HOME_ROUTER)),
+                listOf(P2P_LEGACY to LOCAL, HOTSPOT to LOCAL, BLUETOOTH to null),
+                requestFiveGhz = true,
+            ),
+            Case(
+                "N6: equal hints without mDNS still race two phones' Wi-Fi Direct formation (it costs nothing)",
+                input(phone(Caps.MIDRANGE, HOME_ROUTER), phone(Caps.MIDRANGE, HOME_ROUTER)),
+                listOf(LAN to LOCAL, P2P to PEER, HOTSPOT to PEER, BLUETOOTH to null),
+                parallel = true,
+                requestFiveGhz = true,
+            ),
+            Case(
+                "N6: equal hints without mDNS do not hold up a hotspot join between phones without Wi-Fi Direct",
+                input(phone(Caps.NO_WIFI_DIRECT, HOME_ROUTER), phone(Caps.NO_WIFI_DIRECT, HOME_ROUTER)),
+                listOf(HOTSPOT to PEER, BLUETOOTH to null),
+            ),
+            Case(
+                "N6: with mDNS the hotspot joiner waits for the LAN verdict",
+                input(phone(Caps.NO_WIFI_DIRECT, HOME_ROUTER), phone(Caps.NO_WIFI_DIRECT, HOME_ROUTER), lanReachable = true),
+                listOf(LAN to LOCAL, HOTSPOT to PEER, BLUETOOTH to null),
             ),
             Case(
                 "N8: a browser joins the phone's group; no Bluetooth towards a browser",
@@ -179,6 +202,11 @@ class LadderPlannerTest {
                 input(phone(hostingAllowed = false), laptop(Caps.MAC)),
                 listOf(BLUETOOTH to null),
             ),
+            Case(
+                "a hotspot host that may not host now drops the rung rather than electing the peer, who cannot know",
+                input(phone(Caps.NO_WIFI_DIRECT, battery = 90, hostingAllowed = false), phone(Caps.NO_WIFI_DIRECT, battery = 10)),
+                listOf(BLUETOOTH to null),
+            ),
         )
 
     @Test
@@ -192,6 +220,22 @@ class LadderPlannerTest {
             assertEquals(plan.p2pCandidate?.host, plan.groupOwner, "${case.name}: group owner")
             assertEquals(plan.candidate(HOTSPOT)?.host, plan.hotspotHost, "${case.name}: hotspot host")
         }
+    }
+
+    @Test
+    fun fE3_theHotspotFollowsTheGroupOwner() {
+        // The peer wins the group owner election on battery; the hotspot goes with it.
+        val plan = plan(phone(Caps.MIDRANGE, battery = 20), phone(Caps.MIDRANGE, battery = 80))
+        assertEquals(PEER, plan.groupOwner)
+        assertEquals(Election(PEER, ElectionReason.GROUP_OWNER), plan.hotspotElection)
+        // The group owner cannot host a hotspot: the shared election picks the one that can.
+        val noHotspotHere = plan(phone(Caps.MIDRANGE - Flag.CAN_HOST_LOCAL_HOTSPOT, battery = 80), phone(Caps.MIDRANGE, battery = 20))
+        assertEquals(LOCAL, noHotspotHere.groupOwner)
+        assertEquals(Election(PEER, ElectionReason.ONLY_HOST), noHotspotHere.hotspotElection)
+        // Hosting not allowed here (the hotspot is in use): the peer hosts the group, so the hotspot goes there too.
+        val busy = plan(phone(Caps.FLAGSHIP, hostingAllowed = false), phone(Caps.MIDRANGE))
+        assertEquals(PEER, busy.groupOwner)
+        assertEquals(Election(PEER, ElectionReason.GROUP_OWNER), busy.hotspotElection)
     }
 
     @Test

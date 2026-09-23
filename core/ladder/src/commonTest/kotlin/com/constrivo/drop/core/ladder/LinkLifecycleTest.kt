@@ -6,11 +6,13 @@ import com.constrivo.drop.core.ladder.AttemptStatus.ACTIVE
 import com.constrivo.drop.core.ladder.AttemptStatus.FAILED
 import com.constrivo.drop.core.ladder.AttemptStatus.MEASURING
 import com.constrivo.drop.core.ladder.AttemptStatus.PENDING
+import com.constrivo.drop.core.ladder.AttemptStatus.READY
 import com.constrivo.drop.core.ladder.AttemptStatus.STANDBY
 import com.constrivo.drop.core.ladder.AttemptStatus.STARTING
 import com.constrivo.drop.core.ladder.AttemptStatus.STOPPED
 import com.constrivo.drop.core.ladder.AttemptStatus.VERIFYING
 import com.constrivo.drop.core.ladder.Caps.onWifi
+import com.constrivo.drop.core.ladder.LinkEffect.AnnounceSelection
 import com.constrivo.drop.core.ladder.LinkEffect.CancelTimer
 import com.constrivo.drop.core.ladder.LinkEffect.RestoreNetwork
 import com.constrivo.drop.core.ladder.LinkEffect.StartCandidate
@@ -21,6 +23,7 @@ import com.constrivo.drop.core.ladder.LinkEvent.Connected
 import com.constrivo.drop.core.ladder.LinkEvent.Failed
 import com.constrivo.drop.core.ladder.LinkEvent.FrequencyReported
 import com.constrivo.drop.core.ladder.LinkEvent.LinkLost
+import com.constrivo.drop.core.ladder.LinkEvent.PeerSelected
 import com.constrivo.drop.core.ladder.LinkEvent.RestoreCompleted
 import com.constrivo.drop.core.ladder.LinkEvent.ThroughputSample
 import com.constrivo.drop.core.ladder.LinkEvent.TimerFired
@@ -37,6 +40,9 @@ import com.constrivo.drop.core.protocol.ProtocolConstants.LAN_MEASURE_MS
 import com.constrivo.drop.core.protocol.ProtocolConstants.LINK_IDLE_TEARDOWN_MS
 import com.constrivo.drop.core.protocol.ProtocolConstants.P2P_FORMATION_TIMEOUT_MS
 import com.constrivo.drop.core.protocol.ProtocolConstants.WIFI_RESTORE_BUDGET_MS
+import com.constrivo.drop.core.protocol.TransferRole
+import com.constrivo.drop.core.protocol.TransferRole.RECEIVER
+import com.constrivo.drop.core.protocol.TransferRole.SENDER
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -44,19 +50,36 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
-/** Architecture §4, §7.8 and §9 with N9, as a pure reducer driven by a fake clock. */
+/**
+ * Architecture §4, §7.8 and §9 with N9, as a pure reducer driven by a fake clock. Most cases run on the receiver, the
+ * ladder's authority; the "follower" cases run on the sender.
+ */
 class LinkLifecycleTest {
     private val lifecycle = LinkLifecycle()
     private val t0 = 5_000_000L
 
-    /** Rungs: 0 LAN, 1 Wi-Fi Direct (peer hosts), 2 hotspot, 3 Bluetooth. */
-    private val sameRouter = plan(phone(Caps.FLAGSHIP.onWifi(true), HOME_ROUTER), phone(Caps.FLAGSHIP.onWifi(true), HOME_ROUTER))
+    /** Plans from the receiver's side (the authority) unless [role] says otherwise. */
+    private fun rplan(
+        local: LinkFacts,
+        peer: LinkFacts,
+        role: TransferRole = RECEIVER,
+        localRadio: RadioState = RadioState.ALL_ON,
+        lanReachable: Boolean = false,
+    ): LadderPlan = plan(local, peer, role, localRadio = localRadio, lanReachable = lanReachable)
 
-    /** Rungs: 0 Wi-Fi Direct (peer hosts), 1 hotspot, 2 Bluetooth. */
-    private val mobileData = plan(phone(), phone())
+    private val sameRouterFacts = phone(Caps.FLAGSHIP.onWifi(true), HOME_ROUTER)
 
-    /** Rungs: 0 LAN, 1 legacy join of this phone's group, 2 hotspot, 3 Bluetooth. */
-    private val macOnSameLan = plan(phone(Caps.FLAGSHIP.onWifi(true), HOME_ROUTER), laptop(Caps.MAC.onWifi(true), HOME_ROUTER))
+    /** Rungs: 0 LAN (the sender listens), 1 Wi-Fi Direct (hosted here), 2 hotspot (here), 3 Bluetooth. */
+    private val sameRouter = rplan(sameRouterFacts, sameRouterFacts)
+
+    /** Rungs: 0 Wi-Fi Direct (hosted here), 1 hotspot (here), 2 Bluetooth. */
+    private val mobileData = rplan(phone(), phone())
+
+    /** Rungs: 0 LAN (the Mac listens), 1 legacy join of this phone's group, 2 hotspot, 3 Bluetooth. */
+    private val macOnSameLan = rplan(sameRouterFacts, laptop(Caps.MAC.onWifi(true), HOME_ROUTER), lanReachable = true)
+
+    /** The same pair seen from the sender, which follows the receiver's decisions. */
+    private val sameRouterFollower = rplan(sameRouterFacts, sameRouterFacts, SENDER)
 
     private inner class Driver(
         plan: LadderPlan,
@@ -126,8 +149,11 @@ class LinkLifecycleTest {
         assertEquals(MEASURING, d.status(0))
         d.on(ThroughputSample(0, 2_000_000), t0 + 900)
         assertEquals(ACTIVE, d.status(0))
-        // The loser of the race is cancelled (N9).
-        assertEquals(listOf(CancelTimer(Measure(0)), CancelTimer(Deadline(1)), StopCandidate(1, LinkEndReason.SUPERSEDED)), d.effects)
+        // The peer is told, and the loser of the race is cancelled (N9).
+        assertEquals(
+            listOf(CancelTimer(Measure(0)), AnnounceSelection(0, 0), CancelTimer(Deadline(1)), StopCandidate(1, LinkEndReason.SUPERSEDED)),
+            d.effects,
+        )
         assertEquals(STOPPED, d.status(1))
         assertEquals(PENDING, d.status(2))
         assertEquals(LadderPhase.ACTIVE, d.state.phase)
@@ -143,7 +169,13 @@ class LinkLifecycleTest {
         d.on(Connected(1, 5180), t0 + 800)
         assertEquals(ACTIVE, d.status(1))
         assertEquals(
-            listOf(CancelTimer(Deadline(1)), UseLink(1), CancelTimer(Measure(0)), StopCandidate(0, LinkEndReason.SUPERSEDED)),
+            listOf(
+                CancelTimer(Deadline(1)),
+                UseLink(1),
+                AnnounceSelection(1, 0),
+                CancelTimer(Measure(0)),
+                StopCandidate(0, LinkEndReason.SUPERSEDED),
+            ),
             d.effects,
         )
         assertEquals(1, d.state.dataLink)
@@ -163,14 +195,17 @@ class LinkLifecycleTest {
         assertEquals(emptyList(), d.effects) // nothing new starts: Wi-Fi Direct is already forming
 
         d.on(Connected(1, 5745), t0 + 2_500)
-        assertEquals(listOf(CancelTimer(Deadline(1)), UseLink(1), StopCandidate(0, LinkEndReason.SUPERSEDED)), d.effects)
+        assertEquals(
+            listOf(CancelTimer(Deadline(1)), UseLink(1), AnnounceSelection(1, 0), StopCandidate(0, LinkEndReason.SUPERSEDED)),
+            d.effects,
+        )
         assertEquals(emptyList(), d.state.hints)
         assertEquals(LadderPhase.ACTIVE, d.state.phase)
     }
 
     @Test
     fun fE4_slowLanIsUsedWhenNoDirectLinkIsLeft() {
-        val lanOnly = plan(laptop(Caps.WINDOWS, HOME_ROUTER), laptop(Caps.MAC, HOME_ROUTER))
+        val lanOnly = rplan(laptop(Caps.WINDOWS, HOME_ROUTER), laptop(Caps.MAC, HOME_ROUTER))
         val d = Driver(lanOnly)
         d.on(Connected(0), t0 + 100)
         d.on(ThroughputSample(0, 2_000_000), t0 + 700)
@@ -289,7 +324,7 @@ class LinkLifecycleTest {
 
     @Test
     fun fE1_wifiOffGoesStraightToBluetoothWithTheSlowModeHint() {
-        val offPlan = plan(phone(), phone(), localRadio = RadioState(wifiEnabled = false, bluetoothEnabled = true))
+        val offPlan = rplan(phone(), phone(), localRadio = RadioState(wifiEnabled = false, bluetoothEnabled = true))
         val d = Driver(offPlan)
         assertEquals(LadderPhase.BLUETOOTH_ONLY, d.state.phase)
         assertEquals(listOf(HintCode.BT_FALLBACK), d.hintCodes())
@@ -299,7 +334,7 @@ class LinkLifecycleTest {
 
     @Test
     fun fE1_noPathAtAllIsUnreachable() {
-        val none = plan(phone(), laptop(Caps.WIRED_DESKTOP, OFFICE_ROUTER))
+        val none = rplan(phone(), laptop(Caps.WIRED_DESKTOP, OFFICE_ROUTER))
         val d = Driver(none)
         assertEquals(LadderPhase.UNREACHABLE, d.state.phase)
         assertNull(d.state.badge)
@@ -309,32 +344,177 @@ class LinkLifecycleTest {
     }
 
     @Test
-    fun fE1_lostLinkIsReplacedByTheNextUntriedRung() {
+    fun t04_lostGroupIsReformedOnceOn24GhzThenTheNextRungTakesOver() {
         val d = Driver(mobileData)
         d.on(Connected(0, 5180), t0 + 1_000)
         assertEquals(LadderPhase.ACTIVE, d.state.phase)
-        d.on(LinkLost(0), t0 + 30_000)
-        assertEquals(FAILED, d.status(0))
-        assertEquals(LinkEndReason.LOST, d.state.attempts[0].endReason)
+        d.on(LinkLost(0), t0 + 30_000) // the edge of range
+        assertEquals(STARTING, d.status(0)) // formed again at once, with its second formation
+        assertEquals(2, d.state.attempts[0].tries)
         assertEquals(LadderPhase.CONNECTING, d.state.phase)
+        val onTwoPointFour = mobileData.candidates[0].copy(requestFiveGhz = false)
         assertEquals(
             listOf(
                 UseLink(null),
                 StopCandidate(0, LinkEndReason.LOST),
-                StartCandidate(1, mobileData.candidates[1], 0),
-                StartTimer(
-                    Deadline(1),
-                    t0 + 30_000 + HOTSPOT_TIMEOUT_MS,
-                ),
+                StartCandidate(0, onTwoPointFour, 1),
+                StartTimer(Deadline(0), t0 + 30_000 + P2P_FORMATION_TIMEOUT_MS),
             ),
             d.effects,
         )
         assertEquals("Bluetooth", d.badgeText())
-        // A failure report for an accepted link counts as a loss too.
-        d.on(Connected(1, 2437), t0 + 32_000)
-        d.on(Failed(1), t0 + 40_000)
-        assertEquals(LinkEndReason.LOST, d.state.attempts[1].endReason)
+        assertEquals(PENDING, d.status(1)) // Wi-Fi Direct first, not the hotspot
+        // The 2.4 GHz group is accepted with its hint, without a re-form.
+        d.on(Connected(0, 2437), t0 + 32_000)
+        assertEquals(ACTIVE, d.status(0))
+        assertEquals(listOf(HintCode.BAND24), d.hintCodes())
+        assertEquals("Wi\u2011Fi Direct \u00B7 2.4 GHz", d.badgeText())
+
+        // Lost again: both formations are spent, so the hotspot takes over.
+        d.on(LinkLost(0), t0 + 50_000)
+        assertEquals(FAILED, d.status(0))
+        assertEquals(STARTING, d.status(1))
+        assertEquals(emptyList(), d.state.hints)
+        // A failure report for an accepted link counts as a loss too; the hotspot gets its second formation.
+        d.on(Connected(1, 2437), t0 + 52_000)
+        d.on(Failed(1), t0 + 60_000)
+        assertTrue(StopCandidate(1, LinkEndReason.LOST) in d.effects)
+        assertEquals(listOf(StartCandidate(1, mobileData.candidates[1], 1)), d.effects.filterIsInstance<StartCandidate>())
+        d.advanceTo(t0 + 60_000 + HOTSPOT_TIMEOUT_MS)
         assertEquals(LadderPhase.BLUETOOTH_ONLY, d.state.phase)
+    }
+
+    @Test
+    fun fE1_lanWonThenLostTriesWifiDirectBeforeTheHotspot() {
+        val d = Driver(sameRouter)
+        d.on(Connected(0), t0 + 100)
+        d.on(ThroughputSample(0, 12_000_000), t0 + 500)
+        assertEquals(ACTIVE, d.status(0))
+        assertEquals(STOPPED, d.status(1))
+        d.on(LinkLost(0), t0 + 40_000)
+        assertEquals(
+            listOf(StartCandidate(0, sameRouter.candidates[0], 1), StartCandidate(1, sameRouter.candidates[1], 1)),
+            d.effects.filterIsInstance<StartCandidate>(),
+        )
+        assertEquals(PENDING, d.status(2))
+        d.on(Connected(1, 5180), t0 + 41_500)
+        assertEquals(ACTIVE, d.status(1))
+        assertEquals("Wi\u2011Fi Direct \u00B7 5 GHz", d.badgeText())
+    }
+
+    @Test
+    fun fE4_slowLanStoppedForTheHotspotComesBackWhenTheHotspotFails() {
+        val d = Driver(sameRouter)
+        d.on(Connected(0), t0 + 100)
+        d.advanceTo(t0 + 1_100) // too slow: standby
+        d.advanceTo(t0 + P2P_FORMATION_TIMEOUT_MS) // Wi-Fi Direct times out; the LAN is stopped for the hotspot joiner
+        assertEquals(LinkEndReason.SLOW, d.state.attempts[0].endReason)
+        assertEquals(STARTING, d.status(2))
+        d.advanceTo(t0 + P2P_FORMATION_TIMEOUT_MS + HOTSPOT_TIMEOUT_MS) // the hotspot fails too
+        assertEquals(FAILED, d.status(2))
+        assertEquals(listOf(StartCandidate(0, sameRouter.candidates[0], 1)), d.effects.filterIsInstance<StartCandidate>())
+        assertEquals(LadderPhase.CONNECTING, d.state.phase)
+        d.on(Connected(0), t0 + 12_100)
+        d.on(ThroughputSample(0, 3_000_000), t0 + 12_600)
+        d.advanceTo(t0 + 13_100) // still slow, but nothing is left and it beats Bluetooth
+        assertEquals(ACTIVE, d.status(0))
+        assertEquals(LadderPhase.ACTIVE, d.state.phase)
+        assertEquals("Same network", d.badgeText())
+        assertEquals(emptyList(), d.state.hints)
+    }
+
+    // ---- The follower (N9: one device decides) ----
+
+    @Test
+    fun n9_followerNeverAcceptsOnItsOwnMeterAndTakesTheAuthoritysChoice() {
+        val d = Driver(sameRouterFollower)
+        d.on(Connected(0), t0 + 100)
+        assertEquals(listOf(CancelTimer(Deadline(0)), UseLink(0)), d.effects) // carries data, no measurement window
+        assertEquals(MEASURING, d.status(0))
+        assertEquals("Same network", d.badgeText())
+        d.on(ThroughputSample(0, 12_000_000), t0 + 400) // bytes sent here decide nothing
+        assertEquals(MEASURING, d.status(0))
+        d.advanceTo(t0 + 3_000)
+        assertEquals(MEASURING, d.status(0))
+        assertEquals(emptyList(), d.state.hints)
+
+        d.on(Connected(1, 5180), t0 + 3_200) // up here, but the receiver decides
+        assertEquals(READY, d.status(1))
+        assertEquals(0, d.state.dataLink)
+        assertEquals(t0 + P2P_FORMATION_TIMEOUT_MS + LadderTimeouts.DEFAULT_SELECTION_GRACE_MS, d.state.timers[Deadline(1)])
+
+        d.on(PeerSelected(1, 0), t0 + 3_300)
+        assertEquals(ACTIVE, d.status(1))
+        assertEquals(STOPPED, d.status(0))
+        assertEquals(listOf(CancelTimer(Deadline(1)), UseLink(1), StopCandidate(0, LinkEndReason.SUPERSEDED)), d.effects)
+        assertEquals("Wi\u2011Fi Direct \u00B7 5 GHz", d.badgeText())
+    }
+
+    @Test
+    fun n9_followerTakesTheAuthoritysLanVerdict() {
+        val d = Driver(sameRouterFollower)
+        d.on(Connected(0), t0 + 100)
+        d.on(Connected(1, 5180), t0 + 900)
+        d.on(PeerSelected(0, 0), t0 + 950)
+        assertEquals(ACTIVE, d.status(0))
+        assertEquals(STOPPED, d.status(1))
+        assertEquals(LinkEndReason.SUPERSEDED, d.state.attempts[1].endReason)
+        assertEquals(LadderPhase.ACTIVE, d.state.phase)
+    }
+
+    @Test
+    fun n9_selectionThatArrivesBeforeTheLinkIsUpHereIsKept() {
+        val d = Driver(sameRouterFollower)
+        assertTrue(d.on(PeerSelected(1, 0), t0 + 700).handled)
+        assertEquals(LinkSelection(1, 0), d.state.pendingSelection)
+        assertEquals(STARTING, d.status(1))
+        d.on(Connected(1, 5180), t0 + 720)
+        assertEquals(ACTIVE, d.status(1))
+        assertNull(d.state.pendingSelection)
+        // Stale or foreign selections change nothing.
+        assertFalse(d.on(PeerSelected(1, 0), t0 + 800).handled)
+        assertFalse(d.on(PeerSelected(3, 0), t0 + 800).handled) // Bluetooth
+        assertFalse(d.on(PeerSelected(9, 0), t0 + 800).handled)
+    }
+
+    @Test
+    fun n9_followerReformsTogetherWithTheAuthority() {
+        // The re-form is decided from the channel both devices share, so the follower re-forms on its own.
+        val d = Driver(rplan(phone(), phone(), SENDER))
+        d.on(Connected(0, 2437), t0 + 1_000)
+        assertEquals(STARTING, d.status(0))
+        assertEquals(2, d.state.attempts[0].tries)
+        d.on(Connected(0, 2437), t0 + 3_000)
+        assertEquals(READY, d.status(0))
+        d.on(PeerSelected(0, 1), t0 + 3_100)
+        assertEquals(ACTIVE, d.status(0))
+        assertEquals(listOf(HintCode.BAND24), d.hintCodes())
+    }
+
+    @Test
+    fun n9_followerGivesUpOnALinkTheAuthorityNeverSelects() {
+        val d = Driver(rplan(phone(), phone(), SENDER))
+        d.on(Connected(0, 5180), t0 + 1_000)
+        assertEquals(READY, d.status(0))
+        d.advanceTo(t0 + P2P_FORMATION_TIMEOUT_MS + LadderTimeouts.DEFAULT_SELECTION_GRACE_MS - 1)
+        assertEquals(READY, d.status(0))
+        d.advanceTo(t0 + P2P_FORMATION_TIMEOUT_MS + LadderTimeouts.DEFAULT_SELECTION_GRACE_MS)
+        assertEquals(FAILED, d.status(0))
+        assertEquals(LinkEndReason.TIMEOUT, d.state.attempts[0].endReason)
+        assertEquals(STARTING, d.status(1))
+    }
+
+    @Test
+    fun n9_followerMovesOnWhenTheAuthorityStopsASlowLan() {
+        // The phone sends to a Mac; the Mac (receiver) found the LAN too slow and stopped it before joining the group.
+        val d = Driver(rplan(sameRouterFacts, laptop(Caps.MAC.onWifi(true), HOME_ROUTER), SENDER, lanReachable = true))
+        d.on(Connected(0), t0 + 100)
+        d.advanceTo(t0 + 5_000)
+        assertEquals(MEASURING, d.status(0)) // no verdict of its own: the legacy join waits
+        assertEquals(PENDING, d.status(1))
+        d.on(LinkLost(0), t0 + 5_100)
+        assertEquals(LinkEndReason.LOST, d.state.attempts[0].endReason)
+        assertEquals(STARTING, d.status(1))
     }
 
     // ---- 5 GHz verification (§9) ----
@@ -396,7 +576,7 @@ class LinkLifecycleTest {
 
     @Test
     fun n9_stationOn24PinsTheChannel() {
-        val pinned = plan(phone(Caps.FLAGSHIP.onWifi(false)), laptop(Caps.MAC))
+        val pinned = rplan(phone(Caps.FLAGSHIP.onWifi(false)), laptop(Caps.MAC))
         val d = Driver(pinned)
         d.on(Connected(0, 2437), t0 + 1_000)
         assertEquals(STARTING, d.status(0)) // still re-formed once
@@ -406,7 +586,7 @@ class LinkLifecycleTest {
         assertEquals(HintCode.STATION_BAND24, hint.code)
         assertEquals("Your Wi\u2011Fi network is on 2.4 GHz", hint.englishText)
 
-        val peerPinned = plan(laptop(Caps.MAC), phone(Caps.FLAGSHIP.onWifi(false)))
+        val peerPinned = rplan(laptop(Caps.MAC), phone(Caps.FLAGSHIP.onWifi(false)))
         val p = Driver(peerPinned)
         p.on(Connected(0, 2437), t0 + 1_000)
         p.on(Connected(0, 2437), t0 + 3_000)
@@ -415,7 +595,7 @@ class LinkLifecycleTest {
 
     @Test
     fun fF3_twoPointFourOnlyPeerIsAcceptedAtOnceWithItsHint() {
-        val d = Driver(plan(phone(), phone(Caps.BAND24_ONLY)))
+        val d = Driver(rplan(phone(), phone(Caps.BAND24_ONLY)))
         d.on(Connected(0, 2437), t0 + 1_000)
         assertEquals(ACTIVE, d.status(0))
         assertEquals(1, d.state.attempts[0].tries)
@@ -424,7 +604,7 @@ class LinkLifecycleTest {
 
     @Test
     fun fF3_twoPointFourOnlyHereShowsNothingHere() {
-        val d = Driver(plan(phone(Caps.BAND24_ONLY), phone()))
+        val d = Driver(rplan(phone(Caps.BAND24_ONLY), phone()))
         d.on(Connected(0, 2437), t0 + 1_000)
         assertEquals(ACTIVE, d.status(0))
         assertEquals(emptyList(), d.state.hints)
@@ -451,6 +631,27 @@ class LinkLifecycleTest {
     }
 
     @Test
+    fun fE2_aTwoPointFourChannelLearntOnlyAfterTheConnectionIsAcceptedAsItIs() {
+        // Only the Connected channel is shared by both devices; a later one cannot re-form both groups together.
+        val d = Driver(mobileData)
+        d.on(Connected(0), t0 + 1_000)
+        assertEquals(VERIFYING, d.status(0))
+        d.on(FrequencyReported(0, 2437), t0 + 1_200)
+        assertEquals(ACTIVE, d.status(0))
+        assertTrue(d.effects.none { it is StartCandidate })
+        assertEquals(listOf(HintCode.BAND24), d.hintCodes())
+    }
+
+    @Test
+    fun fE2_aPairWithout5GhzIsAcceptedAtOnceEvenWithoutAChannel() {
+        val d = Driver(rplan(phone(), phone(Caps.BAND24_ONLY)))
+        d.on(Connected(0, null), t0 + 500)
+        assertEquals(ACTIVE, d.status(0))
+        assertEquals(0, d.state.dataLink)
+        assertEquals("Wi\u2011Fi Direct", d.badgeText())
+    }
+
+    @Test
     fun fF2_frequencyNeverReportedIsAcceptedAtTheDeadlineWithAnUnknownBand() {
         val d = Driver(mobileData)
         d.on(Connected(0), t0 + 1_000)
@@ -466,14 +667,14 @@ class LinkLifecycleTest {
 
     @Test
     fun fE3_hotspotIsAcceptedOnWhateverBandTheSystemChose() {
-        val hotspotOnly = plan(phone(Caps.NO_WIFI_DIRECT), phone(Caps.NO_WIFI_DIRECT))
+        val hotspotOnly = rplan(phone(Caps.NO_WIFI_DIRECT), phone(Caps.NO_WIFI_DIRECT))
         val d = Driver(hotspotOnly)
         d.on(Connected(0, 2437), t0 + 3_000)
         assertEquals(ACTIVE, d.status(0))
         assertEquals("Hotspot \u00B7 2.4 GHz", d.badgeText())
         assertEquals(emptyList(), d.state.hints) // "move closer" would not help: the band is not selectable (N8)
 
-        val band24Peer = plan(phone(Caps.NO_WIFI_DIRECT), phone(Capabilities.of(Flag.CAN_HOST_LOCAL_HOTSPOT)))
+        val band24Peer = rplan(phone(Caps.NO_WIFI_DIRECT), phone(Capabilities.of(Flag.CAN_HOST_LOCAL_HOTSPOT)))
         val p = Driver(band24Peer)
         p.on(Connected(0, 2412), t0 + 3_000)
         assertEquals(listOf(HintCode.PEER_BAND24_ONLY), p.hintCodes())
@@ -585,6 +786,7 @@ class LinkLifecycleTest {
         assertFalse(d.on(LinkLost(2), t0 + 10).handled)
         assertFalse(d.on(TransferStarted, t0 + 10).handled) // already running
         assertFalse(d.on(RestoreCompleted, t0 + 10).handled)
+        assertFalse(d.on(PeerSelected(1, 0), t0 + 10).handled) // the authority takes no orders
         assertEquals(start, d.state)
 
         d.on(Connected(1, 5180), t0 + 500)
@@ -602,6 +804,7 @@ class LinkLifecycleTest {
         assertEquals(10_000_000L, LadderTimeouts().lanMinBytes)
         assertEquals(5_000_000L, LadderTimeouts(lanMeasureMillis = 500).lanMinBytes)
         assertFailsWith<IllegalArgumentException> { LadderTimeouts(lanConnectMillis = 0) }
+        assertFailsWith<IllegalArgumentException> { LadderTimeouts(selectionGraceMillis = 0) }
         assertFailsWith<IllegalArgumentException> { LadderTimeouts(lanMinBytesPerSecond = Long.MAX_VALUE) }
         assertFailsWith<IllegalArgumentException> { LadderTimeouts().connectTimeout(LinkMode.BLUETOOTH) }
         assertFailsWith<IllegalArgumentException> { ThroughputSample(0, -1) }

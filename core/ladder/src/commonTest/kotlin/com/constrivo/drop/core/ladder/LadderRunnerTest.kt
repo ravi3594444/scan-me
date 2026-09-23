@@ -10,10 +10,14 @@ import com.constrivo.drop.core.protocol.ProtocolConstants.HOTSPOT_TIMEOUT_MS
 import com.constrivo.drop.core.protocol.ProtocolConstants.LINK_IDLE_TEARDOWN_MS
 import com.constrivo.drop.core.protocol.ProtocolConstants.P2P_FORMATION_TIMEOUT_MS
 import com.constrivo.drop.core.protocol.ProtocolConstants.WIFI_RESTORE_BUDGET_MS
+import com.constrivo.drop.core.protocol.TransferRole.RECEIVER
+import com.constrivo.drop.core.protocol.TransferRole.SENDER
 import com.constrivo.drop.core.protocol.WifiCredentials
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.toList
@@ -23,14 +27,21 @@ import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlin.random.Random
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
-/** [LadderRunner] against fake providers under virtual time (architecture §4, N9, F-E11). */
+/**
+ * [LadderRunner] against fake providers under virtual time (architecture §4, N9, F-E11). The single-runner cases run
+ * on the receiver, the ladder's authority, with a fake peer that echoes `LinkReady`; the pair cases wire a sender's
+ * and a receiver's runner back to back.
+ */
 @OptIn(ExperimentalCoroutinesApi::class)
 class LadderRunnerTest {
     /** How one provider call behaves: time to come up, the channel it reports, or failure. */
@@ -41,6 +52,8 @@ class LadderRunnerTest {
         val fail: Boolean = false,
         val teardownMillis: Long = 0,
         val credentials: WifiCredentials? = null,
+        /** Hands the link over and then never returns: the return value is lost, as with prompt cancellation. */
+        val hangAfterUp: Boolean = false,
     )
 
     private class FakeLink(
@@ -53,6 +66,7 @@ class LadderRunnerTest {
         override val localPort: Int?,
         private val teardownMillis: Long,
         private val now: () -> Long,
+        private val onTeardown: (LinkKind) -> Unit,
     ) : ActiveLink {
         var tornDownAt: Long? = null
 
@@ -65,6 +79,7 @@ class LadderRunnerTest {
 
         override suspend fun teardown() {
             delay(teardownMillis)
+            if (tornDownAt == null) onTeardown(kind)
             tornDownAt = now()
         }
     }
@@ -80,25 +95,35 @@ class LadderRunnerTest {
         val cancelledAt = ArrayList<Long>()
         val links = ArrayList<FakeLink>()
 
+        /** Called when a link of this provider is torn down (the pair rig tells the other device). */
+        var onTeardown: (LinkKind) -> Unit = {}
+
         override fun supports(
             mode: LinkMode,
             role: LinkRole,
         ): Boolean = mode.kind == kind && role in roles
 
-        override suspend fun host(request: HostRequest): ActiveLink {
+        override suspend fun host(
+            request: HostRequest,
+            onUp: (ActiveLink) -> Unit,
+        ): ActiveLink {
             hosts += now() to request
-            return run(request.mode, LinkRole.HOST, hosts.size + joins.size - 1)
+            return run(request.mode, LinkRole.HOST, hosts.size + joins.size - 1, onUp)
         }
 
-        override suspend fun join(request: JoinRequest): ActiveLink {
+        override suspend fun join(
+            request: JoinRequest,
+            onUp: (ActiveLink) -> Unit,
+        ): ActiveLink {
             joins += now() to request
-            return run(request.mode, LinkRole.JOIN, hosts.size + joins.size - 1)
+            return run(request.mode, LinkRole.JOIN, hosts.size + joins.size - 1, onUp)
         }
 
         private suspend fun run(
             mode: LinkMode,
             role: LinkRole,
             call: Int,
+            onUp: (ActiveLink) -> Unit,
         ): ActiveLink {
             val step = steps[minOf(call, steps.lastIndex)]
             try {
@@ -111,7 +136,11 @@ class LadderRunnerTest {
             if (step.fail) throw IllegalStateException("radio said no")
             val address = if (role == LinkRole.HOST) "192.168.49.1" else null
             val port = if (role == LinkRole.HOST) 4000 + call else null
-            return FakeLink(kind, mode, role, step.freqMhz, step.credentials, address, port, step.teardownMillis, now).also { links += it }
+            val link = FakeLink(kind, mode, role, step.freqMhz, step.credentials, address, port, step.teardownMillis, now, onTeardown)
+            links += link
+            onUp(link)
+            if (step.hangAfterUp) awaitCancellation()
+            return link
         }
     }
 
@@ -125,6 +154,7 @@ class LadderRunnerTest {
         lateinit var runner: LadderRunner
         val sent = ArrayList<Pair<Long, LinkReady>>()
         val opened = ArrayList<Pair<Long, LinkKind>>()
+        val selected = ArrayList<Int>()
 
         override suspend fun sendLinkReady(message: LinkReady) {
             sent += now() to message
@@ -143,6 +173,10 @@ class LadderRunnerTest {
             if (millis == null) awaitCancellation()
             delay(millis)
             opened += now() to link.kind
+        }
+
+        override suspend fun sendLinkSelected(generation: Int) {
+            selected += generation
         }
     }
 
@@ -181,14 +215,19 @@ class LadderRunnerTest {
         runCurrent()
     }
 
-    /** Rungs: 0 LAN (this sender listens), 1 Wi-Fi Direct (the peer hosts), 2 hotspot (peer), 3 Bluetooth. */
-    private val sameRouter = plan(phone(Caps.FLAGSHIP.onWifi(true), HOME_ROUTER), phone(Caps.FLAGSHIP.onWifi(true), HOME_ROUTER))
+    private val sameRouterFacts = phone(Caps.FLAGSHIP.onWifi(true), HOME_ROUTER)
+
+    /** Receiver's rungs: 0 LAN (the sender listens, this device joins), 1 Wi-Fi Direct (hosted here), 2 hotspot, 3 Bluetooth. */
+    private val sameRouter = plan(sameRouterFacts, sameRouterFacts, RECEIVER)
 
     /** Rungs: 0 Wi-Fi Direct hosted here, 1 hotspot hosted here, 2 Bluetooth. */
-    private val hostHere = plan(phone(Caps.FLAGSHIP), phone(Caps.MIDRANGE))
+    private val hostHere = plan(phone(Caps.FLAGSHIP), phone(Caps.MIDRANGE), RECEIVER)
 
-    /** Rungs: 0 Wi-Fi Direct (the peer hosts), 1 hotspot (peer), 2 Bluetooth. */
-    private val mobileData = plan(phone(), phone())
+    /** Rungs: 0 Wi-Fi Direct (the peer hosts, this device joins as a client), 1 hotspot (peer), 2 Bluetooth. */
+    private val peerHosts = plan(phone(Caps.MIDRANGE), phone(Caps.FLAGSHIP), RECEIVER)
+
+    /** Rungs: 0 hotspot (the peer hosts), 1 Bluetooth. */
+    private val peerHostsHotspot = plan(phone(Caps.NO_WIFI_DIRECT, battery = 10), phone(Caps.NO_WIFI_DIRECT, battery = 90), RECEIVER)
 
     @Test
     fun n9_lanWinsTheRaceAndWifiDirectFormationIsCancelled() =
@@ -198,16 +237,16 @@ class LadderRunnerTest {
             val rig = rig(sameRouter, listOf(lan, p2p))
             rig.runner.start()
             at(0)
-            assertEquals(1, lan.hosts.size)
-            assertEquals(1, p2p.joins.size) // both started at once (N9)
-            assertEquals(TEST_CREDENTIALS, p2p.joins.single().second.credentials)
+            assertEquals(1, lan.joins.size) // this receiver dials the sender's LAN listener
+            assertEquals(1, p2p.hosts.size) // both started at once (N9)
+            assertEquals(TEST_CREDENTIALS, p2p.hosts.single().second.credentials)
             assertEquals("Bluetooth", rig.state.badge?.englishText)
 
             at(40) // LinkReady answered at 20 ms, stream open at 40 ms
             assertEquals(AttemptStatus.MEASURING, rig.state.attempts[0].status)
             assertEquals("Same network", rig.state.badge?.englishText)
             assertSame(lan.links.single(), rig.state.dataLink)
-            assertEquals(LinkReady(LinkKind.LAN, "192.168.49.1", 4000, 0, null, 0), rig.session.sent.first().second)
+            assertEquals(LinkReady(LinkKind.LAN, null, null, 0, null, 0), rig.session.sent.first().second)
 
             at(300)
             rig.runner.onThroughputSample(LinkKind.LAN, 12_000_000)
@@ -216,6 +255,8 @@ class LadderRunnerTest {
             assertEquals(AttemptStatus.STOPPED, rig.state.attempts[1].status)
             assertEquals(listOf(300L), p2p.cancelledAt) // the loser's formation was cancelled
             assertTrue(p2p.links.isEmpty())
+            assertEquals(listOf(0), rig.session.selected) // the sender is told which link won
+            assertTrue(rig.events.any { it is LadderLogEvent.SelectionAnnounced && it.generation == 0 })
 
             at(10_000)
             rig.runner.onTransferEnded()
@@ -243,13 +284,14 @@ class LadderRunnerTest {
             assertEquals(listOf(HintCode.LAN_SLOW), rig.state.hints.map { it.code })
             assertSame(lan.links.single(), rig.state.dataLink) // still carrying data
 
-            at(1_540) // group joined at 1500, LinkReady answered at 1520, stream at 1540
+            at(1_540) // group formed at 1500, LinkReady answered at 1520, stream at 1540
             assertEquals(LadderPhase.ACTIVE, rig.state.phase)
             assertSame(p2p.links.single(), rig.state.dataLink)
-            assertEquals("Wi\u2011Fi Direct \u00B7 5 GHz", rig.state.badge?.englishText)
+            assertEquals("Wi‑Fi Direct · 5 GHz", rig.state.badge?.englishText)
             assertEquals(emptyList(), rig.state.hints)
             assertEquals(1_540L, lan.links.single().tornDownAt)
-            assertEquals(LinkReady(LinkKind.P2P, null, null, 5180, null, 2), rig.session.sent.last().second)
+            assertEquals(LinkReady(LinkKind.P2P, "192.168.49.1", 4000, 5180, null, 2), rig.session.sent.last().second)
+            assertEquals(listOf(2), rig.session.selected)
             assertTrue(rig.events.any { it is LadderLogEvent.CandidateStopped && it.index == 0 && it.reason == LinkEndReason.SUPERSEDED })
         }
 
@@ -258,7 +300,7 @@ class LadderRunnerTest {
         runTest {
             val p2p = provider(LinkKind.P2P, Step(never = true))
             val hotspot = provider(LinkKind.HOTSPOT, Step(millis = 100))
-            val rig = rig(mobileData, listOf(p2p, hotspot), replyMillis = null) // the host never announces anything
+            val rig = rig(peerHosts, listOf(p2p, hotspot), replyMillis = null) // the host never announces anything
             rig.runner.start()
             at(P2P_FORMATION_TIMEOUT_MS - 1)
             assertEquals(LadderPhase.CONNECTING, rig.state.phase)
@@ -275,8 +317,9 @@ class LadderRunnerTest {
             assertEquals(LadderPhase.BLUETOOTH_ONLY, rig.state.phase)
             assertEquals("Bluetooth", rig.state.badge?.englishText)
             assertEquals(emptyList(), rig.state.hints)
-            rig.runner.close()
+            val closing = backgroundScope.async { rig.runner.closeAndAwait() }
             at(P2P_FORMATION_TIMEOUT_MS + HOTSPOT_TIMEOUT_MS)
+            assertTrue(closing.isCompleted) // once this returns the caller may cancel its scope
             assertEquals(LadderPhase.CLOSED, rig.state.phase)
         }
 
@@ -299,8 +342,9 @@ class LadderRunnerTest {
             assertEquals(listOf(0, 1), p2p.hosts.map { it.second.attempt })
             assertTrue(p2p.hosts.all { it.second.requestFiveGhz && it.second.credentials == TEST_CREDENTIALS })
             assertEquals(listOf(2, 3), rig.session.sent.map { it.second.generation })
+            assertEquals(listOf(3), rig.session.selected)
             assertEquals(listOf(HintCode.BAND24), rig.state.hints.map { it.code })
-            assertEquals("Wi\u2011Fi Direct \u00B7 2.4 GHz", rig.state.badge?.englishText)
+            assertEquals("Wi‑Fi Direct · 2.4 GHz", rig.state.badge?.englishText)
             assertSame(p2p.links[1], rig.state.dataLink)
         }
 
@@ -370,7 +414,7 @@ class LadderRunnerTest {
             assertNull(hotspot.hosts.single().second.credentials) // the system picks them (N15)
             at(740)
             assertEquals(LadderPhase.ACTIVE, rig.state.phase)
-            assertEquals("Hotspot \u00B7 2.4 GHz", rig.state.badge?.englishText)
+            assertEquals("Hotspot · 2.4 GHz", rig.state.badge?.englishText)
             // The hotspot's system credentials always travel in LinkReady.
             assertEquals(WifiCredentials("AndroidShare_1234", "k3v9m2xq"), rig.session.sent.single().second.credentials)
             assertEquals(4, rig.session.sent.single().second.generation)
@@ -379,14 +423,13 @@ class LadderRunnerTest {
     @Test
     fun fE3_joinerWaitsForTheHostsCredentialsAndDialsItsAddress() =
         runTest {
-            val hotspotOnly = plan(phone(Caps.NO_WIFI_DIRECT), phone(Caps.NO_WIFI_DIRECT)) // the peer hosts
             val hotspot = provider(LinkKind.HOTSPOT, Step(millis = 1_000, freqMhz = 5180))
-            val rig = rig(hotspotOnly, listOf(hotspot), replyMillis = null)
+            val rig = rig(peerHostsHotspot, listOf(hotspot), replyMillis = null)
             rig.runner.start()
             at(300)
             assertTrue(hotspot.joins.isEmpty())
             val credentials = WifiCredentials("AndroidShare_77", "system-pass-1")
-            rig.runner.onPeerLinkReady(LinkReady(LinkKind.HOTSPOT, "192.168.43.1", 4001, 2437, credentials, 4))
+            rig.runner.onPeerLinkReady(LinkReady(LinkKind.HOTSPOT, "192.168.43.1", 4001, 5180, credentials, 4))
             at(300)
             val join = hotspot.joins.single().second
             assertEquals(credentials, join.credentials)
@@ -394,16 +437,15 @@ class LadderRunnerTest {
             assertEquals(4001, join.hostPort)
             at(1_320)
             assertEquals(LadderPhase.ACTIVE, rig.state.phase)
-            assertEquals("Hotspot \u00B7 5 GHz", rig.state.badge?.englishText) // this device's own measurement wins
+            assertEquals("Hotspot · 5 GHz", rig.state.badge?.englishText)
             assertNull(rig.session.sent.single().second.credentials) // a joiner announces none
         }
 
     @Test
     fun fE3_invalidCredentialsFromTheHostFallThrough() =
         runTest {
-            val hotspotOnly = plan(phone(Caps.NO_WIFI_DIRECT), phone(Caps.NO_WIFI_DIRECT))
             val hotspot = provider(LinkKind.HOTSPOT, Step(millis = 100))
-            val rig = rig(hotspotOnly, listOf(hotspot), replyMillis = null)
+            val rig = rig(peerHostsHotspot, listOf(hotspot), replyMillis = null)
             rig.runner.start()
             at(500)
             rig.runner.onPeerLinkReady(LinkReady(LinkKind.HOTSPOT, "192.168.43.1", 4001, 2437, WifiCredentials("x", "pässwort1"), 4))
@@ -449,7 +491,7 @@ class LadderRunnerTest {
     fun fE2_joinerWithoutPreSharedCredentialsTakesThemFromLinkReady() =
         runTest {
             val p2p = provider(LinkKind.P2P, Step(millis = 300, freqMhz = null))
-            val rig = rig(mobileData, listOf(p2p), config = LadderConfig(), replyMillis = null)
+            val rig = rig(peerHosts, listOf(p2p), config = LadderConfig(), replyMillis = null)
             rig.runner.start()
             at(100)
             rig.runner.onPeerLinkReady(LinkReady(LinkKind.P2P, "192.168.49.1", 4100, 5745, TEST_CREDENTIALS, 2))
@@ -461,33 +503,82 @@ class LadderRunnerTest {
         }
 
     @Test
-    fun fE1_lostLinkMovesOnToTheNextRung() =
+    fun t04_lostGroupIsReformedOn24GhzBeforeTheHotspot() =
         runTest {
-            val p2p = provider(LinkKind.P2P, Step(millis = 300, freqMhz = 5180))
+            val p2p = provider(LinkKind.P2P, Step(millis = 300, freqMhz = 5180), Step(millis = 700, freqMhz = 2437))
             val hotspot = provider(LinkKind.HOTSPOT, Step(never = true))
             val rig = rig(hostHere, listOf(p2p, hotspot))
             rig.runner.start()
             at(340)
             assertEquals(LadderPhase.ACTIVE, rig.state.phase)
             rig.runner.onLinkLost(LinkKind.P2P)
-            at(5_000)
+            at(500)
             assertEquals(LadderPhase.CONNECTING, rig.state.phase)
             assertNull(rig.state.dataLink)
-            assertEquals(1, hotspot.hosts.size)
-            assertNotNull(p2p.links.single().tornDownAt)
+            assertNotNull(p2p.links[0].tornDownAt)
+            val reform = p2p.hosts[1].second
+            assertEquals(1, reform.attempt)
+            assertFalse(reform.requestFiveGhz) // 2.4 GHz reaches further (T-04)
+            assertTrue(hotspot.hosts.isEmpty())
+            at(1_300)
+            assertEquals(LadderPhase.ACTIVE, rig.state.phase)
+            assertEquals("Wi‑Fi Direct · 2.4 GHz", rig.state.badge?.englishText)
+            assertEquals(listOf(HintCode.BAND24), rig.state.hints.map { it.code })
+        }
+
+    @Test
+    fun fE11_aLinkHandedOverBeforeItsCallWasCancelledIsStillTornDown() =
+        runTest {
+            // The provider formed the group and handed it over, but its return was lost to the cancellation.
+            val lan = provider(LinkKind.LAN, Step(millis = 0))
+            val p2p = provider(LinkKind.P2P, Step(millis = 200, freqMhz = 5180, hangAfterUp = true, teardownMillis = 100))
+            val rig = rig(sameRouter, listOf(lan, p2p))
+            rig.runner.start()
+            at(250)
+            assertEquals(1, p2p.links.size)
+            rig.runner.onThroughputSample(LinkKind.LAN, 12_000_000)
+            at(250)
+            assertEquals(LadderPhase.ACTIVE, rig.state.phase)
+            assertNull(p2p.links.single().tornDownAt)
+            at(400)
+            assertEquals(350L, p2p.links.single().tornDownAt)
+        }
+
+    @Test
+    fun fF2_aChannelLearntAfterTheConnectionReachesTheBadge() =
+        runTest {
+            val p2p = provider(LinkKind.P2P, Step(millis = 300, freqMhz = null))
+            val rig = rig(hostHere, listOf(p2p))
+            rig.runner.start()
+            at(340) // up, but neither side knows the channel: verifying
+            assertEquals(AttemptStatus.VERIFYING, rig.state.attempts[0].status)
+            assertEquals("Bluetooth", rig.state.badge?.englishText)
+            // The peer's group information arrives late, in a repeated LinkReady.
+            rig.runner.onPeerLinkReady(LinkReady(LinkKind.P2P, "192.168.49.2", 5000, 5180, null, 2))
+            at(340)
+            assertEquals(LadderPhase.ACTIVE, rig.state.phase)
+            assertEquals("Wi‑Fi Direct · 5 GHz", rig.state.badge?.englishText)
+            // Then the channel drops to 2.4 GHz at the edge of range (T-04): badge and hint follow.
+            rig.runner.onFrequency(LinkKind.P2P, 2437)
+            at(340)
+            assertEquals("Wi‑Fi Direct · 2.4 GHz", rig.state.badge?.englishText)
+            assertEquals(listOf(HintCode.BAND24), rig.state.hints.map { it.code })
+            assertEquals(1, p2p.hosts.size) // no re-form
         }
 
     @Test
     fun peerLinkReadyOutsideThisRunIsIgnored() =
         runTest {
-            val rig = rig(mobileData, emptyList(), config = LadderConfig(generationBase = 6))
+            val rig = rig(peerHosts, emptyList(), config = LadderConfig(generationBase = 6))
             rig.runner.start()
             at(0)
             rig.runner.onPeerLinkReady(LinkReady(LinkKind.P2P, null, null, 0, null, 2)) // the previous run
             rig.runner.onPeerLinkReady(LinkReady(LinkKind.LAN, null, null, 0, null, 8)) // generation 8 is Wi-Fi Direct
             rig.runner.onPeerLinkReady(LinkReady("aware", null, null, 0, null, 6))
+            rig.runner.onPeerSelected(8) // this device is the authority: it takes no orders
             at(0)
             assertEquals(listOf(2, 8, 6), rig.events.filterIsInstance<LadderLogEvent.PeerLinkReadyIgnored>().map { it.generation })
+            assertEquals(listOf(8), rig.events.filterIsInstance<LadderLogEvent.PeerSelectionIgnored>().map { it.generation })
             assertEquals(LadderPhase.BLUETOOTH_ONLY, rig.state.phase) // no providers at all
         }
 
@@ -514,6 +605,14 @@ class LadderRunnerTest {
         }
 
     @Test
+    fun n8_browserPlansAreNotRunByTheRunner() =
+        runTest {
+            val browser = plan(phone(), LinkFacts.browser())
+            assertTrue(browser.isBrowserPlan)
+            assertFailsWith<IllegalArgumentException> { rig(browser, emptyList()) }
+        }
+
+    @Test
     fun generationsArePerRungKindAndAttempt() {
         assertEquals(0, LadderGenerations.of(0, LinkMode.LAN, 0))
         assertEquals(2, LadderGenerations.of(0, LinkMode.P2P, 0))
@@ -524,8 +623,167 @@ class LadderRunnerTest {
         assertNull(LadderGenerations.kindOf(6, 12))
         assertNull(LadderGenerations.kindOf(6, 5))
         assertNull(LadderGenerations.kindOf(0, -1))
-        kotlin.test.assertFailsWith<IllegalArgumentException> { LadderGenerations.of(0, LinkMode.BLUETOOTH, 0) }
-        kotlin.test.assertFailsWith<IllegalArgumentException> { LadderGenerations.of(0, LinkMode.P2P, 2) }
-        kotlin.test.assertFailsWith<IllegalArgumentException> { LadderConfig(generationBase = -1) }
+        assertFailsWith<IllegalArgumentException> { LadderGenerations.of(0, LinkMode.BLUETOOTH, 0) }
+        assertFailsWith<IllegalArgumentException> { LadderGenerations.of(0, LinkMode.P2P, 2) }
+        assertFailsWith<IllegalArgumentException> { LadderConfig(generationBase = -1) }
+    }
+
+    // ---- Two devices back to back (N9: both must end on the same link) ----
+
+    /** One device's engine in a pair: messages reach the other device after [latency]; a stream opens on both or neither. */
+    private class PairSession(
+        private val scope: CoroutineScope,
+        private val latency: Long,
+        private val streamMillis: Long,
+    ) : LadderSession {
+        lateinit var runner: LadderRunner
+        lateinit var peer: PairSession
+        private val streams = HashMap<Int, CompletableDeferred<Unit>>()
+
+        fun stream(generation: Int): CompletableDeferred<Unit> = streams.getOrPut(generation) { CompletableDeferred() }
+
+        override suspend fun sendLinkReady(message: LinkReady) {
+            scope.launch {
+                delay(latency)
+                peer.runner.onPeerLinkReady(message)
+            }
+        }
+
+        override suspend fun openStream(
+            link: ActiveLink,
+            peer: LinkReady,
+        ) {
+            stream(peer.generation).complete(Unit)
+            this.peer.stream(peer.generation).await()
+            delay(streamMillis)
+        }
+
+        override suspend fun sendLinkSelected(generation: Int) {
+            scope.launch {
+                delay(latency)
+                peer.runner.onPeerSelected(generation)
+            }
+        }
+
+        /** The other device notices a link this one tore down. */
+        fun lost(kind: LinkKind) {
+            scope.launch {
+                delay(latency)
+                peer.runner.onLinkLost(kind)
+            }
+        }
+    }
+
+    /** Timings of one device in a pair run. */
+    private data class Timing(
+        val lanMillis: Long,
+        val p2pMillis: Long,
+        val latency: Long,
+        val streamMillis: Long,
+        /** What this device's meter counts on the LAN, per second. */
+        val lanBytesPerSecond: Long,
+    )
+
+    private class Pair2(
+        val sender: LadderRunner,
+        val receiver: LadderRunner,
+    )
+
+    private fun TestScope.pair(
+        senderTiming: Timing,
+        receiverTiming: Timing,
+    ): Pair2 {
+        val now = { testScheduler.currentTime }
+        val clock = MonotonicClock { testScheduler.currentTime }
+        val config = LadderConfig(p2pCredentials = TEST_CREDENTIALS)
+
+        fun device(
+            plan: LadderPlan,
+            timing: Timing,
+        ): Pair<LadderRunner, PairSession> {
+            val session = PairSession(backgroundScope, timing.latency, timing.streamMillis)
+            val lan = FakeProvider(LinkKind.LAN, now, listOf(Step(millis = timing.lanMillis)))
+            val p2p = FakeProvider(LinkKind.P2P, now, listOf(Step(millis = timing.p2pMillis, freqMhz = 5180)))
+            val hotspot = FakeProvider(LinkKind.HOTSPOT, now, listOf(Step(never = true)))
+            for (provider in listOf(lan, p2p, hotspot)) provider.onTeardown = session::lost
+            val runner = LadderRunner(plan, listOf(lan, p2p, hotspot), session, backgroundScope, clock, config)
+            session.runner = runner
+            // The engine's 250 ms throughput samples while the LAN is being measured.
+            backgroundScope.launch {
+                while (true) {
+                    delay(250)
+                    if (runner.state.value.attempts.any { it.candidate.mode == LinkMode.LAN && it.status == AttemptStatus.MEASURING }) {
+                        runner.onThroughputSample(LinkKind.LAN, timing.lanBytesPerSecond / 4)
+                    }
+                }
+            }
+            return runner to session
+        }
+        val (sender, senderSession) = device(plan(sameRouterFacts, sameRouterFacts, SENDER), senderTiming)
+        val (receiver, receiverSession) = device(plan(sameRouterFacts, sameRouterFacts, RECEIVER), receiverTiming)
+        senderSession.peer = receiverSession
+        receiverSession.peer = senderSession
+        return Pair2(sender, receiver)
+    }
+
+    private fun TestScope.assertSameLink(
+        pair: Pair2,
+        expected: LinkMode? = null,
+        context: String = "",
+    ) {
+        pair.sender.start()
+        pair.receiver.start()
+        at(10_000)
+        val sender = pair.sender.state.value
+        val receiver = pair.receiver.state.value
+        assertEquals(LadderPhase.ACTIVE, receiver.phase, "receiver $context")
+        assertEquals(LadderPhase.ACTIVE, sender.phase, "sender $context")
+        assertEquals(receiver.dataCandidate?.mode, sender.dataCandidate?.mode, "data link $context")
+        if (expected != null) assertEquals(expected, receiver.dataCandidate?.mode, context)
+        assertNotNull(sender.dataLink, context)
+        assertNotNull(receiver.dataLink, context)
+    }
+
+    @Test
+    fun n9_theSenderFollowsTheReceiversSlowLanVerdict() =
+        runTest {
+            // The sender's meter (bytes sent) reaches 10 MB at 750 ms, the receiver's (bytes received) never does, and
+            // Wi-Fi Direct connects at 940 ms, inside the receiver's window: both must end on Wi-Fi Direct.
+            val pair =
+                pair(
+                    Timing(lanMillis = 80, p2pMillis = 910, latency = 20, streamMillis = 10, lanBytesPerSecond = 14_000_000),
+                    Timing(lanMillis = 100, p2pMillis = 900, latency = 20, streamMillis = 10, lanBytesPerSecond = 8_400_000),
+                )
+            assertSameLink(pair, LinkMode.P2P)
+        }
+
+    @Test
+    fun n9_theSenderFollowsTheReceiversFastLanVerdict() =
+        runTest {
+            // The other way round: the receiver sees a fast LAN, the sender a slow one, and Wi-Fi Direct is quick.
+            val pair =
+                pair(
+                    Timing(lanMillis = 0, p2pMillis = 700, latency = 30, streamMillis = 10, lanBytesPerSecond = 6_000_000),
+                    Timing(lanMillis = 20, p2pMillis = 1_200, latency = 30, streamMillis = 10, lanBytesPerSecond = 14_000_000),
+                )
+            assertSameLink(pair, LinkMode.LAN)
+        }
+
+    @Test
+    fun n9_bothDevicesEndOnTheSameLinkUnderJitter() {
+        val random = Random(9)
+        repeat(40) { run ->
+            fun timing() =
+                Timing(
+                    lanMillis = random.nextLong(0, 300),
+                    p2pMillis = random.nextLong(300, 3_000),
+                    latency = random.nextLong(5, 60),
+                    streamMillis = random.nextLong(5, 40),
+                    lanBytesPerSecond = random.nextLong(6_000_000, 14_000_000),
+                )
+            val senderTiming = timing()
+            val receiverTiming = timing()
+            runTest { assertSameLink(pair(senderTiming, receiverTiming), context = "run $run: $senderTiming / $receiverTiming") }
+        }
     }
 }
