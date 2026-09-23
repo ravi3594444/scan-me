@@ -1,0 +1,126 @@
+-- Queries behind TransferRepository and StatsRepository. Schema: 0.sqm.
+
+insert:
+INSERT INTO transfer (id, peer_device_id, direction, status, started_at, updated_at, bytes_total, file_count, mime_histogram)
+VALUES (:id, :peerDeviceId, :direction, :status, :startedAt, :startedAt, :bytesTotal, :fileCount, :mimeHistogram);
+
+exists:
+SELECT count(*) FROM transfer WHERE id = ?;
+
+-- A missing row, a null finished_at (running) or its finish time.
+selectFinishedAt:
+SELECT finished_at FROM transfer WHERE id = ?;
+
+selectRow:
+SELECT * FROM transfer_row WHERE id = ?;
+
+selectHints:
+SELECT hint_codes FROM transfer WHERE id = ? AND finished_at IS NULL;
+
+-- History (F-G2): newest first by start time, ties broken by id, so keyset paging is exact. Served by
+-- transfer_by_start without a sort step (HistoryPerformanceTest checks the plan).
+historyFirstPage:
+SELECT * FROM transfer_row ORDER BY started_at DESC, id DESC LIMIT :limit;
+
+historyPageAfter:
+SELECT * FROM transfer_row
+WHERE started_at <= :startedAt AND (started_at < :startedAt OR id < :id)
+ORDER BY started_at DESC, id DESC
+LIMIT :limit;
+
+historyForPeer:
+SELECT * FROM transfer_row WHERE peer_device_id = :peerDeviceId ORDER BY started_at DESC, id DESC LIMIT :limit;
+
+selectActive:
+SELECT * FROM transfer_row
+WHERE status IN ('offered', 'accepted', 'streaming', 'interrupted', 'verifying')
+ORDER BY started_at DESC, id DESC;
+
+updateStatus:
+UPDATE transfer SET status = :status, updated_at = :updatedAt WHERE id = :id AND finished_at IS NULL;
+
+updateProgress:
+UPDATE transfer SET bytes_done = :bytesDone, updated_at = :updatedAt
+WHERE id = :id AND finished_at IS NULL AND bytes_total >= :bytesDone;
+
+updateLink:
+UPDATE transfer SET transport = :transport, band = :band, updated_at = :updatedAt WHERE id = :id AND finished_at IS NULL;
+
+updateHints:
+UPDATE transfer SET hint_codes = :hintCodes, updated_at = :updatedAt WHERE id = :id AND finished_at IS NULL;
+
+finish:
+UPDATE transfer SET
+  status = :status,
+  finished_at = :finishedAt,
+  updated_at = :finishedAt,
+  bytes_done = :bytesDone,
+  transport = coalesce(:transport, transport),
+  band = coalesce(:band, band),
+  avg_speed_bps = :avgSpeedBps,
+  hint_codes = :hintCodes,
+  failed_files = :failedFiles
+WHERE id = :id AND finished_at IS NULL AND bytes_total >= :bytesDone AND file_count >= :failedFiles;
+
+selectBytesTotal:
+SELECT bytes_total, file_count FROM transfer WHERE id = ?;
+
+-- Non-terminal transfers with no activity since :cutoff, neither on the row nor in a manifest (§7.6, S8).
+selectInactiveUnfinished:
+SELECT id FROM transfer
+WHERE finished_at IS NULL AND updated_at < :cutoff
+  AND NOT EXISTS (SELECT 1 FROM chunk_manifest WHERE chunk_manifest.transfer_id = transfer.id AND chunk_manifest.updated_at >= :cutoff);
+
+-- Leaves updated_at alone: expiring is not activity, so the clean-up that follows still sees the transfer as idle.
+expireIfInactive:
+UPDATE transfer SET status = 'cancelled', finished_at = :finishedAt
+WHERE id = :id AND finished_at IS NULL AND updated_at < :cutoff
+  AND NOT EXISTS (SELECT 1 FROM chunk_manifest WHERE chunk_manifest.transfer_id = transfer.id AND chunk_manifest.updated_at >= :cutoff);
+
+-- Cancels an unfinished transfer whose resume state the user cleared (ResumeDataCleaner.clearPartials).
+cancelUnfinished:
+UPDATE transfer SET status = 'cancelled', finished_at = :finishedAt, updated_at = :finishedAt
+WHERE id = :id AND finished_at IS NULL;
+
+-- Finished transfers that may have partial files: every received one, and any with a manifest left.
+selectFinishedWithResumeData:
+SELECT id FROM transfer
+WHERE finished_at IS NOT NULL
+  AND (direction = 'receive' OR EXISTS (SELECT 1 FROM chunk_manifest WHERE chunk_manifest.transfer_id = transfer.id))
+ORDER BY id;
+
+selectFinishedDirection:
+SELECT direction FROM transfer WHERE id = ? AND finished_at IS NOT NULL;
+
+selectFinished:
+SELECT id, direction FROM transfer WHERE finished_at IS NOT NULL ORDER BY id;
+
+deleteFilesOfFinished:
+DELETE FROM transfer_file WHERE transfer_id = :id AND EXISTS (SELECT 1 FROM transfer WHERE transfer.id = :id AND finished_at IS NOT NULL);
+
+deleteManifestsOfFinished:
+DELETE FROM chunk_manifest WHERE transfer_id = :id AND EXISTS (SELECT 1 FROM transfer WHERE transfer.id = :id AND finished_at IS NOT NULL);
+
+deleteFinished:
+DELETE FROM transfer WHERE id = :id AND finished_at IS NOT NULL;
+
+-- Stats (F-G4). Counted transfers are exactly the History rows with status 'done'; see TransferStats for the
+-- definitions. Active time: bytes at the recorded average speed, or wall time when no speed was recorded.
+statsTotals:
+SELECT
+  count(*) AS transfers,
+  CAST(coalesce(sum(bytes_done), 0) AS INTEGER) AS bytes,
+  CAST(coalesce(sum(CASE WHEN avg_speed_bps > 0 THEN bytes_done * 1000 / avg_speed_bps ELSE max(finished_at - started_at, 0) END), 0) AS INTEGER) AS active_ms,
+  CAST(coalesce(sum(max(bytes_done * 1000 / :baselineBytesPerSecond - CASE WHEN avg_speed_bps > 0 THEN bytes_done * 1000 / avg_speed_bps ELSE max(finished_at - started_at, 0) END, 0)), 0) AS INTEGER) AS saved_ms
+FROM transfer
+WHERE status = 'done';
+
+-- Changes exactly when a done row is added or removed (done rows never change), from the transfer_by_status index
+-- alone: StatsRepository.observe recomputes only then, not at every progress write.
+statsFingerprint:
+SELECT count(*) AS transfers, coalesce(sum(started_at), 0) AS start_sum FROM transfer WHERE status = 'done';
+
+statsStartsBetween:
+SELECT started_at FROM transfer
+WHERE status = 'done' AND started_at >= :fromInclusive AND started_at < :untilExclusive
+ORDER BY started_at;

@@ -1,0 +1,33 @@
+-- Queries behind TransferFileRepository. Schema: 0.sqm.
+
+insert:
+INSERT INTO transfer_file (transfer_id, file_index, name, mime_type, size, sha256, saved_uri, status)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+
+selectOne:
+SELECT * FROM transfer_file WHERE transfer_id = ? AND file_index = ?;
+
+selectForTransfer:
+SELECT * FROM transfer_file WHERE transfer_id = ? ORDER BY file_index;
+
+selectPage:
+SELECT * FROM transfer_file WHERE transfer_id = :transferId AND file_index >= :fromIndex ORDER BY file_index LIMIT :limit;
+
+countByStatus:
+SELECT status, count(*) AS files FROM transfer_file WHERE transfer_id = ? GROUP BY status;
+
+updateStatus:
+UPDATE transfer_file SET status = :status WHERE transfer_id = :transferId AND file_index = :fileIndex;
+
+updateSha256:
+UPDATE transfer_file SET sha256 = :sha256 WHERE transfer_id = :transferId AND file_index = :fileIndex;
+
+updateSavedUri:
+UPDATE transfer_file SET saved_uri = :savedUri WHERE transfer_id = :transferId AND file_index = :fileIndex;
+
+complete:
+UPDATE transfer_file SET status = 'done', saved_uri = coalesce(:savedUri, saved_uri), sha256 = coalesce(:sha256, sha256)
+WHERE transfer_id = :transferId AND file_index = :fileIndex;
+
+updateUnfinishedStatus:
+UPDATE transfer_file SET status = :status WHERE transfer_id = :transferId AND status IN ('pending', 'in_progress');

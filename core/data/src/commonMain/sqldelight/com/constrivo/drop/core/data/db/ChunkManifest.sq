@@ -1,0 +1,35 @@
+-- Queries behind ChunkManifestRepository. Schema: 0.sqm.
+
+put:
+INSERT OR REPLACE INTO chunk_manifest (transfer_id, file_index, unit_count, received_bitmap, chunk_hashes, partial_unit, partial_bytes, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+
+selectOne:
+SELECT * FROM chunk_manifest WHERE transfer_id = ? AND file_index = ?;
+
+selectForTransfer:
+SELECT * FROM chunk_manifest WHERE transfer_id = ? ORDER BY file_index;
+
+deleteOne:
+DELETE FROM chunk_manifest WHERE transfer_id = ? AND file_index = ?;
+
+deleteForTransfer:
+DELETE FROM chunk_manifest WHERE transfer_id = ?;
+
+-- Transfers whose manifests and row have both been idle since :cutoff (architecture §7.6: 24 h after the last activity).
+selectInactiveTransfers:
+SELECT chunk_manifest.transfer_id FROM chunk_manifest
+GROUP BY chunk_manifest.transfer_id
+HAVING max(chunk_manifest.updated_at) < :cutoff
+  AND NOT EXISTS (SELECT 1 FROM transfer WHERE transfer.id = chunk_manifest.transfer_id AND transfer.updated_at >= :cutoff)
+ORDER BY chunk_manifest.transfer_id;
+
+-- Re-checks the condition in the same statement, so a manifest written since the scan survives.
+deleteIfInactive:
+DELETE FROM chunk_manifest
+WHERE transfer_id = :transferId
+  AND NOT EXISTS (SELECT 1 FROM chunk_manifest AS recent WHERE recent.transfer_id = :transferId AND recent.updated_at >= :cutoff)
+  AND NOT EXISTS (SELECT 1 FROM transfer WHERE transfer.id = :transferId AND transfer.updated_at >= :cutoff);
+
+countAll:
+SELECT count(*) FROM chunk_manifest;
