@@ -18,6 +18,9 @@ CREATE TABLE device (
   peer_adv_secret BLOB,
   peer_adv_generation INTEGER CHECK (peer_adv_generation IS NULL OR peer_adv_generation >= 0),
   previous_peer_adv_secret BLOB,
+  -- Until when the previous generation still resolves (a short grace period after the rotation was stored), so the
+  -- device the peer forgot, which knows that k_adv, cannot keep passing for the peer on this radar.
+  previous_peer_adv_until INTEGER,
   -- Bluetooth Classic address (48-bit value) of a trusted desktop, which stops advertising it in Trusted-only mode.
   classic_address INTEGER CHECK (classic_address IS NULL OR classic_address BETWEEN 1 AND 281474976710654),
   first_seen INTEGER NOT NULL,
@@ -26,11 +29,12 @@ CREATE TABLE device (
   CHECK (platform = 'browser' OR identity_pk IS NOT NULL),
   CHECK (identity_pk IS NOT NULL OR trusted = 0),
   CHECK (trusted = 1 OR (auto_accept = 0 AND recognition_secret IS NULL AND peer_adv_secret IS NULL
-    AND peer_adv_generation IS NULL AND previous_peer_adv_secret IS NULL AND classic_address IS NULL
-    AND trusted_at IS NULL)),
+    AND peer_adv_generation IS NULL AND previous_peer_adv_secret IS NULL AND previous_peer_adv_until IS NULL
+    AND classic_address IS NULL AND trusted_at IS NULL)),
   CHECK (trusted = 0 OR (recognition_secret IS NOT NULL AND trusted_at IS NOT NULL)),
   CHECK ((peer_adv_secret IS NULL) = (peer_adv_generation IS NULL)),
-  CHECK (previous_peer_adv_secret IS NULL OR peer_adv_secret IS NOT NULL)
+  CHECK (previous_peer_adv_secret IS NULL OR peer_adv_secret IS NOT NULL),
+  CHECK ((previous_peer_adv_secret IS NULL) = (previous_peer_adv_until IS NULL))
 )
 
 -- object index device_by_trust

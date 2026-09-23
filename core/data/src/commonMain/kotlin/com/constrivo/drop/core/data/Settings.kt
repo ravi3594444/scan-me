@@ -100,7 +100,8 @@ internal class InstantSetting(
 /**
  * Every user setting of design §6 and F-G5, with its default. Visibility is read and written through
  * [SettingsRepository.visibility] and [SettingsRepository.setVisibility], which keep its three stored parts
- * consistent. "Clear partial files" is an action ([ResumeDataCleaner]), not a setting.
+ * consistent. "Clear partial files" is an action, not a setting: [ResumeDataCleaner.clearPartials], which never
+ * touches a transfer an engine may still be writing (a short retention on [ResumeDataCleaner] would cancel live ones).
  */
 object SettingKeys {
     /** Longest save location or avatar URI accepted. */

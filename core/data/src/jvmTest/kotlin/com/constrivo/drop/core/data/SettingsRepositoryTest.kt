@@ -3,6 +3,7 @@ package com.constrivo.drop.core.data
 import com.constrivo.drop.core.discovery.Visibility
 import com.constrivo.drop.core.discovery.WallClock
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
@@ -207,6 +208,41 @@ class SettingsRepositoryTest {
             runCurrent()
             assertEquals(Visibility.EVERYONE, effective.last())
             assertEquals(4, effective.size)
+        }
+
+    @Test
+    fun theWindowEndsOnTheWallClockEvenWhenDelaysStopInDeepSleep() =
+        runTest {
+            // The wall clock moves on while the monotonic clock (the test scheduler) stands still: the CPU slept.
+            val clock = FakeClock(T0)
+            val data = openTestData(clock)
+            val ticks = MutableSharedFlow<Unit>()
+            val effective = collectInto(data.settings.observeEffectiveVisibility(ticks))
+            runCurrent()
+            data.settings.setVisibility(Visibility.EVERYONE_TEN_MINUTES)
+            runCurrent()
+            assertEquals(Visibility.EVERYONE_TEN_MINUTES, effective.last())
+            clock.advance(3 * HOUR)
+            assertEquals(Visibility.TRUSTED_ONLY, data.settings.effectiveVisibility(), "what a beacon rebuild reads")
+            ticks.emit(Unit) // the platform's exact alarm, or an epoch rebuild
+            runCurrent()
+            assertEquals(listOf(Visibility.TRUSTED_ONLY, Visibility.EVERYONE_TEN_MINUTES, Visibility.TRUSTED_ONLY), effective)
+        }
+
+    @Test
+    fun anOpenWindowReReadsTheWallClockWithoutATick() =
+        runTest {
+            val clock = FakeClock(T0)
+            val data = openTestData(clock)
+            val effective = collectInto(data.settings.observeEffectiveVisibility())
+            runCurrent()
+            data.settings.setVisibility(Visibility.EVERYONE_TEN_MINUTES)
+            runCurrent()
+            clock.advance(HOUR) // slept; on waking, the next re-check sees the wall clock
+            advanceTimeBy(SettingsRepository.VISIBILITY_RECHECK_MILLIS)
+            runCurrent()
+            assertEquals(Visibility.TRUSTED_ONLY, effective.last())
+            assertEquals(3, effective.size)
         }
 
     @Test

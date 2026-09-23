@@ -6,8 +6,16 @@ SELECT * FROM device WHERE id = ?;
 selectByIdentityKey:
 SELECT * FROM device WHERE identity_pk = ?;
 
+-- The Devices tab: most recently seen first.
 selectTrusted:
 SELECT * FROM device WHERE trusted = 1 ORDER BY last_seen DESC, id;
+
+-- The handshake and radar input, in id order, so a sighting (which moves last_seen) never reorders it.
+selectTrustedById:
+SELECT * FROM device WHERE trusted = 1 ORDER BY id;
+
+selectLastSeen:
+SELECT last_seen FROM device WHERE id = ?;
 
 insertPeer:
 INSERT INTO device (id, identity_pk, nickname, platform, first_seen, last_seen)
@@ -20,23 +28,35 @@ WHERE id = :id;
 touchLastSeen:
 UPDATE device SET last_seen = max(last_seen, :seenAt) WHERE id = :id;
 
+-- Pairing. DeviceRepository.trust reads the row first and passes the stored advertising secret back unless the new
+-- one is strictly newer, so pairing again without a TrustShare, or with a stale one, never loses or rolls back a k_adv.
 trust:
 UPDATE device SET
   trusted = 1,
   recognition_secret = :recognitionSecret,
   peer_adv_secret = :advertisingSecret,
   peer_adv_generation = :advertisingGeneration,
-  previous_peer_adv_secret = NULL,
+  previous_peer_adv_secret = :previousAdvertisingSecret,
+  previous_peer_adv_until = :previousUntil,
   trusted_at = coalesce(trusted_at, :trustedAt),
   last_seen = max(last_seen, :trustedAt)
 WHERE id = :id AND identity_pk IS NOT NULL;
 
+-- A TrustShare (S3): the stored secret becomes the previous generation, which resolves until :previousUntil.
+-- DeviceRepository passes :previousUntil as null when no secret was stored, and re-checks the generation here.
 rotateAdvertisingSecret:
 UPDATE device SET
   previous_peer_adv_secret = peer_adv_secret,
+  previous_peer_adv_until = :previousUntil,
   peer_adv_secret = :advertisingSecret,
   peer_adv_generation = :advertisingGeneration
 WHERE id = :id AND trusted = 1 AND (peer_adv_generation IS NULL OR peer_adv_generation < :advertisingGeneration);
+
+-- Re-seals the secrets of one device with the configured SecretFieldCipher (DeviceRepository.resealPlaintextSecrets).
+updateSecrets:
+UPDATE device SET recognition_secret = :recognitionSecret, peer_adv_secret = :advertisingSecret,
+  previous_peer_adv_secret = :previousAdvertisingSecret
+WHERE id = :id AND trusted = 1;
 
 setClassicAddress:
 UPDATE device SET classic_address = :classicAddress WHERE id = :id AND trusted = 1;
@@ -55,6 +75,7 @@ UPDATE device SET
   peer_adv_secret = NULL,
   peer_adv_generation = NULL,
   previous_peer_adv_secret = NULL,
+  previous_peer_adv_until = NULL,
   classic_address = NULL,
   custom_name = NULL,
   trusted_at = NULL

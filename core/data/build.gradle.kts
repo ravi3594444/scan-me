@@ -29,8 +29,6 @@ sqldelight {
     databases {
         create("DropDatabase") {
             packageName.set("com.constrivo.drop.core.data.db")
-            // The 3.24 dialect keeps queries to SQL that Android 12's SQLite (API 31: 3.32) and SQLCipher's both run.
-            dialect(libs.sqldelight.sqlite.dialect)
             // The schema is the result of the numbered migrations: 0.sqm creates version 1 (DropSchema).
             deriveSchemaFromMigrations.set(true)
         }

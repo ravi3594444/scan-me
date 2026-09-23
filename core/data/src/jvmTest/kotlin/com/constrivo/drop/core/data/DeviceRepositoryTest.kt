@@ -6,9 +6,14 @@ import com.constrivo.drop.core.crypto.toHex
 import com.constrivo.drop.core.crypto.trust.AdvertisingSecret
 import com.constrivo.drop.core.discovery.BluetoothAddress
 import com.constrivo.drop.core.discovery.DevicePlatform
+import com.constrivo.drop.core.discovery.WallClock
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import java.io.File
+import java.nio.file.Files
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -101,11 +106,57 @@ class DeviceRepositoryTest {
         runTest {
             val data = openTestData()
             val id = data.peer(1, at = T0)
-            assertTrue(data.devices.recordSighting(id, T0 + 5_000))
+            assertTrue(data.devices.recordSighting(id, T0 + 50_000))
             assertTrue(data.devices.recordSighting(id, T0 + 1_000))
-            assertEquals(T0 + 5_000, data.devices.find(id)?.lastSeenMillis)
+            assertEquals(T0 + 50_000, data.devices.find(id)?.lastSeenMillis)
             assertFalse(data.devices.recordSighting("f".repeat(32), T0))
             assertFailsWith<IllegalArgumentException> { data.devices.recordSighting("not-an-id", T0) }
+        }
+
+    @Test
+    fun sightingsAreStoredAtMostEvery30SecondsAndNeverTouchTheKeysFlow() =
+        runTest {
+            val crypto = SeededCrypto(7)
+            val opened = mutableListOf<String>()
+            val aead = AeadSecretFieldCipher(crypto, ByteArray(32))
+            // Counts every opened secret: the keys flow must not re-open secrets for a sighting.
+            val counting =
+                object : SecretFieldCipher by aead {
+                    override fun open(
+                        sealed: ByteArray,
+                        context: String,
+                    ): ByteArray = aead.open(sealed, context).also { opened += context }
+                }
+            val data = openTestData(cipher = counting, crypto = crypto)
+            val a = data.peer(1, at = T0)
+            val b = data.peer(2, at = T0)
+            data.devices.trust(a, secret(1), adv1, 0, T0)
+            data.devices.trust(b, secret(2), adv2, 0, T0)
+            val keys = collectInto(data.devices.observeTrustedKeys())
+            val trusted = collectInto(data.devices.observeTrusted())
+            runCurrent()
+            val openedAtStart = opened.size
+
+            // A burst of beacons within 30 s: not one write.
+            for (t in 1..29) assertTrue(data.devices.recordSighting(b, T0 + t * 1_000L))
+            runCurrent()
+            assertEquals(T0, data.devices.find(b)?.lastSeenMillis)
+            assertEquals(1, trusted.size, "no write, so not even the Devices tab re-queried")
+
+            // 30 s later: stored, the Devices tab reorders, the keys flow stays silent and opens nothing.
+            assertTrue(data.devices.recordSighting(b, T0 + 30_000))
+            runCurrent()
+            assertEquals(T0 + 30_000, data.devices.find(b)?.lastSeenMillis)
+            assertEquals(listOf(b, a), trusted.last().map { it.id })
+            assertEquals(1, keys.size, "a sighting does not re-emit the keys")
+            assertEquals(openedAtStart, opened.size, "a sighting opens no secret")
+            assertEquals(listOf(a, b).sorted(), keys.single().map { it.device.id }, "keys are in id order")
+
+            // A real change re-emits.
+            data.devices.rename(a, "Laptop")
+            runCurrent()
+            assertEquals(2, keys.size)
+            assertEquals("Laptop", keys.last().first { it.device.id == a }.device.displayName)
         }
 
     @Test
@@ -167,6 +218,77 @@ class DeviceRepositoryTest {
             val peer = assertNotNull(keys.toTrustedPeer())
             assertEquals(id, peer.deviceId)
             assertEquals("Peer 1", peer.nickname)
+        }
+
+    @Test
+    fun pairingAgainNeverLosesOrRollsBackAKnownAdvertisingSecret() =
+        runTest {
+            val data = openTestData()
+            val id = data.peer(1)
+            assertTrue(data.devices.trust(id, secret(1), adv2, 5, T0))
+            assertTrue(data.devices.trust(id, secret(2), atMillis = T0 + 1), "re-pair without a TrustShare")
+            var keys = assertNotNull(data.devices.trustedKeys(id))
+            assertContentEquals(secret(2), keys.recognitionSecret(), "the recognition secret is replaced")
+            assertEquals(adv2, keys.advertisingSecret, "the known k_adv stays")
+            assertEquals(5, keys.device.advertisingSecretGeneration)
+
+            assertTrue(data.devices.trust(id, secret(3), adv1, 4, T0 + 2), "re-pair with a stale TrustShare")
+            keys = assertNotNull(data.devices.trustedKeys(id))
+            assertEquals(adv2, keys.advertisingSecret, "an older generation never replaces a newer one")
+            assertEquals(5, keys.device.advertisingSecretGeneration)
+            assertNull(keys.previousAdvertisingSecret)
+
+            assertTrue(data.devices.trust(id, secret(4), adv3, 6, T0 + 3), "re-pair with a newer TrustShare")
+            keys = assertNotNull(data.devices.trustedKeys(id))
+            assertEquals(adv3, keys.advertisingSecret)
+            assertEquals(adv2, keys.previousAdvertisingSecret, "the replaced secret becomes the previous generation")
+            assertEquals(6, keys.device.advertisingSecretGeneration)
+            assertEquals(T0, keys.device.trustedAtMillis, "the first trust time stays")
+        }
+
+    @Test
+    fun thePreviousAdvertisingSecretStopsResolvingAfterItsGracePeriod() =
+        runTest {
+            val clock = WallClock { T0 + testScheduler.currentTime }
+            val data = openTestData(clock)
+            val id = data.peer(1)
+            data.devices.trust(id, secret(1), adv1, 0)
+            val keys = collectInto(data.devices.observeTrustedKeys())
+            runCurrent()
+            assertTrue(data.devices.storeAdvertisingSecret(id, adv2, 1))
+            runCurrent()
+            assertEquals(adv1, keys.last().single().previousAdvertisingSecret)
+
+            advanceTimeBy(DeviceRepository.PREVIOUS_SECRET_GRACE_MILLIS - 1)
+            runCurrent()
+            assertEquals(adv1, keys.last().single().previousAdvertisingSecret, "still inside the grace period")
+            advanceTimeBy(1)
+            runCurrent()
+            val after = keys.last().single()
+            assertNull(after.previousAdvertisingSecret, "the forgotten device's copy of the old k_adv no longer resolves")
+            assertEquals(adv2, after.advertisingSecret)
+            assertNull(data.devices.trustedKeys(id)?.previousAdvertisingSecret)
+            assertEquals(30 * 60_000L, DeviceRepository.PREVIOUS_SECRET_GRACE_MILLIS)
+        }
+
+    @Test
+    fun ownAdvertisingGenerationStartsAtZeroAndOnlyAdvances() =
+        runTest {
+            val data = openTestData()
+            assertEquals(0, data.devices.ownAdvertisingGeneration())
+            assertEquals(1, data.devices.advanceOwnAdvertisingGeneration())
+            assertEquals(2, data.devices.advanceOwnAdvertisingGeneration())
+            assertEquals(2, data.devices.ownAdvertisingGeneration())
+            assertEquals(SettingsSnapshot::class, data.settings.snapshot()::class, "not a user setting, and harmless to them")
+
+            // What a peer does with our shares: every advanced generation is accepted.
+            val peer = data.peer(1)
+            data.devices.trust(peer, secret(1))
+            assertTrue(data.devices.storeAdvertisingSecret(peer, adv1, data.devices.ownAdvertisingGeneration()))
+            assertTrue(data.devices.storeAdvertisingSecret(peer, adv2, data.devices.advanceOwnAdvertisingGeneration()))
+
+            data.driver.execute(null, "UPDATE settings SET value = '-1' WHERE key = '${DeviceRepository.OWN_GENERATION_KEY}'", 0)
+            assertFailsWith<DataCorruptionException>("never silently back to 0") { data.devices.ownAdvertisingGeneration() }
         }
 
     @Test
@@ -273,7 +395,7 @@ class DeviceRepositoryTest {
             runCurrent()
             data.devices.trust(b, secret(2), atMillis = T0 + 3)
             runCurrent()
-            data.devices.recordSighting(a, T0 + 10)
+            data.devices.recordSighting(a, T0 + 60_000)
             runCurrent()
             data.devices.forget(b)
             runCurrent()
@@ -361,6 +483,71 @@ class DeviceRepositoryTest {
             )
             assertFailsWith<DataCorruptionException> { data.devices.trustedKeys(b) }
             assertNotNull(data.devices.trustedKeys(a))
+        }
+
+    @Test
+    fun oneUnreadableDeviceLeavesTheOthersTrusted() =
+        runTest {
+            val data = openTestData()
+            val a = data.peer(1)
+            val b = data.peer(2)
+            val c = data.peer(3)
+            for ((n, id) in listOf(a, b, c).withIndex()) data.devices.trust(id, secret(n), adv1, 0)
+            val reported = mutableListOf<String>()
+            val keys = collectInto(data.devices.observeTrustedKeys { id, _ -> reported += id })
+            runCurrent()
+            data.driver.execute(null, "UPDATE device SET recognition_secret = X'01' WHERE id = '$b'", 0)
+            data.devices.rename(a, "A") // any write re-runs the flow
+            runCurrent()
+            assertEquals(listOf(a, c).sorted(), keys.last().map { it.device.id }, "the flow keeps going without b")
+            assertEquals(listOf(b), reported.distinct())
+
+            val skipped = mutableListOf<String>()
+            assertEquals(listOf(a, c).sorted(), data.devices.trustedKeys { id, _ -> skipped += id }.map { it.device.id })
+            assertEquals(listOf(b), skipped)
+            assertFailsWith<DataCorruptionException>("asking for that one device still says why") { data.devices.trustedKeys(b) }
+        }
+
+    @Test
+    fun switchingFromPlaintextToAeadKeepsEveryTrustedDevice() =
+        runTest {
+            val dir = Files.createTempDirectory("drop-reseal").toFile()
+            val path = File(dir, "drop.db").path
+            val crypto = SeededCrypto(7)
+            val aead = AeadSecretFieldCipher(crypto, ByteArray(32) { 3 })
+            val first = DropData.open(JdbcSqliteDriverFactory.file(path), Dispatchers.IO, crypto, FakeClock(), LocalCalendar.UTC)
+            val id = first.peer(1)
+            first.devices.trust(id, secret(1), adv1, 0)
+            first.devices.storeAdvertisingSecret(id, adv2, 1)
+            val untrusted = first.peer(2)
+            first.close()
+
+            // A later release plugs in the AEAD cipher.
+            val second = DropData.open(JdbcSqliteDriverFactory.file(path), Dispatchers.IO, crypto, FakeClock(), LocalCalendar.UTC, aead)
+            val keys = assertNotNull(second.devices.trustedKeys(id))
+            assertContentEquals(secret(1), keys.recognitionSecret())
+            assertEquals(adv2, keys.advertisingSecret)
+            assertEquals(adv1, keys.previousAdvertisingSecret)
+            for (column in listOf("recognition_secret", "peer_adv_secret", "previous_peer_adv_secret")) {
+                assertEquals(1, second.driver.blob("SELECT $column FROM device WHERE id = '$id'")!![0].toInt(), "$column re-sealed")
+            }
+            assertNull(second.driver.blob("SELECT recognition_secret FROM device WHERE id = '$untrusted'"))
+            val sealed = second.driver.blob("SELECT recognition_secret FROM device WHERE id = '$id'")!!.toList()
+            second.close()
+
+            // Opening again changes nothing, and the re-seal was one-time: a plaintext value written later does not open.
+            val third = DropData.open(JdbcSqliteDriverFactory.file(path), Dispatchers.IO, crypto, FakeClock(), LocalCalendar.UTC, aead)
+            assertEquals(sealed, third.driver.blob("SELECT recognition_secret FROM device WHERE id = '$id'")!!.toList())
+            assertContentEquals(secret(1), third.devices.trustedKeys(id)!!.recognitionSecret())
+            val planted = third.peer(3)
+            third.devices.trust(planted, secret(3))
+            third.driver.execute(null, "UPDATE device SET recognition_secret = X'00${secret(9).toHex()}' WHERE id = '$planted'", 0)
+            third.close()
+            val fourth = DropData.open(JdbcSqliteDriverFactory.file(path), Dispatchers.IO, crypto, FakeClock(), LocalCalendar.UTC, aead)
+            assertEquals(listOf(id), fourth.devices.trustedKeys().map { it.device.id })
+            assertFailsWith<DataCorruptionException> { fourth.devices.trustedKeys(planted) }
+            fourth.close()
+            dir.deleteRecursively()
         }
 
     @Test

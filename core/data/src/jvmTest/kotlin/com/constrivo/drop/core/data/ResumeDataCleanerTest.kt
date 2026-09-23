@@ -1,5 +1,6 @@
 package com.constrivo.drop.core.data
 
+import com.constrivo.drop.core.protocol.ChunkHash
 import com.constrivo.drop.core.protocol.TransferId
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.launch
@@ -61,6 +62,77 @@ class ResumeDataCleanerTest {
                 cleaner.runOnce(),
                 "a second pass has nothing to do",
             )
+        }
+
+    @Test
+    fun aLateFlushCannotLeaveAManifestWhoseBytesWereDeleted() =
+        runTest {
+            val clock = FakeClock(T0)
+            val data = openTestData(clock)
+            data.receiving(1, T0)
+            data.manifests.put(ChunkManifest.empty(transferId(1), 0, 2, T0))
+            clock.now = T0 + 2 * DAY
+            val flushes = mutableListOf<Boolean>()
+            val cleaner =
+                data.resumeDataCleaner(clock) { id ->
+                    // An engine that still held the transfer flushes its write-behind manifest right after the partials went.
+                    val late = ChunkManifest.empty(id, 0, 2, clock.now).withReceived(0, ChunkHash(ByteArray(16) { 1 }), clock.now)
+                    flushes += data.manifests.put(late)
+                }
+            val report = cleaner.runOnce()
+            assertEquals(listOf(transferId(1)), report.expired)
+            assertEquals(listOf(transferId(1)), report.purged)
+            assertEquals(listOf(false), flushes, "a cancelled transfer takes no manifest")
+            assertEquals(emptyList(), data.manifests.forTransfer(transferId(1)), "no manifest points at the deleted bytes")
+        }
+
+    @Test
+    fun anIdleManifestOfARunningTransferIsLeftAlone() =
+        runTest {
+            val clock = FakeClock(T0)
+            val data = openTestData(clock)
+            data.receiving(1, T0)
+            data.manifests.put(ChunkManifest.empty(transferId(1), 0, 2, T0))
+            clock.now = T0 + 2 * DAY
+            // The transfer row saw activity (so it is not expired), but its manifest did not.
+            data.transfers.updateProgress(transferId(1), 10, clock.now)
+            val deleted = mutableListOf<TransferId>()
+            val report = data.resumeDataCleaner(clock) { deleted += it }.runOnce()
+            assertEquals(ResumeDataCleaner.Report(emptyList(), emptyList(), emptyMap()), report)
+            assertEquals(emptyList(), deleted)
+            assertEquals(1, data.manifests.forTransfer(transferId(1)).size)
+        }
+
+    @Test
+    fun clearPartialsNeverTouchesATransferAnEngineHolds() =
+        runTest {
+            val clock = FakeClock(T0)
+            val data = openTestData(clock)
+            data.receiving(1, T0) // streaming right now
+            data.receiving(2, T0) // parked, released by the caller
+            data.receiving(3, T0) // failed a minute ago, partials left
+            data.receiving(4, T0) // done, no manifest
+            data.transfers.create(NewTransfer(transferId(5), data.peer(1), TransferDirection.SEND, 10, 1), T0) // sent: no partials
+            for (n in 1..3) data.manifests.put(ChunkManifest.empty(transferId(n), 0, 2, T0))
+            data.transfers.updateStatus(transferId(1), TransferStatus.STREAMING, T0)
+            data.transfers.finish(transferId(3), TransferOutcome(TransferStatus.FAILED, 0), T0)
+            data.transfers.finish(transferId(4), TransferOutcome(TransferStatus.DONE, 1_000), T0)
+            data.transfers.finish(transferId(5), TransferOutcome(TransferStatus.DONE, 10), T0)
+
+            val deleted = mutableListOf<TransferId>()
+            val cleaner = data.resumeDataCleaner(clock) { deleted += it }
+            clock.now = T0 + 60_000
+            val report = cleaner.clearPartials(released = listOf(transferId(2), transferId(3)))
+
+            assertEquals(listOf(transferId(2)), report.expired, "a released transfer cannot resume without its partials")
+            assertEquals(setOf(transferId(2), transferId(3), transferId(4)), deleted.toSet())
+            assertEquals(deleted.toSet(), report.purged.toSet())
+            assertEquals(TransferStatus.STREAMING, data.transfers.get(transferId(1))?.status)
+            assertEquals(1, data.manifests.forTransfer(transferId(1)).size, "the running transfer keeps its resume state")
+            assertEquals(TransferStatus.CANCELLED, data.transfers.get(transferId(2))?.status)
+            assertEquals(emptyList(), data.manifests.forTransfer(transferId(2)))
+            assertEquals(emptyList(), data.manifests.forTransfer(transferId(3)))
+            assertEquals(TransferStatus.DONE, data.transfers.get(transferId(4))?.status, "History is untouched")
         }
 
     @Test

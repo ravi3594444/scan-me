@@ -9,8 +9,11 @@ import com.constrivo.drop.core.discovery.WallClock
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.transformLatest
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.CoroutineContext
@@ -76,19 +79,31 @@ class SettingsRepository internal constructor(
     /** The visibility setting now and after every change. */
     fun observeVisibility(): Flow<VisibilityPreference> = observeAll().map { it.visibility }.distinctUntilChanged()
 
+    /** The visibility in force at [nowMillis] (wall clock): what the advertiser reads at every beacon rebuild. */
+    suspend fun effectiveVisibility(nowMillis: Long = clock.nowMillis()): Visibility = visibility().effectiveAt(nowMillis)
+
     /**
      * The visibility in force (F-A5): follows [observeVisibility] and also switches back when a 10-minute window
      * ends, without any write. This is what the advertiser and the mDNS announcer follow.
+     *
+     * The window's end is a wall-clock time, but coroutine delays run on a monotonic clock that stops while the CPU
+     * sleeps, and the Bluetooth controller keeps advertising the last beacon meanwhile. So while a window is open the
+     * wall clock is re-read at least every [VISIBILITY_RECHECK_MILLIS] of awake time and at every [recheck] emission,
+     * and the platform must make the window end on time even in deep sleep:
+     * - schedule an exact wake-up at [VisibilityPreference.expiresAtMillis] (Android: an `AlarmManager` exact alarm
+     *   allowed while idle) and emit into [recheck] when it fires, as well as at every epoch or advertisement rebuild;
+     * - at every rebuild, build the beacon from [effectiveVisibility] (or [VisibilityPreference.effectiveAt] with the
+     *   wall-clock time), never from a value cached before the device slept.
      */
     @OptIn(ExperimentalCoroutinesApi::class)
-    fun observeEffectiveVisibility(): Flow<Visibility> =
-        observeVisibility()
+    fun observeEffectiveVisibility(recheck: Flow<Unit> = emptyFlow()): Flow<Visibility> =
+        combine(observeVisibility(), recheck.onStart { emit(Unit) }) { preference, _ -> preference }
             .transformLatest { preference ->
                 while (true) {
                     val now = clock.nowMillis()
                     emit(preference.effectiveAt(now))
                     val remaining = preference.remainingMillis(now) ?: break
-                    delay(remaining)
+                    delay(remaining.coerceAtMost(VISIBILITY_RECHECK_MILLIS))
                 }
             }.distinctUntilChanged()
 
@@ -174,5 +189,10 @@ class SettingsRepository internal constructor(
         } else {
             VisibilityPreference(mode, null, safeRevert)
         }
+    }
+
+    companion object {
+        /** While a 10-minute window is open, [observeEffectiveVisibility] re-reads the wall clock at least this often. */
+        const val VISIBILITY_RECHECK_MILLIS: Long = 30_000
     }
 }

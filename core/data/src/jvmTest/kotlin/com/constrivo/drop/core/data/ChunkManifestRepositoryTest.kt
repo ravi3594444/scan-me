@@ -77,6 +77,24 @@ class ChunkManifestRepositoryTest {
         }
 
     @Test
+    fun aFinishedTransferTakesNoManifest() =
+        runTest {
+            val data = openTestData()
+            data.receiving(1)
+            data.receiving(2)
+            assertTrue(data.manifests.put(ChunkManifest.empty(transferId(1), 0, 4, T0)))
+            data.transfers.finish(transferId(1), TransferOutcome(TransferStatus.CANCELLED, 0), T0 + 1)
+            // A late write-behind flush: its bits would claim bytes the clean-up may already have deleted.
+            val late = ChunkManifest.empty(transferId(1), 0, 4, T0 + 2).withReceived(0, hash(0), T0 + 2)
+            assertFalse(data.manifests.put(late))
+            assertEquals(ChunkManifest.empty(transferId(1), 0, 4, T0), data.manifests.get(transferId(1), 0), "the stored one is unchanged")
+            val mixed = listOf(late, ChunkManifest.empty(transferId(2), 0, 4, T0), ChunkManifest.empty(transferId(1), 1, 4, T0))
+            assertEquals(1, data.manifests.putAll(mixed), "only the unfinished transfer's manifest is stored")
+            assertEquals(1, data.manifests.forTransfer(transferId(2)).size)
+            assertEquals(1, data.manifests.forTransfer(transferId(1)).size)
+        }
+
+    @Test
     fun deleteOneAndDeleteForTransfer() =
         runTest {
             val data = openTestData()

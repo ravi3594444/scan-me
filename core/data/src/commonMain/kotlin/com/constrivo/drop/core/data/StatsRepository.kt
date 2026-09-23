@@ -1,11 +1,14 @@
 package com.constrivo.drop.core.data
 
 import app.cash.sqldelight.coroutines.asFlow
+import app.cash.sqldelight.coroutines.mapToOne
 import com.constrivo.drop.core.data.db.DropDatabase
 import com.constrivo.drop.core.discovery.WallClock
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.transformLatest
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.CoroutineContext
 
@@ -77,13 +80,28 @@ class StatsRepository internal constructor(
     /** The figures at [nowMillis] ("this week" is the local week containing it). */
     suspend fun stats(nowMillis: Long = clock.nowMillis()): TransferStats = withContext(context) { compute(nowMillis) }
 
-    /** [stats], recomputed whenever a transfer changes. */
+    /**
+     * [stats], recomputed when a done transfer is added or removed and when a new local week starts (so "this week"
+     * resets without any write). Progress writes of running transfers, and failed or cancelled ones, only re-run a
+     * cheap check over the status index (the count and start times of the done rows).
+     * The week boundary is re-checked at least every [RECHECK_MILLIS] of awake time, since coroutine delays stop while
+     * the CPU sleeps.
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
     fun observe(): Flow<TransferStats> =
         queries
-            .statsTotals(TransferStats.BLUETOOTH_BYTES_PER_SECOND)
+            .statsFingerprint()
             .asFlow()
-            .map { withContext(context) { compute(clock.nowMillis()) } }
+            .mapToOne(context)
             .distinctUntilChanged()
+            .transformLatest {
+                while (true) {
+                    val now = clock.nowMillis()
+                    val stats = withContext(context) { compute(now) }
+                    emit(stats)
+                    delay((stats.weeks.last().endMillis - now).coerceIn(1, RECHECK_MILLIS))
+                }
+            }.distinctUntilChanged()
 
     private fun compute(nowMillis: Long): TransferStats {
         val weeks = weekBoundaries(nowMillis)
@@ -137,5 +155,8 @@ class StatsRepository internal constructor(
     companion object {
         /** Weeks in the Stats chart (design §6). */
         const val WEEKS: Int = 12
+
+        /** [observe] re-reads the wall clock for a new week at least this often (1 h). */
+        const val RECHECK_MILLIS: Long = 60L * 60 * 1000
     }
 }

@@ -31,6 +31,17 @@ class DatabaseVersionException(
 ) : DataException("database schema version $found is newer than the supported version $supported")
 
 /**
+ * A migration from schema version [from] to [to] left rows whose foreign keys point nowhere
+ * (`PRAGMA foreign_key_check`, [violations] names the first of them). The migration was rolled back and the database is
+ * still at [from]; the migration is wrong, not the data.
+ */
+class SchemaMigrationException(
+    val from: Long,
+    val to: Long,
+    val violations: List<String>,
+) : DataException("migrating the schema from version $from to $to broke foreign keys: ${violations.joinToString()}")
+
+/**
  * A device announced an identity key other than the one stored under its device id. Device ids are derived from the
  * key (`SHA-256(identity_pk)[0..16]`), so this means a 128-bit collision or a caller that computed the id wrongly;
  * the stored row is left untouched.

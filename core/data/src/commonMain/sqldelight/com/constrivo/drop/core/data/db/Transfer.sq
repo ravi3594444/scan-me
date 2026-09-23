@@ -7,6 +7,10 @@ VALUES (:id, :peerDeviceId, :direction, :status, :startedAt, :startedAt, :bytesT
 exists:
 SELECT count(*) FROM transfer WHERE id = ?;
 
+-- A missing row, a null finished_at (running) or its finish time.
+selectFinishedAt:
+SELECT finished_at FROM transfer WHERE id = ?;
+
 selectRow:
 SELECT * FROM transfer_row WHERE id = ?;
 
@@ -73,6 +77,24 @@ UPDATE transfer SET status = 'cancelled', finished_at = :finishedAt
 WHERE id = :id AND finished_at IS NULL AND updated_at < :cutoff
   AND NOT EXISTS (SELECT 1 FROM chunk_manifest WHERE chunk_manifest.transfer_id = transfer.id AND chunk_manifest.updated_at >= :cutoff);
 
+-- Cancels an unfinished transfer whose resume state the user cleared (ResumeDataCleaner.clearPartials).
+cancelUnfinished:
+UPDATE transfer SET status = 'cancelled', finished_at = :finishedAt, updated_at = :finishedAt
+WHERE id = :id AND finished_at IS NULL;
+
+-- Finished transfers that may have partial files: every received one, and any with a manifest left.
+selectFinishedWithResumeData:
+SELECT id FROM transfer
+WHERE finished_at IS NOT NULL
+  AND (direction = 'receive' OR EXISTS (SELECT 1 FROM chunk_manifest WHERE chunk_manifest.transfer_id = transfer.id))
+ORDER BY id;
+
+selectFinishedDirection:
+SELECT direction FROM transfer WHERE id = ? AND finished_at IS NOT NULL;
+
+selectFinished:
+SELECT id, direction FROM transfer WHERE finished_at IS NOT NULL ORDER BY id;
+
 deleteFilesOfFinished:
 DELETE FROM transfer_file WHERE transfer_id = :id AND EXISTS (SELECT 1 FROM transfer WHERE transfer.id = :id AND finished_at IS NOT NULL);
 
@@ -81,15 +103,6 @@ DELETE FROM chunk_manifest WHERE transfer_id = :id AND EXISTS (SELECT 1 FROM tra
 
 deleteFinished:
 DELETE FROM transfer WHERE id = :id AND finished_at IS NOT NULL;
-
-clearFilesOfFinished:
-DELETE FROM transfer_file WHERE transfer_id IN (SELECT id FROM transfer WHERE finished_at IS NOT NULL);
-
-clearManifestsOfFinished:
-DELETE FROM chunk_manifest WHERE transfer_id IN (SELECT id FROM transfer WHERE finished_at IS NOT NULL);
-
-clearFinished:
-DELETE FROM transfer WHERE finished_at IS NOT NULL;
 
 -- Stats (F-G4). Counted transfers are exactly the History rows with status 'done'; see TransferStats for the
 -- definitions. Active time: bytes at the recorded average speed, or wall time when no speed was recorded.
@@ -101,6 +114,11 @@ SELECT
   CAST(coalesce(sum(max(bytes_done * 1000 / :baselineBytesPerSecond - CASE WHEN avg_speed_bps > 0 THEN bytes_done * 1000 / avg_speed_bps ELSE max(finished_at - started_at, 0) END, 0)), 0) AS INTEGER) AS saved_ms
 FROM transfer
 WHERE status = 'done';
+
+-- Changes exactly when a done row is added or removed (done rows never change), from the transfer_by_status index
+-- alone: StatsRepository.observe recomputes only then, not at every progress write.
+statsFingerprint:
+SELECT count(*) AS transfers, coalesce(sum(started_at), 0) AS start_sum FROM transfer WHERE status = 'done';
 
 statsStartsBetween:
 SELECT started_at FROM transfer

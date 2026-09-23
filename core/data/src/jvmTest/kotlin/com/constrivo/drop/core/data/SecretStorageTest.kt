@@ -2,10 +2,12 @@ package com.constrivo.drop.core.data
 
 import com.constrivo.drop.core.crypto.InMemorySecretStorage
 import com.constrivo.drop.core.crypto.JcaCryptoProvider
+import com.constrivo.drop.core.crypto.SecretStorage
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CountDownLatch
 import kotlin.random.Random
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
@@ -93,6 +95,35 @@ class SecretStorageTest {
         threads.forEach(Thread::start)
         threads.forEach(Thread::join)
         assertEquals(1, results.toSet().size)
+    }
+
+    @Test
+    fun concurrentFirstUseThroughSeparateInstancesCreatesOneKey() {
+        // What `DatabaseKeys(secretStorage, crypto).sqlCipherKey()` inline at two call sites does.
+        repeat(20) {
+            val storage = SlowSecretStorage(InMemorySecretStorage())
+            val start = CountDownLatch(1)
+            val results = ConcurrentLinkedQueue<List<Byte>>()
+            val threads =
+                (0 until 8).map {
+                    Thread {
+                        start.await()
+                        results += DatabaseKeys(storage, JcaCryptoProvider()).masterKey().toList()
+                    }
+                }
+            threads.forEach(Thread::start)
+            start.countDown()
+            threads.forEach(Thread::join)
+            assertEquals(1, results.toSet().size, "every instance got the same key")
+            assertEquals(results.first(), storage.get(DatabaseKeys.STORAGE_NAME)!!.drop(1), "and it is the stored one")
+        }
+    }
+
+    /** Widens the get-then-put window of first use, so an unguarded race would show. */
+    private class SlowSecretStorage(
+        private val delegate: SecretStorage,
+    ) : SecretStorage by delegate {
+        override fun get(name: String): ByteArray? = delegate.get(name).also { Thread.sleep(1) }
     }
 
     @Test

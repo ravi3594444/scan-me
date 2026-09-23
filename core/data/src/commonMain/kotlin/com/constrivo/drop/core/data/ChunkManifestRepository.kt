@@ -16,9 +16,12 @@ import kotlin.coroutines.CoroutineContext
  * can lose the last commits on power loss), which is safe: a lost update only makes the receiver ask for a unit
  * it already has; the unsafe direction, a bit without its bytes, cannot happen when this order is kept.
  *
+ * Only an unfinished transfer takes manifests ([put]): once a transfer is finished its partial files may be deleted
+ * at any time ([ResumeDataCleaner]), so a late write-behind flush must not recreate a manifest that claims their bytes.
+ *
  * Rows go away with [deleteForTransfer] when a transfer completes, with their transfer
- * ([TransferRepository.delete]), and through [purgeInactive] 24 hours after the transfer's last activity.
- * Every function is main-safe.
+ * ([TransferRepository.delete]), and through [ResumeDataCleaner] (or [purgeInactive]) 24 hours after the transfer's
+ * last activity. Every function is main-safe.
  */
 class ChunkManifestRepository internal constructor(
     private val database: DropDatabase,
@@ -43,21 +46,35 @@ class ChunkManifestRepository internal constructor(
      * Stores [manifest], replacing the stored one for its key; `updated_at` is [ChunkManifest.updatedAtMillis].
      * See the durability rule in the class comment.
      *
+     * @return true when stored; false when the transfer is already finished (a flush that lost the race with
+     *   [TransferRepository.finish] or with the 24 h expiry), in which case nothing is stored.
      * @throws NoSuchRecordException if the transfer is not stored.
      */
-    suspend fun put(manifest: ChunkManifest) = putAll(listOf(manifest))
+    suspend fun put(manifest: ChunkManifest): Boolean = putAll(listOf(manifest)) == 1
 
-    /** [put] for several manifests in one transaction: one write-behind flush (≤ 100 ms, §7.6). */
-    suspend fun putAll(manifests: Collection<ChunkManifest>) {
-        if (manifests.isEmpty()) return
-        withContext(context) {
-            database.transaction {
-                val known = HashSet<String>()
+    /**
+     * [put] for several manifests in one transaction: one write-behind flush (≤ 100 ms, §7.6). Returns how many were
+     * stored; the manifests of finished transfers are skipped.
+     *
+     * @throws NoSuchRecordException if a transfer is not stored; nothing is stored then.
+     */
+    suspend fun putAll(manifests: Collection<ChunkManifest>): Int {
+        if (manifests.isEmpty()) return 0
+        return withContext(context) {
+            database.transactionWithResult {
+                // Per transfer: whether it still takes manifests.
+                val open = HashMap<String, Boolean>()
+                var stored = 0
                 for (manifest in manifests) {
                     val id = manifest.transferId.toDb()
-                    if (known.add(id) && database.transferQueries.exists(id).executeAsOne() == 0L) {
-                        throw NoSuchRecordException("no transfer $id")
-                    }
+                    val unfinished =
+                        open.getOrPut(id) {
+                            val row =
+                                database.transferQueries.selectFinishedAt(id).executeAsOneOrNull()
+                                    ?: throw NoSuchRecordException("no transfer $id")
+                            row.finished_at == null
+                        }
+                    if (!unfinished) continue
                     queries.put(
                         transfer_id = id,
                         file_index = manifest.trackingKey.toLong(),
@@ -68,7 +85,9 @@ class ChunkManifestRepository internal constructor(
                         partial_bytes = manifest.partialBytes.toLong(),
                         updated_at = manifest.updatedAtMillis,
                     )
+                    stored++
                 }
+                stored
             }
         }
     }
@@ -97,6 +116,13 @@ class ChunkManifestRepository internal constructor(
         transferId: TransferId,
         cutoffMillis: Long,
     ): Int = withContext(context) { queries.deleteIfInactive(transferId.toDb(), cutoffMillis).value.toInt() }
+
+    /**
+     * Deletes every manifest of the transfer if it is finished; returns how many rows went. A finished transfer takes
+     * no new manifest ([put]), so after its partial files were deleted nothing can bring one back.
+     */
+    internal suspend fun deleteOfFinished(transferId: TransferId): Int =
+        withContext(context) { database.transferQueries.deleteManifestsOfFinished(transferId.toDb()).value.toInt() }
 
     /**
      * Deletes the manifests of every transfer inactive for more than [maxInactiveMillis] (architecture §7.6: 24 h)

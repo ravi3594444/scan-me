@@ -13,7 +13,12 @@ import com.constrivo.drop.core.crypto.CryptoProvider
  * per-value protection, so a copy of the file without the key yields no secret, and a sealed value cannot be moved
  * to another row or column: [context] names the row and column and must be the same to open it.
  *
- * Choose the cipher at first install and keep it: values sealed by one cipher do not open with another.
+ * Values sealed by one cipher do not open with another, with one exception that makes turning encryption on safe:
+ * [PLAINTEXT] values start with the byte `0x00`, and the first time a database opens with another cipher,
+ * [DropData.open] re-seals them with it, once (`DeviceRepository`). A release that switches from [PLAINTEXT] to an
+ * [AeadSecretFieldCipher] therefore keeps every trusted device, and afterwards plaintext values no longer open. Other
+ * ciphers' stored values must never start with `0x00`. Going back, or losing the key, leaves values that do not open:
+ * those devices drop out of the trusted lists (reported, not thrown) until paired again.
  */
 interface SecretFieldCipher {
     /** Returns the stored form of [plaintext] for the value named by [context]. */
@@ -38,11 +43,14 @@ interface SecretFieldCipher {
          * default until a platform supplies an [AeadSecretFieldCipher].
          */
         val PLAINTEXT: SecretFieldCipher = PlaintextSecretFieldCipher
+
+        /** Whether [sealed] is in [PLAINTEXT]'s framing (`0x00 ‖ plaintext`). */
+        internal fun isPlaintextValue(sealed: ByteArray): Boolean = sealed.isNotEmpty() && sealed[0] == PlaintextSecretFieldCipher.FORMAT
     }
 }
 
 private object PlaintextSecretFieldCipher : SecretFieldCipher {
-    private const val FORMAT: Byte = 0
+    const val FORMAT: Byte = 0
 
     override fun seal(
         plaintext: ByteArray,

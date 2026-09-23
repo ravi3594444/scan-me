@@ -9,11 +9,15 @@ import com.constrivo.drop.core.crypto.trust.TrustedProof
 import com.constrivo.drop.core.data.db.DropDatabase
 import com.constrivo.drop.core.discovery.BluetoothAddress
 import com.constrivo.drop.core.discovery.DevicePlatform
+import com.constrivo.drop.core.discovery.EphemeralIds
 import com.constrivo.drop.core.discovery.Nicknames
 import com.constrivo.drop.core.discovery.WallClock
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.transformLatest
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.CoroutineContext
 import com.constrivo.drop.core.data.db.Device as DeviceRow
@@ -28,6 +32,13 @@ import com.constrivo.drop.core.data.db.Device as DeviceRow
  * Every function is main-safe (runs on the database context). Updates that name a device return false when there is
  * no such device, or when it is not in the state the update needs (for example [setAutoAccept] on an untrusted
  * device); they never create rows. Secrets are stored through the [SecretFieldCipher] given to [DropData.open].
+ *
+ * **Own `k_adv` generation (S3).** A peer keeps a shared advertising secret only when its generation is strictly newer
+ * than the one it holds ([storeAdvertisingSecret]), and `core/crypto`'s `AdvertisingSecretStore` keeps only the secret,
+ * so this device's own generation is kept here: send [ownAdvertisingGeneration] as `TrustShare.generation` with the
+ * current secret, and on "Forget" call [advanceOwnAdvertisingGeneration] *before* `AdvertisingSecretStore.rotate()`.
+ * A crash between the two then leaves a generation ahead of the secret (peers accept the same secret again), never a
+ * new secret under an old generation, which every remaining peer would refuse.
  */
 class DeviceRepository internal constructor(
     private val database: DropDatabase,
@@ -100,19 +111,32 @@ class DeviceRepository internal constructor(
         }
     }
 
-    /** Moves the device's last-seen time forward to [seenAtMillis] (a resolved beacon or LAN record); never back. */
+    /**
+     * Moves the device's last-seen time forward to [seenAtMillis] (a resolved beacon or LAN record); never back. The
+     * radar reports every resolved beacon, so the time is stored only when it moves by at least
+     * [SIGHTING_RESOLUTION_MILLIS]: a write re-runs every device flow, and the stored time only feeds "last seen"
+     * labels. Returns false when there is no such device.
+     */
     suspend fun recordSighting(
         deviceId: String,
         seenAtMillis: Long = clock.nowMillis(),
     ): Boolean {
         DeviceIds.requireValid(deviceId)
-        return withContext(context) { queries.touchLastSeen(seenAt = seenAtMillis, id = deviceId).value > 0 }
+        return withContext(context) {
+            // Read first: an UPDATE notifies the flows even when it changes no row.
+            val lastSeen = queries.selectLastSeen(deviceId).executeAsOneOrNull() ?: return@withContext false
+            if (seenAtMillis - lastSeen >= SIGHTING_RESOLUTION_MILLIS) queries.touchLastSeen(seenAt = seenAtMillis, id = deviceId)
+            true
+        }
     }
 
     /**
      * Makes the device trusted after a confirmed SAS or a verified QR (F-B3, F-B5), storing the pairing's
      * [recognitionSecret] and, when the peer's `TrustShare` already arrived, its [advertisingSecret] with
-     * [advertisingSecretGeneration] (S3). Pairing again replaces the secrets and keeps the first trust time.
+     * [advertisingSecretGeneration] (S3). Pairing again replaces the recognition secret and keeps the first trust
+     * time. Like [storeAdvertisingSecret], an advertising secret replaces the stored one only when its generation is
+     * strictly newer (the stored one then becomes the previous generation); without one, or with a stale one, the
+     * stored secret stays, so pairing again never makes a trusted device unresolvable or rolls its `k_adv` back.
      *
      * @return false when there is no such device, or it is a browser session.
      * @throws IllegalArgumentException for a recognition secret that is not 32 bytes, or an advertising secret without
@@ -133,21 +157,41 @@ class DeviceRepository internal constructor(
         require(advertisingSecretGeneration == null || advertisingSecretGeneration >= 0) { "generation must be non-negative" }
         val sealedRecognition = cipher.seal(recognitionSecret, recognitionContext(deviceId))
         val sealedAdvertising = advertisingSecret?.let { sealAdvertising(deviceId, it) }
+        val generation = advertisingSecretGeneration?.toLong()
         return withContext(context) {
-            queries
-                .trust(
-                    recognitionSecret = sealedRecognition,
-                    advertisingSecret = sealedAdvertising,
-                    advertisingGeneration = advertisingSecretGeneration?.toLong(),
-                    trustedAt = atMillis,
-                    id = deviceId,
-                ).value > 0
+            database.transactionWithResult {
+                val row = queries.selectById(deviceId).executeAsOneOrNull()
+                if (row?.identity_pk == null) return@transactionWithResult false
+                val stored = row.peer_adv_generation
+                val newer = sealedAdvertising != null && generation != null && (stored == null || stored < generation)
+                queries
+                    .trust(
+                        recognitionSecret = sealedRecognition,
+                        advertisingSecret = if (newer) sealedAdvertising else row.peer_adv_secret,
+                        advertisingGeneration = if (newer) generation else stored,
+                        previousAdvertisingSecret = if (newer) row.peer_adv_secret else row.previous_peer_adv_secret,
+                        previousUntil =
+                            if (newer) {
+                                row.peer_adv_secret?.let {
+                                    atMillis + PREVIOUS_SECRET_GRACE_MILLIS
+                                }
+                            } else {
+                                row.previous_peer_adv_until
+                            },
+                        trustedAt = atMillis,
+                        id = deviceId,
+                    ).value > 0
+            }
         }
     }
 
     /**
-     * Stores the advertising secret a trusted peer shared in `TrustShare` (S3). The previous one is kept as the
-     * previous generation, so beacons sent just before the peer rotated still resolve.
+     * Stores the advertising secret a trusted peer shared in `TrustShare` (S3). The stored one becomes the previous
+     * generation, which keeps resolving for [PREVIOUS_SECRET_GRACE_MILLIS] after [atMillis], so beacons the peer sent
+     * just before it rotated still resolve. After that it no longer resolves: the peer rotated because it forgot some
+     * device, which still knows the old secret and must not be able to pass for the peer on this radar.
+     *
+     * Generations must increase: see the class comment for how this device numbers its own.
      *
      * @return true when stored; false when the device is missing or untrusted, or [generation] is not newer than the
      *   stored one (a duplicate or replayed share).
@@ -156,18 +200,46 @@ class DeviceRepository internal constructor(
         deviceId: String,
         secret: AdvertisingSecret,
         generation: Int,
+        atMillis: Long = clock.nowMillis(),
     ): Boolean {
         DeviceIds.requireValid(deviceId)
         require(generation >= 0) { "generation must be non-negative" }
         val sealed = sealAdvertising(deviceId, secret)
         return withContext(context) {
-            queries
-                .rotateAdvertisingSecret(
-                    advertisingSecret = sealed,
-                    advertisingGeneration = generation.toLong(),
-                    id = deviceId,
-                ).value > 0
+            database.transactionWithResult {
+                val row = queries.selectById(deviceId).executeAsOneOrNull() ?: return@transactionWithResult false
+                queries
+                    .rotateAdvertisingSecret(
+                        previousUntil = row.peer_adv_secret?.let { atMillis + PREVIOUS_SECRET_GRACE_MILLIS },
+                        advertisingSecret = sealed,
+                        advertisingGeneration = generation.toLong(),
+                        id = deviceId,
+                    ).value > 0
+            }
         }
+    }
+
+    /** The generation of this device's own `k_adv` to send in `TrustShare` (S3): 0 until the first rotation. */
+    suspend fun ownAdvertisingGeneration(): Int = withContext(context) { readOwnGeneration() }
+
+    /**
+     * Advances this device's own `k_adv` generation for a rotation and returns the new one. Call it before
+     * `AdvertisingSecretStore.rotate()` (class comment), then share the new secret under the returned generation.
+     */
+    suspend fun advanceOwnAdvertisingGeneration(): Int =
+        withContext(context) {
+            database.transactionWithResult {
+                val current = readOwnGeneration()
+                check(current < Int.MAX_VALUE) { "the advertising-secret generation is exhausted" }
+                (current + 1).also { database.settingsQueries.put(OWN_GENERATION_KEY, it.toString()) }
+            }
+        }
+
+    private fun readOwnGeneration(): Int {
+        val text = database.settingsQueries.selectValue(OWN_GENERATION_KEY).executeAsOneOrNull() ?: return 0
+        val value = text.toIntOrNull()
+        requireStored(value != null && value >= 0 && value.toString() == text) { "own advertising-secret generation holds '$text'" }
+        return value!!
     }
 
     /**
@@ -255,28 +327,115 @@ class DeviceRepository internal constructor(
 
     suspend fun trusted(): List<Device> = withContext(context) { queries.selectTrusted().executeAsList().map(::toDevice) }
 
-    /** The secrets of every trusted device, for the handshake and the radar (S3). */
-    suspend fun trustedKeys(): List<TrustedDeviceKeys> = withContext(context) { queries.selectTrusted().executeAsList().map(::toKeys) }
-
-    /** The secrets of one trusted device (the handshake initiator's expected peer); null if missing or untrusted. */
-    suspend fun trustedKeys(deviceId: String): TrustedDeviceKeys? {
-        DeviceIds.requireValid(deviceId)
-        return withContext(context) {
-            queries.selectById(deviceId).executeAsOneOrNull()?.takeIf { it.trusted == 1L }?.let(::toKeys)
-        }
+    /**
+     * The secrets of every trusted device, in device id order, for the handshake and the radar (S3). A device whose
+     * stored secrets do not open (a lost field key, a damaged row) is left out and passed to [onUnreadable], so one
+     * bad row never takes every trusted device off the radar; it can be paired again.
+     */
+    suspend fun trustedKeys(
+        onUnreadable: (deviceId: String, error: DataCorruptionException) -> Unit = { _, _ -> },
+    ): List<TrustedDeviceKeys> {
+        val rows = withContext(context) { queries.selectTrustedById().executeAsList() }
+        return decodeKeys(rows, clock.nowMillis(), onUnreadable)
     }
 
     /**
-     * [trustedKeys], re-emitted whenever the trusted set or a secret changes: feed it to the radar's `TrustState`
-     * ([toTrustedPeers]) and the handshake ([toTrustedPeerLookup]) so trust changes apply without a restart.
+     * The secrets of one trusted device (the handshake initiator's expected peer); null if missing or untrusted.
+     *
+     * @throws DataCorruptionException if its stored secrets do not open.
      */
-    fun observeTrustedKeys(): Flow<List<TrustedDeviceKeys>> =
+    suspend fun trustedKeys(deviceId: String): TrustedDeviceKeys? {
+        DeviceIds.requireValid(deviceId)
+        val row = withContext(context) { queries.selectById(deviceId).executeAsOneOrNull()?.takeIf { it.trusted == 1L } }
+        return row?.let { toKeys(it, clock.nowMillis()) }
+    }
+
+    /**
+     * [trustedKeys], re-emitted whenever the trusted set, a name or a secret changes, and when a previous advertising
+     * secret stops resolving ([storeAdvertisingSecret]): feed it to the radar's `TrustState` ([toTrustedPeers]) and
+     * the handshake ([toTrustedPeerLookup]) so trust changes apply without a restart.
+     *
+     * Sightings do not re-emit it: the list is in device id order, and a change of `last_seen` alone neither re-opens
+     * the secrets nor emits, so the radar never rebuilds its resolver for a beacon ([recordSighting]). The
+     * [TrustedDeviceKeys.device] of an emitted value may therefore show an older last-seen time; the Devices tab
+     * reads [observeTrusted].
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun observeTrustedKeys(
+        onUnreadable: (deviceId: String, error: DataCorruptionException) -> Unit = { _, _ -> },
+    ): Flow<List<TrustedDeviceKeys>> =
         queries
-            .selectTrusted()
+            .selectTrustedById()
             .asFlow()
             .mapToList(context)
-            .map { rows -> rows.map(::toKeys) }
+            .map { rows -> rows.map(::KeyRow) }
             .distinctUntilChanged()
+            .transformLatest { rows ->
+                while (true) {
+                    val now = clock.nowMillis()
+                    emit(decodeKeys(rows.map { it.row }, now, onUnreadable))
+                    val next = rows.mapNotNull { it.row.previous_peer_adv_until }.filter { it > now }.minOrNull() ?: break
+                    delay(next - now)
+                }
+            }.distinctUntilChanged()
+
+    /**
+     * Re-seals, with the configured cipher, every secret still stored in [SecretFieldCipher.PLAINTEXT] framing: a
+     * platform that supplies an [AeadSecretFieldCipher] in a later release finds its existing trusted devices intact.
+     * [DropData.open] calls it, blocking; it runs once per database, in one transaction, the first time a cipher other
+     * than PLAINTEXT opens it, and never again, so a plaintext value written into the file later does not open.
+     * Returns how many devices were re-sealed.
+     */
+    internal fun resealPlaintextSecrets(): Int {
+        if (cipher === SecretFieldCipher.PLAINTEXT) return 0
+        return database.transactionWithResult {
+            if (database.settingsQueries.selectValue(RESEALED_KEY).executeAsOneOrNull() != null) return@transactionWithResult 0
+            database.settingsQueries.put(RESEALED_KEY, "true")
+            var resealed = 0
+            // Only trusted rows hold secrets (0.sqm CHECK).
+            for (row in queries.selectTrustedById().executeAsList()) {
+                val recognition = reseal(row.recognition_secret, recognitionContext(row.id))
+                val current = reseal(row.peer_adv_secret, advertisingContext(row.id))
+                val previous = reseal(row.previous_peer_adv_secret, advertisingContext(row.id))
+                if (recognition === row.recognition_secret && current === row.peer_adv_secret &&
+                    previous === row.previous_peer_adv_secret
+                ) {
+                    continue
+                }
+                queries.updateSecrets(recognition, current, previous, row.id)
+                resealed++
+            }
+            resealed
+        }
+    }
+
+    /** [stored] sealed with [cipher] if it is a PLAINTEXT value, else [stored] itself. */
+    private fun reseal(
+        stored: ByteArray?,
+        context: String,
+    ): ByteArray? {
+        if (stored == null || !SecretFieldCipher.isPlaintextValue(stored)) return stored
+        val plaintext = SecretFieldCipher.PLAINTEXT.open(stored, context)
+        try {
+            return cipher.seal(plaintext, context)
+        } finally {
+            plaintext.fill(0)
+        }
+    }
+
+    private fun decodeKeys(
+        rows: List<DeviceRow>,
+        nowMillis: Long,
+        onUnreadable: (deviceId: String, error: DataCorruptionException) -> Unit,
+    ): List<TrustedDeviceKeys> =
+        rows.mapNotNull { row ->
+            try {
+                toKeys(row, nowMillis)
+            } catch (e: DataCorruptionException) {
+                onUnreadable(row.id, e)
+                null
+            }
+        }
 
     private fun sealAdvertising(
         deviceId: String,
@@ -290,18 +449,23 @@ class DeviceRepository internal constructor(
         }
     }
 
-    private fun toKeys(row: DeviceRow): TrustedDeviceKeys {
+    /** The keys of a trusted [row] at [nowMillis]: the previous advertising secret only while its grace period runs. */
+    private fun toKeys(
+        row: DeviceRow,
+        nowMillis: Long,
+    ): TrustedDeviceKeys {
         val device = toDevice(row)
         val where = "device ${row.id}"
         val sealedRecognition = row.recognition_secret ?: throw DataCorruptionException("$where: trusted without a recognition secret")
         val recognition = cipher.open(sealedRecognition, recognitionContext(row.id))
         try {
             requireStored(recognition.size == TrustedProof.SECRET_SIZE) { "$where: recognition secret has ${recognition.size} bytes" }
+            val previousResolves = row.previous_peer_adv_until?.let { nowMillis < it } ?: false
             return TrustedDeviceKeys(
                 device = device,
                 recognitionSecret = recognition,
                 advertisingSecret = row.peer_adv_secret?.let { openAdvertising(it, row.id) },
-                previousAdvertisingSecret = row.previous_peer_adv_secret?.let { openAdvertising(it, row.id) },
+                previousAdvertisingSecret = row.previous_peer_adv_secret?.takeIf { previousResolves }?.let { openAdvertising(it, row.id) },
             )
         } finally {
             recognition.fill(0)
@@ -321,13 +485,56 @@ class DeviceRepository internal constructor(
         }
     }
 
-    private companion object {
-        fun recognitionContext(deviceId: String) = "device:$deviceId:recognition_secret"
+    /** A trusted row as the keys flows compare it: every column but `last_seen`, blobs by content. */
+    private class KeyRow(
+        val row: DeviceRow,
+    ) {
+        override fun equals(other: Any?): Boolean {
+            if (other !is KeyRow) return false
+            val a = row
+            val b = other.row
+            return a.id == b.id &&
+                a.identity_pk.contentEquals(b.identity_pk) &&
+                a.nickname == b.nickname &&
+                a.custom_name == b.custom_name &&
+                a.platform == b.platform &&
+                a.trusted == b.trusted &&
+                a.auto_accept == b.auto_accept &&
+                a.recognition_secret.contentEquals(b.recognition_secret) &&
+                a.peer_adv_secret.contentEquals(b.peer_adv_secret) &&
+                a.peer_adv_generation == b.peer_adv_generation &&
+                a.previous_peer_adv_secret.contentEquals(b.previous_peer_adv_secret) &&
+                a.previous_peer_adv_until == b.previous_peer_adv_until &&
+                a.classic_address == b.classic_address &&
+                a.first_seen == b.first_seen &&
+                a.trusted_at == b.trusted_at
+        }
+
+        override fun hashCode(): Int = row.id.hashCode()
+    }
+
+    companion object {
+        /** [recordSighting] stores a sighting only when it moves the last-seen time by at least this much (30 s). */
+        const val SIGHTING_RESOLUTION_MILLIS: Long = 30_000
+
+        /**
+         * How long a peer's previous advertising secret keeps resolving after the new one was stored: two beacon epochs
+         * (30 min), the time the peer may still advertise an ID of the old one.
+         */
+        const val PREVIOUS_SECRET_GRACE_MILLIS: Long = 2 * EphemeralIds.EPOCH_MILLIS
+
+        /** The `settings` row holding this device's own `k_adv` generation (not a user setting). */
+        internal const val OWN_GENERATION_KEY = "trust.own_adv_generation"
+
+        /** The `settings` row marking that [resealPlaintextSecrets] ran (not a user setting). */
+        internal const val RESEALED_KEY = "trust.plaintext_resealed"
+
+        private fun recognitionContext(deviceId: String) = "device:$deviceId:recognition_secret"
 
         /** Shared by the current and the previous generation, because a rotation moves the value between columns. */
-        fun advertisingContext(deviceId: String) = "device:$deviceId:peer_adv_secret"
+        private fun advertisingContext(deviceId: String) = "device:$deviceId:peer_adv_secret"
 
-        fun toDevice(row: DeviceRow): Device {
+        private fun toDevice(row: DeviceRow): Device {
             val where = "device ${row.id}"
             val key = row.identity_pk
             requireStored(key == null || key.size == DeviceIds.IDENTITY_KEY_SIZE) { "$where: identity key has ${key?.size} bytes" }

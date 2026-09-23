@@ -301,39 +301,84 @@ class TransferRepositoryTest {
         }
 
     @Test
-    fun deleteRemovesOnlyFinishedTransfersWithTheirChildren() =
+    fun deleteRemovesOnlyFinishedTransfersWithTheirChildrenAndPartials() =
         runTest {
             val data = openTestData()
             val peer = data.peer(1)
             data.transfers.create(newTransfer(1, peer, files = 1))
             data.transferFiles.add(transferId(1), listOf(NewTransferFile(0, "a", null, 1)))
             data.manifests.put(ChunkManifest.empty(transferId(1), 0, 4, T0))
-            assertFalse(data.transfers.delete(transferId(1)), "running transfers belong to the engine")
+            val deleted = mutableListOf<TransferId>()
+            val rowsWhenDeleting = mutableListOf<Int>()
+            val deletePartials: suspend (TransferId) -> Unit = { id ->
+                rowsWhenDeleting += data.manifests.forTransfer(id).size
+                deleted += id
+            }
+            assertFalse(data.transfers.delete(transferId(1), deletePartials), "running transfers belong to the engine")
+            assertEquals(emptyList(), deleted, "nor are their partial files touched")
             data.transfers.finish(transferId(1), TransferOutcome(TransferStatus.CANCELLED, 0))
-            assertTrue(data.transfers.delete(transferId(1)))
+            assertTrue(data.transfers.delete(transferId(1), deletePartials))
+            assertEquals(listOf(transferId(1)), deleted, "a cancelled receive may have left partial files")
+            assertEquals(listOf(1), rowsWhenDeleting, "partial files go first, while the rows still point at them")
             assertNull(data.transfers.get(transferId(1)))
             assertEquals(emptyList(), data.transferFiles.files(transferId(1)))
             assertEquals(emptyList(), data.manifests.forTransfer(transferId(1)))
-            assertFalse(data.transfers.delete(transferId(1)))
+            assertFalse(data.transfers.delete(transferId(1), deletePartials))
+
+            // A sent transfer has no partial files.
+            data.transfers.create(newTransfer(2, peer, direction = TransferDirection.SEND))
+            data.transfers.finish(transferId(2), TransferOutcome(TransferStatus.DONE, 0))
+            assertTrue(data.transfers.delete(transferId(2), deletePartials))
+            assertEquals(listOf(transferId(1)), deleted)
         }
 
     @Test
-    fun clearHistoryKeepsRunningTransfers() =
+    fun aFailedPartialDeletionKeepsTheTransfer() =
         runTest {
             val data = openTestData()
             val peer = data.peer(1)
-            for (n in 1..5) {
-                data.transfers.create(newTransfer(n, peer, files = 1), T0 + n)
+            data.transfers.create(newTransfer(1, peer, files = 1))
+            data.manifests.put(ChunkManifest.empty(transferId(1), 0, 4, T0))
+            data.transfers.finish(transferId(1), TransferOutcome(TransferStatus.FAILED, 0))
+            assertFailsWith<java.io.IOException> { data.transfers.delete(transferId(1)) { throw java.io.IOException("busy") } }
+            assertNotNull(data.transfers.get(transferId(1)), "the row still points at the partial files")
+            assertEquals(1, data.manifests.forTransfer(transferId(1)).size)
+            assertFailsWith<java.io.IOException> { data.transfers.clearHistory { throw java.io.IOException("busy") } }
+            assertNotNull(data.transfers.get(transferId(1)))
+            assertTrue(data.transfers.delete(transferId(1)) {})
+        }
+
+    @Test
+    fun clearHistoryKeepsRunningTransfersAndDeletesPartialsFirst() =
+        runTest {
+            val data = openTestData()
+            val peer = data.peer(1)
+            for (n in 1..6) {
+                val direction = if (n == 6) TransferDirection.SEND else TransferDirection.RECEIVE
+                data.transfers.create(newTransfer(n, peer, direction = direction, files = 1), T0 + n)
                 data.transferFiles.add(transferId(n), listOf(NewTransferFile(0, "f$n", null, 1)))
             }
+            data.manifests.put(ChunkManifest.empty(transferId(2), 0, 4, T0))
             data.transfers.finish(transferId(1), TransferOutcome(TransferStatus.DONE, 1))
             data.transfers.finish(transferId(2), TransferOutcome(TransferStatus.FAILED, 0))
             data.transfers.finish(transferId(3), TransferOutcome(TransferStatus.CANCELLED, 0))
+            data.transfers.finish(transferId(6), TransferOutcome(TransferStatus.DONE, 1))
             data.transfers.updateStatus(transferId(4), TransferStatus.INTERRUPTED)
-            assertEquals(3, data.transfers.clearHistory())
+            val deleted = mutableListOf<TransferId>()
+            val cleared =
+                data.transfers.clearHistory { id ->
+                    assertNotNull(data.transfers.get(id), "partial files go before the rows")
+                    deleted += id
+                    // Transfer 5 finishes while the clear runs: its partials were not deleted, so it must stay.
+                    data.transfers.finish(transferId(5), TransferOutcome(TransferStatus.CANCELLED, 0))
+                }
+            assertEquals(4, cleared)
+            assertEquals(setOf(transferId(1), transferId(2), transferId(3)), deleted.toSet(), "received ones only")
             assertEquals(listOf(transferId(5), transferId(4)), data.transfers.historyPage().transfers.map { it.id })
             assertEquals(listOf(2L), data.driver.longs("SELECT count(*) FROM transfer_file"))
-            assertEquals(0, data.transfers.clearHistory())
+            assertEquals(listOf(0L), data.driver.longs("SELECT count(*) FROM chunk_manifest"))
+            assertEquals(1, data.transfers.clearHistory {}, "the next clear takes transfer 5")
+            assertEquals(0, data.transfers.clearHistory {})
         }
 
     @Test

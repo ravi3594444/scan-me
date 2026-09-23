@@ -26,7 +26,10 @@ class DropData private constructor(
     val settings: SettingsRepository,
     val stats: StatsRepository,
 ) : AutoCloseable {
-    /** A [ResumeDataCleaner] over this database; [deletePartials] is `FileStore.deletePartials` of the platform. */
+    /**
+     * A [ResumeDataCleaner] over this database; [deletePartials] is `FileStore.deletePartials` of the platform. The same
+     * function goes to [TransferRepository.delete] and [TransferRepository.clearHistory].
+     */
     fun resumeDataCleaner(
         clock: WallClock,
         retentionMillis: Long = ResumeDataCleaner.RETENTION_MILLIS,
@@ -47,8 +50,9 @@ class DropData private constructor(
          * @param crypto derives device ids from identity keys ([DeviceRepository.recordPeer]).
          * @param clock the wall clock for every stored timestamp.
          * @param calendar the user's calendar for Stats weeks ([StatsRepository]).
-         * @param secretCipher how device secrets are stored ([SecretFieldCipher]); keep the same one for the lifetime
-         *   of the database.
+         * @param secretCipher how device secrets are stored ([SecretFieldCipher]). Secrets stored with
+         *   [SecretFieldCipher.PLAINTEXT] are re-sealed with it here, so a later release may switch from PLAINTEXT to an
+         *   [AeadSecretFieldCipher]; keep the same non-PLAINTEXT cipher afterwards.
          * @param firstDayOfWeek the first day of a Stats week (the locale's; ISO Monday by default).
          * @throws DatabaseVersionException if the file was written by a newer app version.
          * @throws IllegalStateException if the driver does not enforce foreign keys ([SqlDriverFactory] contract).
@@ -72,10 +76,12 @@ class DropData private constructor(
                 check(DropSchema.foreignKeysEnabled(driver)) { "the SqlDriver must enforce foreign keys (PRAGMA foreign_keys = ON)" }
                 val database = DropDatabase(driver)
                 val context = dispatcher.limitedParallelism(1)
+                val devices = DeviceRepository(database, context, clock, crypto, secretCipher)
+                devices.resealPlaintextSecrets()
                 return DropData(
                     driver = driver,
                     database = database,
-                    devices = DeviceRepository(database, context, clock, crypto, secretCipher),
+                    devices = devices,
                     transfers = TransferRepository(database, context, clock),
                     transferFiles = TransferFileRepository(database, context),
                     manifests = ChunkManifestRepository(database, context, clock),

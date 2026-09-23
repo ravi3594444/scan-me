@@ -1,5 +1,6 @@
 package com.constrivo.drop.core.data
 
+import app.cash.sqldelight.db.AfterVersion
 import app.cash.sqldelight.db.QueryResult
 import app.cash.sqldelight.db.SqlDriver
 import app.cash.sqldelight.db.SqlSchema
@@ -61,19 +62,173 @@ class SchemaMigrationTest {
         driver.close()
     }
 
+    /**
+     * Rows in every table of a schema version, written with that version's SQL, including the parent-child chains
+     * (device → transfer → transfer_file / chunk_manifest) that a table rebuild must not cascade into. Every older
+     * version needs an entry; its rows must all survive [DropSchema.createOrMigrate] ([assertSeedKept]).
+     */
+    private val seeds: Map<Long, (SqlDriver) -> Unit> = mapOf(1L to ::seedV1)
+
+    private fun seedV1(driver: SqlDriver) {
+        val trusted = "1".repeat(32)
+        val stranger = "2".repeat(32)
+        val statements =
+            listOf(
+                "INSERT INTO device (id, identity_pk, nickname, platform, trusted, recognition_secret, peer_adv_secret, " +
+                    "peer_adv_generation, previous_peer_adv_secret, previous_peer_adv_until, first_seen, last_seen, trusted_at) " +
+                    "VALUES ('$trusted', X'${"11".repeat(32)}', 'Dev', 'laptop', 1, X'00${"22".repeat(32)}', X'00${"33".repeat(32)}', 2, " +
+                    "X'00${"44".repeat(32)}', 5, 0, 0, 0)",
+                insertDevice(stranger, "55".repeat(32), "phone"),
+                insertTransfer("a".repeat(32), trusted, "streaming"),
+                insertTransfer("b".repeat(32), stranger, "offered"),
+                "INSERT INTO transfer_file (transfer_id, file_index, name, size, status) VALUES ('${"a".repeat(
+                    32,
+                )}', 0, 'x.jpg', 10, 'pending')",
+                "INSERT INTO transfer_file (transfer_id, file_index, name, size, status) VALUES ('${"a".repeat(
+                    32,
+                )}', 1, 'y.jpg', 10, 'done')",
+                "INSERT INTO transfer_file (transfer_id, file_index, name, size, status) VALUES ('${"b".repeat(
+                    32,
+                )}', 0, 'z.pdf', 10, 'pending')",
+                insertManifest("a".repeat(32), 0, 9, "0100", 144),
+                insertManifest("a".repeat(32), -1, 1, "00", 16),
+                "INSERT INTO settings (key, value) VALUES ('probe', 'kept')",
+            )
+        statements.forEach { driver.execute(null, it, 0) }
+    }
+
+    private val seededCounts = mapOf("device" to 2L, "transfer" to 2L, "transfer_file" to 3L, "chunk_manifest" to 2L, "settings" to 1L)
+
+    private fun assertSeedKept(
+        driver: SqlDriver,
+        what: String,
+    ) {
+        for ((table, count) in seededCounts) {
+            assertEquals(listOf(count), driver.longs("SELECT count(*) FROM $table"), "$what: rows of $table")
+        }
+        assertEquals(listOf("kept"), driver.column("SELECT value FROM settings WHERE key = 'probe'"), what)
+        assertEquals(emptyList(), driver.column("PRAGMA foreign_key_check"), "$what: dangling references")
+    }
+
     @Test
     fun everyOlderSchemaMigratesToTheCurrentOneKeepingItsData() {
         for (version in 1 until DropSchema.VERSION) {
             val driver = rawDriver()
             schemaStatements(golden(version)!!).forEach { driver.execute(null, it, 0) }
             driver.execute(null, "PRAGMA user_version = $version", 0)
-            driver.execute(null, "INSERT INTO settings (key, value) VALUES ('probe', 'kept')", 0)
+            assertNotNull(seeds[version], "add a seed for v$version").invoke(driver)
             DropSchema.createOrMigrate(driver)
             assertEquals(DropSchema.VERSION, DropSchema.userVersion(driver), "v$version")
             assertEquals(golden(DropSchema.VERSION), driver.schemaDump(), "v$version migrated")
-            assertEquals(listOf("kept"), driver.column("SELECT value FROM settings WHERE key = 'probe'"))
+            assertSeedKept(driver, "v$version migrated")
+            assertTrue(DropSchema.foreignKeysEnabled(driver), "v$version: enforcement is back on")
             driver.close()
         }
+    }
+
+    @Test
+    fun theSeedOfEveryVersionFitsItsSchema() {
+        for (version in 1..DropSchema.VERSION) {
+            val driver = rawDriver()
+            schemaStatements(golden(version)!!).forEach { driver.execute(null, it, 0) }
+            seeds[version]?.invoke(driver) ?: continue
+            assertSeedKept(driver, "v$version seeded")
+            driver.close()
+        }
+        assertNotNull(seeds[DropSchema.VERSION], "keep a seed for the current version: the next migration's test needs it")
+    }
+
+    /**
+     * A version 2 whose migration rebuilds every table the way SQLite prescribes for a change it cannot ALTER (a new
+     * CHECK vocabulary): create the new table, copy, drop the old one, rename. The view is dropped first and the
+     * indexes and view are recreated after, as the procedure requires.
+     */
+    private fun rebuildingSchema(extra: (SqlDriver) -> Unit = {}): SqlSchema<QueryResult.Value<Unit>> =
+        object : SqlSchema<QueryResult.Value<Unit>> {
+            override val version: Long = DropSchema.VERSION + 1
+
+            override fun create(driver: SqlDriver): QueryResult.Value<Unit> = error("only migrations are tested")
+
+            override fun migrate(
+                driver: SqlDriver,
+                oldVersion: Long,
+                newVersion: Long,
+                vararg callbacks: AfterVersion,
+            ): QueryResult.Value<Unit> {
+                DropSchema.schema.migrate(driver, oldVersion, DropSchema.VERSION)
+                val views = driver.column("SELECT sql FROM sqlite_master WHERE type = 'view'")
+                driver.column("SELECT name FROM sqlite_master WHERE type = 'view'").forEach { driver.execute(null, "DROP VIEW $it", 0) }
+                for (table in listOf("device", "transfer", "transfer_file", "chunk_manifest")) {
+                    val create = driver.column("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = '$table'").single()!!
+                    val indexes =
+                        driver.column(
+                            "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = '$table' AND sql IS NOT NULL",
+                        )
+                    driver.execute(null, create.replaceFirst("CREATE TABLE $table (", "CREATE TABLE ${table}_new ("), 0)
+                    driver.execute(null, "INSERT INTO ${table}_new SELECT * FROM $table", 0)
+                    driver.execute(null, "DROP TABLE $table", 0)
+                    driver.execute(null, "ALTER TABLE ${table}_new RENAME TO $table", 0)
+                    indexes.forEach { driver.execute(null, it!!, 0) }
+                }
+                views.forEach { driver.execute(null, it!!, 0) }
+                extra(driver)
+                return QueryResult.Unit
+            }
+        }
+
+    private fun seededV1(driver: SqlDriver): SqlDriver {
+        DropSchema.createOrMigrate(driver)
+        seedV1(driver)
+        return driver
+    }
+
+    @Test
+    fun aTableRebuildMigrationKeepsEveryRowOfEveryTable() {
+        // The in-memory driver keeps one connection that enforces foreign keys: createOrMigrate turns it off around.
+        val driver = seededV1(JdbcSqliteDriver("jdbc:sqlite::memory:", Properties().apply { put("foreign_keys", "true") }))
+        assertTrue(DropSchema.foreignKeysEnabled(driver))
+        DropSchema.createOrMigrate(driver, rebuildingSchema())
+        assertEquals(DropSchema.VERSION + 1, DropSchema.userVersion(driver))
+        assertSeedKept(driver, "rebuilt in memory")
+        assertTrue(DropSchema.foreignKeysEnabled(driver), "enforcement is back on")
+        assertFailsWith<Exception>("and enforced") { driver.execute(null, "DELETE FROM device", 0) }
+        driver.close()
+    }
+
+    @Test
+    fun aFileDatabaseIsRebuiltWithoutLosingRows() {
+        val path = File(tempDir, "rebuild.db").path
+        seededV1(JdbcSqliteDriverFactory.file(path).open(DropSchema.schema)).close()
+        val driver = JdbcSqliteDriverFactory.file(path).open(rebuildingSchema())
+        assertEquals(DropSchema.VERSION + 1, DropSchema.userVersion(driver))
+        assertSeedKept(driver, "rebuilt on file")
+        assertTrue(DropSchema.foreignKeysEnabled(driver), "the app's driver enforces foreign keys")
+        driver.close()
+    }
+
+    @Test
+    fun aDriverThatCannotTurnEnforcementOffIsRefusedBeforeAnyChange() {
+        val path = File(tempDir, "enforcing.db").path
+        seededV1(JdbcSqliteDriverFactory.file(path).open(DropSchema.schema)).close()
+        // A file driver opens a connection per statement, each enforcing foreign keys: the pragma cannot reach the migration.
+        val enforcing = JdbcSqliteDriver("jdbc:sqlite:$path", Properties().apply { put("foreign_keys", "true") })
+        assertFailsWith<IllegalStateException> { DropSchema.createOrMigrate(enforcing, rebuildingSchema()) }
+        assertEquals(DropSchema.VERSION, DropSchema.userVersion(enforcing))
+        assertSeedKept(enforcing, "refused")
+        enforcing.close()
+    }
+
+    @Test
+    fun aMigrationThatBreaksAForeignKeyIsRolledBack() {
+        val driver = seededV1(JdbcSqliteDriver("jdbc:sqlite::memory:", Properties().apply { put("foreign_keys", "true") }))
+        val breaking = rebuildingSchema { it.execute(null, "DELETE FROM device WHERE id = '${"2".repeat(32)}'", 0) }
+        val error = assertFailsWith<SchemaMigrationException> { DropSchema.createOrMigrate(driver, breaking) }
+        assertEquals(DropSchema.VERSION, error.from)
+        assertTrue(error.violations.single().startsWith("transfer row"), error.violations.toString())
+        assertEquals(DropSchema.VERSION, DropSchema.userVersion(driver), "nothing changed")
+        assertSeedKept(driver, "rolled back")
+        assertTrue(DropSchema.foreignKeysEnabled(driver))
+        driver.close()
     }
 
     @Test

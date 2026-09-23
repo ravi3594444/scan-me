@@ -255,28 +255,45 @@ class TransferRepository internal constructor(
     /**
      * Deletes a finished transfer with its files and manifests (History "delete"). Returns false when it is missing
      * or still running: the engine owns a running transfer.
+     *
+     * A received transfer that failed or was cancelled may still have partial files, and once its row and manifests
+     * are gone nothing would find them again (§7.6 wants them deleted): [deletePartials] (`FileStore.deletePartials`,
+     * idempotent) runs first, and only when it succeeded are the rows deleted. If it throws, nothing is deleted and
+     * the exception propagates; deleting again is safe.
      */
-    suspend fun delete(id: TransferId): Boolean {
+    suspend fun delete(
+        id: TransferId,
+        deletePartials: suspend (TransferId) -> Unit,
+    ): Boolean {
         val key = id.toDb()
+        val direction = withContext(context) { queries.selectFinishedDirection(key).executeAsOneOrNull() } ?: return false
+        if (direction == TransferDirection.RECEIVE.dbValue) deletePartials(id)
+        // Finished is final, so the transfer is still finished here; a concurrent delete makes this return false.
+        return withContext(context) { database.transactionWithResult { deleteFinishedRows(key) } }
+    }
+
+    /**
+     * History "clear" (F-G2): deletes every finished transfer with its files and manifests; returns how many.
+     * Running transfers stay. As in [delete], the partial files of every finished received transfer are deleted first
+     * with [deletePartials]; if it throws, nothing is deleted and the exception propagates. A transfer that finishes
+     * while this runs is left for the next clear, since its partial files were not deleted.
+     */
+    suspend fun clearHistory(deletePartials: suspend (TransferId) -> Unit): Int {
+        val finished = withContext(context) { queries.selectFinished().executeAsList() }
+        for (row in finished) {
+            if (row.direction == TransferDirection.RECEIVE.dbValue) deletePartials(transferIdFromDb(row.id))
+        }
         return withContext(context) {
-            database.transactionWithResult {
-                // Children first and explicitly, so no orphan remains even on a driver without foreign keys.
-                queries.deleteFilesOfFinished(key)
-                queries.deleteManifestsOfFinished(key)
-                queries.deleteFinished(key).value > 0
-            }
+            database.transactionWithResult { finished.count { row -> deleteFinishedRows(row.id) } }
         }
     }
 
-    /** History "clear" (F-G2): deletes every finished transfer with its files and manifests; returns how many. */
-    suspend fun clearHistory(): Int =
-        withContext(context) {
-            database.transactionWithResult {
-                queries.clearFilesOfFinished()
-                queries.clearManifestsOfFinished()
-                queries.clearFinished().value.toInt()
-            }
-        }
+    /** Deletes a finished transfer's rows, children first so no orphan remains even on a driver without foreign keys. */
+    private fun deleteFinishedRows(key: String): Boolean {
+        queries.deleteFilesOfFinished(key)
+        queries.deleteManifestsOfFinished(key)
+        return queries.deleteFinished(key).value > 0
+    }
 
     /**
      * Cancels every unfinished transfer with no activity since [cutoffMillis], neither on its row nor in a manifest:
@@ -300,6 +317,37 @@ class TransferRepository internal constructor(
                     }.map(::transferIdFromDb)
             }
         }
+
+    /** Whether the transfer is finished; null when it does not exist. */
+    internal suspend fun isFinished(id: TransferId): Boolean? =
+        withContext(context) { queries.selectFinishedAt(id.toDb()).executeAsOneOrNull()?.let { it.finished_at != null } }
+
+    /**
+     * Cancels those of [ids] that are unfinished, at [atMillis] (their resume state is being cleared, so they cannot
+     * resume), and returns them. Their unfinished files become cancelled.
+     */
+    internal suspend fun cancelUnfinished(
+        ids: Collection<TransferId>,
+        atMillis: Long,
+    ): List<TransferId> =
+        withContext(context) {
+            database.transactionWithResult {
+                ids.distinct().filter { id ->
+                    val cancelled = queries.cancelUnfinished(finishedAt = atMillis, id = id.toDb()).value > 0
+                    if (cancelled) {
+                        database.transferFileQueries.updateUnfinishedStatus(
+                            status = TransferFileStatus.encode(TransferFileStatus.CANCELLED),
+                            transferId = id.toDb(),
+                        )
+                    }
+                    cancelled
+                }
+            }
+        }
+
+    /** Finished transfers that may still have partial files: every received one, and any with a manifest left. */
+    internal suspend fun finishedWithResumeData(): List<TransferId> =
+        withContext(context) { queries.selectFinishedWithResumeData().executeAsList().map(::transferIdFromDb) }
 
     companion object {
         const val DEFAULT_PAGE_SIZE: Int = 50

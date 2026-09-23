@@ -3,6 +3,8 @@
 -- Numbering follows SQLDelight: N.sqm upgrades a database at version N (PRAGMA user_version) to N + 1, and the
 -- schema is derived from the migrations. An empty database is at version 0, so this file creates version 1; the
 -- next change goes into 1.sqm and must come with a schema golden (SchemaMigrationTest). Shipped files never change.
+-- Migrations run with foreign-key enforcement off (DropSchema.createOrMigrate, SqlDriverFactory), so the SQLite table
+-- rebuild (create new, copy, drop old, rename) keeps child rows; they must leave PRAGMA foreign_key_check empty.
 --
 -- The CHECK constraints are the invariants the repositories rely on; a bug that would break one fails the write
 -- instead of storing a row the app cannot read back.
@@ -28,6 +30,9 @@ CREATE TABLE device (
   peer_adv_secret BLOB,
   peer_adv_generation INTEGER CHECK (peer_adv_generation IS NULL OR peer_adv_generation >= 0),
   previous_peer_adv_secret BLOB,
+  -- Until when the previous generation still resolves (a short grace period after the rotation was stored), so the
+  -- device the peer forgot, which knows that k_adv, cannot keep passing for the peer on this radar.
+  previous_peer_adv_until INTEGER,
   -- Bluetooth Classic address (48-bit value) of a trusted desktop, which stops advertising it in Trusted-only mode.
   classic_address INTEGER CHECK (classic_address IS NULL OR classic_address BETWEEN 1 AND 281474976710654),
   first_seen INTEGER NOT NULL,
@@ -36,11 +41,12 @@ CREATE TABLE device (
   CHECK (platform = 'browser' OR identity_pk IS NOT NULL),
   CHECK (identity_pk IS NOT NULL OR trusted = 0),
   CHECK (trusted = 1 OR (auto_accept = 0 AND recognition_secret IS NULL AND peer_adv_secret IS NULL
-    AND peer_adv_generation IS NULL AND previous_peer_adv_secret IS NULL AND classic_address IS NULL
-    AND trusted_at IS NULL)),
+    AND peer_adv_generation IS NULL AND previous_peer_adv_secret IS NULL AND previous_peer_adv_until IS NULL
+    AND classic_address IS NULL AND trusted_at IS NULL)),
   CHECK (trusted = 0 OR (recognition_secret IS NOT NULL AND trusted_at IS NOT NULL)),
   CHECK ((peer_adv_secret IS NULL) = (peer_adv_generation IS NULL)),
-  CHECK (previous_peer_adv_secret IS NULL OR peer_adv_secret IS NOT NULL)
+  CHECK (previous_peer_adv_secret IS NULL OR peer_adv_secret IS NOT NULL),
+  CHECK ((previous_peer_adv_secret IS NULL) = (previous_peer_adv_until IS NULL))
 );
 
 CREATE INDEX device_by_trust ON device(trusted, last_seen);

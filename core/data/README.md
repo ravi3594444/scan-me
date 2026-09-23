@@ -15,16 +15,18 @@ Kotlin Multiplatform: everything in `src/commonMain` except the JDBC driver fact
 | Need | API |
 | --- | --- |
 | Open the database | `DropData.open(driverFactory, dispatcher, crypto, clock, calendar, secretCipher)`; desktop and tests: `DropData.openJvm(path)` |
-| Plug in encryption (F-J2) | implement `SqlDriverFactory` (SQLCipher); keys from `DatabaseKeys(secretStorage, crypto).sqlCipherKey()` / `.fieldKey()`; `AeadSecretFieldCipher` for per-value sealing |
-| Schema version, migrations | `DropSchema.VERSION`, `DropSchema.createOrMigrate(driver)`; migrations are `src/commonMain/sqldelight/.../N.sqm` |
+| Plug in encryption (F-J2) | implement `SqlDriverFactory` (SQLCipher); keys from one shared `DatabaseKeys(secretStorage, crypto)`: `.sqlCipherKey()` / `.fieldKey()`; `AeadSecretFieldCipher` for per-value sealing (secrets stored with `PLAINTEXT` are re-sealed on open) |
+| Schema version, migrations | `DropSchema.VERSION`, `DropSchema.createOrMigrate(driver)`; migrations are `src/commonMain/sqldelight/.../N.sqm` and run with foreign keys off (`SqlDriverFactory` contract) |
 | Peer devices and trust | `DropData.devices`: `recordPeer`, `recordSighting`, `trust`, `storeAdvertisingSecret` (S3), `setClassicAddress`, `rename`, `setAutoAccept`, `forget`, `observeTrusted`, `observeTrustedKeys` |
+| Own `k_adv` generation (S3) | `devices.ownAdvertisingGeneration()` for `TrustShare`; `devices.advanceOwnAdvertisingGeneration()` before `AdvertisingSecretStore.rotate()` |
 | Radar and handshake trust input | `List<TrustedDeviceKeys>.toTrustedPeers()` (discovery `TrustState.peers`), `.toTrustedPeerLookup()` (crypto `TrustedPeerLookup`) |
 | Transfers | `DropData.transfers`: `create`, `updateStatus`, `updateProgress`, `recordLink`, `addHint`, `finish`, `observe`, `observeActive` |
-| History (F-G2) | `transfers.historyPage(cursor, limit)`, `observeHistory(limit)`, `delete`, `clearHistory`; `HistoryGrouping.byDay` / `append` |
+| History (F-G2) | `transfers.historyPage(cursor, limit)`, `observeHistory(limit)`, `delete(id, deletePartials)`, `clearHistory(deletePartials)`; `HistoryGrouping.byDay` / `append` |
 | Files of a transfer | `DropData.transferFiles`: `add`, `page`, `updateStatus`, `setSha256`, `setSavedUri`, `complete`, `observeFiles` |
 | Resume manifests (§7.6, N5) | `ChunkManifest` (bitmap, unit hashes, partial prefix) and `DropData.manifests`: `get`, `forTransfer`, `put`, `putAll`, `deleteForTransfer` |
 | 24 h clean-up | `DropData.resumeDataCleaner(clock) { id -> fileStore.deletePartials(id.toHex()) }.runPeriodically()` |
-| Settings (F-G5) | `DropData.settings`: `get` / `set` / `observe(SettingKeys.X)`, `observeAll()`, `setVisibility`, `observeEffectiveVisibility()` |
+| "Clear partial files" (F-G5) | the same cleaner's `clearPartials(released)`: finished transfers plus the unfinished ones the caller released |
+| Settings (F-G5) | `DropData.settings`: `get` / `set` / `observe(SettingKeys.X)`, `observeAll()`, `setVisibility`, `observeEffectiveVisibility(recheck)`, `effectiveVisibility()` |
 | Stats (F-G4) | `DropData.stats.stats()` / `observe()` → `TransferStats` |
 | Column vocabularies | `TransferStatus`, `TransferDirection`, `TransferFileStatus`, `WifiBand`, `LinkKindColumn`, `DevicePlatformColumn`, `HintCodesColumn`, `MimeHistogramColumn` |
 
@@ -33,7 +35,15 @@ Stored data that does not decode raises `DataCorruptionException`; other data er
 that name a missing row return false. A setting that does not decode reads as its default.
 
 **Durability rule (N5).** Set a manifest bit only after the unit's bytes are written and `fsync`ed: sync the
-partial file, then `ChunkManifest.withReceived`, then `manifests.put`.
+partial file, then `ChunkManifest.withReceived`, then `manifests.put`. A finished transfer takes no manifest (`put`
+returns false), so a flush that loses the race with the clean-up cannot describe deleted bytes.
+
+**Partial files.** Everything that removes a received transfer's resume state deletes its partial files first, with
+the platform's `FileStore.deletePartials`: the cleaner, `transfers.delete` and `transfers.clearHistory`.
+
+**Visibility.** "Everyone for 10 min" ends on the wall clock. The platform schedules an exact wake-up at
+`VisibilityPreference.expiresAtMillis`, feeds it (and each beacon rebuild) into `observeEffectiveVisibility(recheck)`,
+and builds every beacon from `effectiveVisibility()`, since coroutine delays stop while the CPU sleeps.
 
 **Threading.** Every call is main-safe: repositories run on one database context (the given dispatcher limited to
 one task at a time), and flows re-query on it after each commit that touches their tables.

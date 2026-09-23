@@ -1,7 +1,10 @@
 package com.constrivo.drop.core.data
 
+import app.cash.sqldelight.db.QueryResult
+import com.constrivo.drop.core.discovery.WallClock
 import com.constrivo.drop.core.protocol.LinkKind
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import java.time.ZoneId
@@ -189,6 +192,75 @@ class StatsTest {
                 stats.transfersThisWeek,
             )
             assertTrue(stats.weeks.sumOf { it.transfers } > 0)
+        }
+
+    @Test
+    fun observeRollsOverToANewWeekWithoutAnyWrite() =
+        runTest {
+            val clock = WallClock { T0 + testScheduler.currentTime }
+            val data = openTestData(clock)
+            val peer = data.peer(1)
+            data.finished(1, peer, T0 - HOUR, mb, speed = mb)
+            val seen = collectInto(data.stats.observe())
+            runCurrent()
+            assertEquals(1, seen.last().transfersThisWeek)
+            // T0 is Wednesday 12:00 UTC; the next week starts Monday 00:00, 4.5 days later.
+            advanceTimeBy(4 * DAY + 12 * HOUR - 1)
+            runCurrent()
+            assertEquals(1, seen.last().transfersThisWeek)
+            advanceTimeBy(1)
+            runCurrent()
+            val rolled = seen.last()
+            assertEquals(0, rolled.transfersThisWeek, "a new week starts empty")
+            assertEquals(1, rolled.weeks[StatsRepository.WEEKS - 2].transfers, "last week holds the transfer")
+            assertEquals(1, rolled.transferCount)
+            assertEquals(2, seen.size)
+        }
+
+    @Test
+    fun progressWritesDoNotRecomputeTheStats() =
+        runTest {
+            // Every computation starts by finding "today" in the calendar: count those.
+            var computations = 0
+            val calendar =
+                object : LocalCalendar by LocalCalendar.UTC {
+                    override fun epochDayOf(epochMillis: Long): Long = LocalCalendar.UTC.epochDayOf(epochMillis).also { computations++ }
+                }
+            val data = openTestData(calendar = calendar)
+            val peer = data.peer(1)
+            data.finished(1, peer, T0 - HOUR, mb, speed = mb)
+            data.transfers.create(NewTransfer(transferId(2), peer, TransferDirection.RECEIVE, 100 * mb, 1), T0)
+            val seen = collectInto(data.stats.observe())
+            runCurrent()
+            val before = computations
+            repeat(20) {
+                data.transfers.updateProgress(transferId(2), it * mb, T0 + it * 250L)
+                runCurrent()
+            }
+            data.transfers.finish(transferId(2), TransferOutcome(TransferStatus.FAILED, 20 * mb), T0 + 10_000)
+            runCurrent()
+            assertEquals(before, computations, "neither progress nor a failed transfer recomputes")
+            data.transfers.create(NewTransfer(transferId(3), peer, TransferDirection.SEND, mb, 1), T0)
+            data.transfers.finish(transferId(3), TransferOutcome(TransferStatus.DONE, mb), T0 + 1_000)
+            runCurrent()
+            assertEquals(listOf(1L, 2L), seen.map { it.transferCount })
+            assertTrue(computations > before)
+
+            // The check behind it reads the status index alone.
+            val plan =
+                data.driver
+                    .executeQuery(
+                        null,
+                        "EXPLAIN QUERY PLAN SELECT count(*), coalesce(sum(started_at), 0) FROM transfer WHERE status = 'done'",
+                        { cursor ->
+                            val out = ArrayList<String>()
+                            while (cursor.next().value) out += cursor.getString(3).orEmpty()
+                            QueryResult.Value(out)
+                        },
+                        0,
+                    ).value
+                    .joinToString(" | ")
+            assertTrue("COVERING INDEX transfer_by_status" in plan, "plan: $plan")
         }
 
     @Test
