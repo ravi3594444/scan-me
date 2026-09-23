@@ -1,0 +1,68 @@
+-- Queries behind DeviceRepository. Schema: 0.sqm.
+
+selectById:
+SELECT * FROM device WHERE id = ?;
+
+selectByIdentityKey:
+SELECT * FROM device WHERE identity_pk = ?;
+
+selectTrusted:
+SELECT * FROM device WHERE trusted = 1 ORDER BY last_seen DESC, id;
+
+insertPeer:
+INSERT INTO device (id, identity_pk, nickname, platform, first_seen, last_seen)
+VALUES (:id, :identityKey, :nickname, :platform, :seenAt, :seenAt);
+
+updatePeer:
+UPDATE device SET nickname = :nickname, platform = :platform, last_seen = max(last_seen, :seenAt)
+WHERE id = :id;
+
+touchLastSeen:
+UPDATE device SET last_seen = max(last_seen, :seenAt) WHERE id = :id;
+
+trust:
+UPDATE device SET
+  trusted = 1,
+  recognition_secret = :recognitionSecret,
+  peer_adv_secret = :advertisingSecret,
+  peer_adv_generation = :advertisingGeneration,
+  previous_peer_adv_secret = NULL,
+  trusted_at = coalesce(trusted_at, :trustedAt),
+  last_seen = max(last_seen, :trustedAt)
+WHERE id = :id AND identity_pk IS NOT NULL;
+
+rotateAdvertisingSecret:
+UPDATE device SET
+  previous_peer_adv_secret = peer_adv_secret,
+  peer_adv_secret = :advertisingSecret,
+  peer_adv_generation = :advertisingGeneration
+WHERE id = :id AND trusted = 1 AND (peer_adv_generation IS NULL OR peer_adv_generation < :advertisingGeneration);
+
+setClassicAddress:
+UPDATE device SET classic_address = :classicAddress WHERE id = :id AND trusted = 1;
+
+rename:
+UPDATE device SET custom_name = :customName WHERE id = :id;
+
+setAutoAccept:
+UPDATE device SET auto_accept = :autoAccept WHERE id = :id AND trusted = 1;
+
+forget:
+UPDATE device SET
+  trusted = 0,
+  auto_accept = 0,
+  recognition_secret = NULL,
+  peer_adv_secret = NULL,
+  peer_adv_generation = NULL,
+  previous_peer_adv_secret = NULL,
+  classic_address = NULL,
+  custom_name = NULL,
+  trusted_at = NULL
+WHERE id = :id;
+
+insertBrowser:
+INSERT INTO device (id, identity_pk, nickname, platform, first_seen, last_seen)
+VALUES (:id, NULL, :nickname, 'browser', :seenAt, :seenAt);
+
+updateBrowser:
+UPDATE device SET nickname = :nickname, last_seen = max(last_seen, :seenAt) WHERE id = :id AND platform = 'browser';

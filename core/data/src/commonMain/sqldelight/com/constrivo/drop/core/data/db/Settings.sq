@@ -1,0 +1,13 @@
+-- Queries behind SettingsRepository. Schema: 0.sqm.
+
+selectValue:
+SELECT value FROM settings WHERE key = ?;
+
+selectAll:
+SELECT key, value FROM settings ORDER BY key;
+
+put:
+INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?);
+
+remove:
+DELETE FROM settings WHERE key = ?;
