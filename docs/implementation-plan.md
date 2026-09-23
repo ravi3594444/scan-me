@@ -260,12 +260,25 @@ Calendar if sessions run back to back with same‑day review: the device‑free 
 | WP1 Discovery core | Done | Beacon body (14 B, 20 B with a Classic address), both carriers (S11), scan response, rotating IDs from the shared advertising secret (S3), network hint from link properties (N6), mDNS TXT without the permanent id (N4), radar maths and the `NearbyDevices` aggregator. 164 tests. Placeholders: service UUID `0xDF01`, company id `0xFFFF` (decision 5) |
 | WP2 Crypto core | Done | Commit-then-reveal handshake (N1) with transcript signatures and Finished MACs (N2), pairing-attempt limiter, SAS, frame cipher with per-stream nonces (S7), signed QR payload, trusted proof bound to the beacon epoch, software identity store behind `SecretStorage` (N11). 136 tests; key schedule cross-checked against an independent Python implementation |
 | WP3 Protocol core | Done | Frames and their associated data (N2), 15 CBOR control messages with golden bytes, summary `Offer` + paged `FileList` (N12), `FileDone` (S2), chunk header with block offset (S1), deterministic bundle plan (S4), state machine with `Reconnecting`/`Parked` (S8), fuzzer with a CI smoke run. 152 + 15 tests |
+| WP5 Transport ladder core | Done | Planner, S5 negotiation, per-pair stable Wi‑Fi Direct credentials (N7), lifecycle reducer with 5 GHz verify and one re-form, `LadderRunner` racing the LAN probe against Wi‑Fi Direct (N9), desktops and browsers join the phone's group as legacy clients (N8, N10), badge and hint rules. 122 tests. New badge keys and hint copy need design sign-off |
+| WP6 Data layer | Done | SQLDelight schema v1 with the S3 and N5 additions, repositories with Flow, stats that reconcile with History, 24 h resume-data cleaner, driver factory hook for SQLCipher. 134 tests |
+| WP9 Browser receive | Done | Single-file page under 30 KB, Ktor server with token path and per-browser "Allow this computer?" approval (N15), streamed STORED zip with ZIP64, Range, uploads, idle shutdown, a small mDNS responder for `drop.local`, Playwright end-to-end script. 156 tests |
 
 ### Carried forward from WP1–WP3
 
 - **WP4** adapts `FrameProtector` (core/protocol) to `FrameCipher` (core/crypto), sends `localFinished()` as the first frame on stream 0 and acts on nothing before `verifyPeerFinished`, computes XXH3-128 per frame, and runs a new handshake on every reconnect or `FrameLimitException` (N3). A file that fails after three strikes needs its remaining units released so `AllChunksAcked` can fire.
-- **WP5** tries every candidate endpoint in `NearbyDevice.lanEndpoints` / `radioAddresses` behind the handshake identity check; unauthenticated LAN records are only hints.
+- **WP4** (moved from WP5) tries every candidate endpoint in `NearbyDevice.lanEndpoints` / `radioAddresses` and the Offer's LAN option behind the handshake identity check; unauthenticated LAN records are only hints.
 - **WP6** stores the peer advertising secret next to `recognition_secret`, and the Classic address of trusted desktops (Trusted-only desktops stop advertising it).
 - **WP7a / WP10** restart the advertising set at `BeaconAdvertisement.validUntilMillis` so the radio address rotates with the ID (N4), and verify in the lab whether dictionary-style scanners merge the scan response with the beacon under one UUID; if they do, send the nickname as manufacturer data.
 - **WP8** animates a stranger's bubble being replaced at each 15-minute rotation, and shows the SAS as soon as the handshake result exists.
 - **Docs:** reword F‑J1 in `features.md` to what the beacon guarantees (IDs unlinkable across epochs; the whole advertisement only in Trusted-only mode).
+
+### Carried forward from WP5, WP6, WP9
+
+- **WP4** implements the ladder's `LadderSession` (send `LinkReady`, open the first `StreamOpen` stream, `sendLinkSelected` / `onPeerSelected` so the receiver's view of the LAN check wins), feeds receiver-side throughput samples and link losses to `LadderRunner`, emits `ControlMoved` when `state.dataLink` changes (N13), and advances the generation base by 6 per ladder run. It persists in the N5 order: fsync the `.part`, then mark the manifest, batched at 100 ms or less.
+- **Protocol gaps to close later:** battery level and "can host right now" are not on the wire, and there is no "candidate failed" message, so one side waits out its own timeout when the other's rung fails early.
+- **WP7:** a SQLCipher `SqlDriverFactory`; a `MulticastLock` while the mDNS responder runs; lab checks that Android groups accept legacy WPA2 clients per OEM and that both ends report `getFrequency()`.
+- **WP8:** approve the new badge keys (`badge.p2p`, `badge.p2p_6`, `badge.hotspot_plain`) and hint copy; build the "Allow this computer?" prompt; the QR and the "computer without the app" hint must carry the port and token path (`http://drop.local:<port>/t/<token>/`) and the real SSID and password; "Clear partial files" must stop parked transfers first.
+- **WP10:** desktops add the SQLite JDBC driver themselves and can reuse `ReceiveServer` for the no-Bluetooth PC path.
+- **WP11:** the nightly job runs the ZIP64 test (needs about 4.5 GB free disk) and can run the Playwright script.
+- **WP12:** the stable per-pair SSID links a trusted pair's sessions on the air; note it in the privacy review.
