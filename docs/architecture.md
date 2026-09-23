@@ -93,6 +93,15 @@ Rules:
 
 ### 5.1 BLE beacon (legacy advertising, 31 bytes total)
 
+> **Changed (WP1):** built in `core/discovery` (`BeaconBody`, `BeaconAdvertisements`, `BeaconAdvertisement`) with spec changes S10, S11, N4, N6 and decision 5 of `docs/implementation-plan.md`. Where the table below differs, this note wins.
+>
+> - **Body, identical in both carriers (14 bytes, 20 with a Classic address).** Multi-byte fields are big-endian. `0` version `0x01` · `1–6` `eph_id` (§5.3) · `7–8` capabilities as a `u16`, bit *n* of §5.2 = bit *n* (bit 0 is the LSB of byte 8) · `9–12` network hint (N6; zero when not connected) · `13` bits 7–6 visibility (0 Everyone, 1 Everyone for 10 min, 2 Trusted only; 3 Hidden is never sent), bits 5–3 platform (0 phone, 1 laptop, 2 desktop, 3 browser proxy), bits 2–0 reserved (sent as 0, ignored) · `14–19` optional BR/EDR address in display order (S10: desktops that can read their adapter address put it here; phones omit it, and six zero bytes read as absent). This field replaces the "reserved / padding" row of the table.
+> - **Versioning.** The first byte of every drop record says what it is: `0x01`–`0x0F` are beacon bodies of this layout (v1 is exactly 14 or 20 bytes; a later minor version may append fields, and decoders read bytes 0–13 and ignore the rest), `0x10`–`0x7F` are reserved for incompatible layouts (dropped as unsupported), and `0x80`–`0xFF` are auxiliary records (`0x81` complete and `0x82` shortened nickname; others are ignored). Decoders raise only `DiscoveryFormatException` for bad input. A body is invalid when bit 11 disagrees with the hint, bit 13 is set without bit 11, the visibility is Hidden or the platform code is unknown.
+> - **Two carriers (S11).** Service data (Android, BlueZ): Flags `02 01 06` ‖ complete 16-bit UUID list `03 03 uu uu` ‖ Service Data `LL 16 uu uu` + body. That is 25 bytes, exactly 31 with the Classic address. Manufacturer data (Windows): Flags ‖ Manufacturer Specific `LL FF cc cc 64 72` + body (company identifier little-endian, then the marker `"dr"`). That is 23 or 29 bytes. macOS does not advertise. Scanners accept both carriers. They ignore unrelated AD structures, other UUIDs and foreign data under the shared test company identifier, and skip zero length bytes (padding). A length byte that runs past the buffer is an error. Every built payload is checked to fit 31 bytes.
+> - **Identifiers (decision 5).** Until they are assigned, both are placeholders in `AdvertisingFormat`: 16-bit service UUID `0xDF01` (outside the SIG-allocated ranges; 128-bit form `0000df01-0000-1000-8000-00805f9b34fb` for scan filters) and company identifier `0xFFFF`, the value the SIG reserves for tests. S11 names `0xFFFE`, which is not the test value. Neither placeholder may ship.
+> - **Scan response.** One Service Data AD `LL 16 uu uu 81|82` + nickname in UTF-8, cut at a code point boundary to at most 26 bytes. The old 12-byte limit came from the 128-bit UUID, which is gone (see the plan's "scan response size" item). There is no 128-bit UUID and no Complete Local Name, which Android apps cannot set anyway. Some stacks report service data per UUID and could merge the two records; for them the same nickname record can travel as Manufacturer Specific `LL FF cc cc 64 72 81|82` + at most 24 bytes, and scanners accept either form. Received names are sanitised: control characters, bidi overrides and invisible separators are removed.
+> - **Visibility (F‑A5, N4).** Hidden never advertises (building it is an error). Trusted-only sends no scan response, a zero hint with bits 11 and 13 cleared, and no Classic address, because a permanent MAC would link every epoch. Otherwise bit 11 follows the hint. An advertisement is valid until the next epoch boundary; the platform then rebuilds it and restarts the advertising set, so the OS address rotates with the ID.
+
 | Offset | Size | Field | Notes |
 | --- | --- | --- | --- |
 | 0 | 3 | Flags AD structure | Standard LE General Discoverable |
@@ -113,6 +122,8 @@ Timing: advertise interval 100 ms foreground / 1000 ms background (`ADVERTISE_MO
 
 ### 5.2 Capability flags (16 bits)
 
+> **Changed (WP1):** bit 11 means "a network hint is present" (N6). It is set exactly when the 4-byte hint is non-zero, and cleared together with bit 13 in Trusted-only mode or when no hint can be derived; receivers reject a beacon where the two disagree. Bit 13 is `STATION_ON_5GHZ` (N9, defined in WP0): the connected network is on 5 GHz or above, valid only together with bit 11. Bits 14–15 stay reserved: sent as 0 and passed through unchanged when received. On the wire the flags are a big-endian `u16` at beacon offset 7 and four lower-case hex digits in the mDNS `cap` key; both sources carry the same normalised value.
+
 | Bit | Meaning |
 | --- | --- |
 | 0 | Wi‑Fi 5 GHz supported |
@@ -132,12 +143,22 @@ Timing: advertise interval 100 ms foreground / 1000 ms background (`ADVERTISE_MO
 
 ### 5.3 Ephemeral device ID and trusted resolution
 
+> **Changed (WP1):** with spec changes S3 and N4, built in `core/discovery` (`EphemeralIds`, `EphemeralIdResolver`). Where the bullets below differ, this note wins.
+>
+> - `epoch = floor(unix_seconds / 900)`; `eph_id = HMAC‑SHA256(k_adv, "drop-eph-v1" ‖ u64be(epoch))[0..6]`. The context prefix is new.
+> - S3: `k_adv` (32 bytes) is shared with every trusted peer inside the encrypted session (WP2), so all trusted peers resolve the same rotating ID; `recognition_secret` is used only for the `Hello` proof. `k_adv` is rotated on "Forget" and "Reset identity" and then re-shared (WP2).
+> - Resolution: for a sighting in epoch *e* the IDs of *e − 1*, *e* and *e + 1* are accepted. The IDs of all trusted peers for an epoch, plus our own (so our echo is dropped), are computed once into a hash table. Tables are cached for two epochs around the latest sighting, so resolving a packet takes at most three map lookups and no cryptography (§15 budget, tested with 100 peers). An ID that matches two different peers is treated as unknown, never guessed.
+> - F‑J1, restated as what the beacon guarantees: without `k_adv`, the IDs of different epochs are unlinkable. The whole advertisement is unlinkable across epochs only in Trusted-only mode, which sends no nickname, hint or Classic address and restarts the advertising set at the boundary (N4). In Everyone mode the nickname, the hint, a desktop's Classic address and the capability and platform bits can still link two scans.
+> - Trusted-only: a scanner drops Trusted-only beacons and TXT records that none of its trusted peers resolves (F‑A5).
+
 - `identity_pk` = Ed25519 public key (32 bytes). `device_id` = SHA‑256(identity_pk)[0..16].
 - Every 15 minutes: `epoch = floor(unix_time / 900)`; `eph_id = HMAC‑SHA256(k_adv, epoch)[0..6]`, where `k_adv` is a per-device secret rotated when the user taps "Reset identity".
 - For a trusted peer, both sides hold `recognition_secret` (derived at pairing via HKDF from the session key with label `"recog"`). The peer's beacon is resolved by computing `HMAC(recognition_secret, epoch)[0..6]` for the current and adjacent epochs and comparing. Untrusted observers see an unlinkable 6-byte value.
 - Trusted-only visibility: the device advertises but the `eph_id` uses the recognition scheme only; strangers cannot start a handshake because the GATT/RFCOMM channel requires a proof of `recognition_secret` in the Hello.
 
 ### 5.4 mDNS / DNS‑SD record
+
+> **Changed (WP1):** built in `MdnsRecord` with spec change N4. TXT keys, in order: `v=1`, `eph` (12 lower-case hex digits), `cap` (4 lower-case hex digits), `plat` (`phone`, `laptop`, `desktop`, `browser`), `nick` (at most 64 UTF-8 bytes; omitted in Trusted-only mode), `port` (decimal 1–65535), and a new `vis` key (visibility code 0, 1 or 2; absent means 0) so the LAN path honours F‑A5 as well. The permanent `id` is no longer published. The instance name is `drop-<eph>` and is registered again at every epoch boundary. Decoding follows RFC 6763 §6: printable-ASCII keys compared case-insensitively, no duplicates, each `key=value` at most 255 bytes, the record at most 1300 bytes, unknown keys ignored; anything else raises `DiscoveryFormatException`. Later `v` values may only add keys. Bluetooth and mDNS sightings of one device merge on the radar when their `eph` values match; for trusted peers they merge when both resolve to the same device, even across epochs.
 
 Service type `_<appname>._tcp` (decide with the name). TXT keys: `v=1`, `id=<device_id hex>`, `eph=<eph_id hex>`, `cap=<flags hex>`, `plat=<phone|laptop|desktop>`, `nick=<nickname>`, `port=<control port>`. Announced on Android with `NsdManager`, on desktop with JmDNS / Bonjour / Avahi. Used for the LAN path and for computers without Bluetooth.
 
