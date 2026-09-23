@@ -4,6 +4,10 @@ plugins {
 }
 
 kotlin {
+    compilerOptions {
+        // @CborLabel, @CborArray, @EncodeDefault and SerialDescriptor(name, original) are still marked experimental.
+        optIn.add("kotlinx.serialization.ExperimentalSerializationApi")
+    }
     sourceSets {
         commonMain.dependencies {
             api(project(":core:crypto"))
