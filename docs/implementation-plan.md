@@ -257,3 +257,15 @@ Calendar if sessions run back to back with same‑day review: the device‑free 
 | --- | --- | --- |
 | Plan + pack in `docs/` | Done | This file and the eight pack files |
 | WP0 Bootstrap | Done | All modules compile; Android debug and release APKs build. Notes: compile and target SDK are 37 because Compose 1.12 requires it; detekt is not added yet (1.23.8 predates Kotlin 2.4 and 2.0 is alpha), ktlint is the lint gate; Android modules are skipped when no SDK is found |
+| WP1 Discovery core | Done | Beacon body (14 B, 20 B with a Classic address), both carriers (S11), scan response, rotating IDs from the shared advertising secret (S3), network hint from link properties (N6), mDNS TXT without the permanent id (N4), radar maths and the `NearbyDevices` aggregator. 164 tests. Placeholders: service UUID `0xDF01`, company id `0xFFFF` (decision 5) |
+| WP2 Crypto core | Done | Commit-then-reveal handshake (N1) with transcript signatures and Finished MACs (N2), pairing-attempt limiter, SAS, frame cipher with per-stream nonces (S7), signed QR payload, trusted proof bound to the beacon epoch, software identity store behind `SecretStorage` (N11). 136 tests; key schedule cross-checked against an independent Python implementation |
+| WP3 Protocol core | Done | Frames and their associated data (N2), 15 CBOR control messages with golden bytes, summary `Offer` + paged `FileList` (N12), `FileDone` (S2), chunk header with block offset (S1), deterministic bundle plan (S4), state machine with `Reconnecting`/`Parked` (S8), fuzzer with a CI smoke run. 152 + 15 tests |
+
+### Carried forward from WP1–WP3
+
+- **WP4** adapts `FrameProtector` (core/protocol) to `FrameCipher` (core/crypto), sends `localFinished()` as the first frame on stream 0 and acts on nothing before `verifyPeerFinished`, computes XXH3-128 per frame, and runs a new handshake on every reconnect or `FrameLimitException` (N3). A file that fails after three strikes needs its remaining units released so `AllChunksAcked` can fire.
+- **WP5** tries every candidate endpoint in `NearbyDevice.lanEndpoints` / `radioAddresses` behind the handshake identity check; unauthenticated LAN records are only hints.
+- **WP6** stores the peer advertising secret next to `recognition_secret`, and the Classic address of trusted desktops (Trusted-only desktops stop advertising it).
+- **WP7a / WP10** restart the advertising set at `BeaconAdvertisement.validUntilMillis` so the radio address rotates with the ID (N4), and verify in the lab whether dictionary-style scanners merge the scan response with the beacon under one UUID; if they do, send the nickname as manufacturer data.
+- **WP8** animates a stranger's bubble being replaced at each 15-minute rotation, and shows the SAS as soon as the handshake result exists.
+- **Docs:** reword F‑J1 in `features.md` to what the beacon guarantees (IDs unlinkable across epochs; the whole advertisement only in Trusted-only mode).

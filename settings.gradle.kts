@@ -36,8 +36,11 @@ val localSdkDir =
 val androidSdk =
     listOf(System.getenv("ANDROID_HOME"), System.getenv("ANDROID_SDK_ROOT"), localSdkDir)
         .firstOrNull { !it.isNullOrBlank() }
-if (androidSdk != null && file(androidSdk).isDirectory) {
+val hasAndroidSdk = androidSdk != null && file(androidSdk).isDirectory
+// Read by modules with an optional Android target (ui/shared) via gradle.extra.
+gradle.extensions.extraProperties["drop.hasAndroidSdk"] = hasAndroidSdk
+if (hasAndroidSdk) {
     include(":platform:android", ":ui:android")
 } else {
-    logger.warn("drop: no Android SDK found; skipping :platform:android and :ui:android")
+    logger.warn("drop: no Android SDK found; skipping :platform:android, :ui:android and the Android target of :ui:shared")
 }
