@@ -14,6 +14,7 @@ import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotSame
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
@@ -33,33 +34,44 @@ class NearbyDevicesTest {
         val nearby: NearbyDevices,
         val sightings: Channel<BeaconSighting>,
         val lan: Channel<LanEvent>,
-        val peers: MutableStateFlow<Collection<TrustedPeer>>,
+        val trust: MutableStateFlow<TrustState>,
         val clockReads: () -> Int,
+        /** Added to our wall clock only: models an NTP or user correction. */
+        var wallOffset: Long = 0,
     )
 
     private fun TestScope.start(): Harness {
         var reads = 0
-        val clock =
+        lateinit var harness: Harness
+        val wall =
             WallClock {
                 reads++
-                base + testScheduler.currentTime
+                base + testScheduler.currentTime + harness.wallOffset
             }
-        val nearby = NearbyDevices(crypto, clock, ownSecret)
+        val monotonic =
+            MonotonicClock {
+                reads++
+                testScheduler.currentTime
+            }
+        val nearby = NearbyDevices(crypto, wall, monotonic)
         val sightings = Channel<BeaconSighting>(Channel.UNLIMITED)
         val lan = Channel<LanEvent>(Channel.UNLIMITED)
-        val peers = MutableStateFlow<Collection<TrustedPeer>>(emptyList())
-        nearby.launchIn(backgroundScope, sightings.receiveAsFlow(), lan.receiveAsFlow(), peers)
+        val trust = MutableStateFlow(TrustState(listOf(ownSecret)))
+        harness = Harness(nearby, sightings, lan, trust, { reads })
+        nearby.launchIn(backgroundScope, sightings.receiveAsFlow(), lan.receiveAsFlow(), trust)
         runCurrent()
-        return Harness(nearby, sightings, lan, peers) { reads }
+        return harness
     }
 
+    /** A beacon of [secret] stamped with the true time (the peers' clocks are right). */
     private fun TestScope.beacon(
         secret: ByteArray,
         rssi: Int = -50,
+        address: String? = null,
     ): BeaconSighting {
         val now = base + testScheduler.currentTime
         val ad = BeaconAdvertisement.create(crypto, secret, state, BeaconCarrier.SERVICE_DATA, now)
-        return BeaconSighting.fromAdvertisingData(ad.advertisingData() + ad.scanResponseData()!!, rssi, null, now)!!
+        return BeaconSighting.fromAdvertisingData(ad.advertisingData() + ad.scanResponseData()!!, rssi, address, now)!!
     }
 
     @Test
@@ -107,7 +119,7 @@ class NearbyDevicesTest {
             runCurrent()
             val device = h.nearby.devices.value.single()
             assertEquals(setOf(DiscoverySource.BLUETOOTH, DiscoverySource.LAN), device.sources)
-            assertEquals(LanEndpoint(record.instanceName, "10.0.0.7", 40404), device.lanEndpoint)
+            assertEquals(listOf(LanEndpoint(record.instanceName, "10.0.0.7", 40404)), device.lanEndpoints)
             // Bluetooth stops; the LAN keeps the device until it is lost.
             advanceTimeBy(6_000)
             runCurrent()
@@ -125,7 +137,10 @@ class NearbyDevicesTest {
             h.sightings.send(beacon(secret))
             runCurrent()
             assertTrue(h.nearby.devices.value.single().key.startsWith("e:"))
-            h.peers.value = listOf(TrustedPeer("peer-3", secret, "Priya"))
+            h.trust.value = TrustState(listOf(ownSecret), listOf(TrustedPeer("peer-3", secret, "Priya")))
+            runCurrent()
+            // Published within one 100 ms throttle interval.
+            advanceTimeBy(100)
             runCurrent()
             val device = h.nearby.devices.value.single()
             assertEquals("t:peer-3", device.key)
@@ -133,11 +148,68 @@ class NearbyDevicesTest {
         }
 
     @Test
+    fun s3_rotatingTheOwnSecretMidRunKeepsTheOwnRecordOffTheRadar() =
+        runTest {
+            val h = start()
+            val rotated = Secrets.secret(300)
+            val record = { secret: ByteArray -> MdnsRecord.create(crypto, secret, state, 40404, base + testScheduler.currentTime) }
+            // "Forget" rotates k_adv; the same run carries on with the new trust state, no restart.
+            h.trust.value = TrustState(listOf(rotated), emptyList())
+            runCurrent()
+            // NsdManager reports our own services too; the old record lingers until it is withdrawn.
+            h.lan.send(LanEvent.Found(record(rotated).toLanService("10.0.0.2")))
+            h.lan.send(LanEvent.Found(record(ownSecret).toLanService("10.0.0.2")))
+            h.sightings.send(beacon(rotated))
+            h.sightings.send(beacon(ownSecret))
+            runCurrent()
+            assertTrue(h.nearby.devices.value.isEmpty(), "${h.nearby.devices.value}")
+            assertEquals(4, h.nearby.counters.value.ownEchoes)
+            // A stranger still shows up.
+            h.sightings.send(beacon(Secrets.secret(4)))
+            runCurrent()
+            assertEquals(1, h.nearby.devices.value.size)
+        }
+
+    @Test
+    fun wallClockStepsNeitherKeepDepartedDevicesNorDropPresentOnes() =
+        runTest {
+            val h = start()
+            val a = Secrets.secret(5)
+            val b = Secrets.secret(6)
+            h.sightings.send(beacon(a))
+            h.sightings.send(beacon(b))
+            val record = MdnsRecord.create(crypto, Secrets.secret(7), state, 40404, base + testScheduler.currentTime)
+            h.lan.send(LanEvent.Found(record.toLanService("10.0.0.9")))
+            runCurrent()
+            assertEquals(3, h.nearby.devices.value.size)
+            // Our wall clock steps back an hour; A keeps beaconing, B has left.
+            h.wallOffset = -3_600_000
+            repeat(10) {
+                advanceTimeBy(1_000)
+                h.sightings.send(beacon(a))
+                runCurrent()
+            }
+            val keys = h.nearby.devices.value.map { it.key }.toSet()
+            assertEquals(2, keys.size, "A once and the LAN device; B left 5 s after its last beacon: $keys")
+            assertFalse("e:${EphemeralIds.at(crypto, b, base).toHex()}" in keys)
+            // Then forward by 31 minutes: the LAN record, 10 s old on the monotonic clock, stays.
+            h.wallOffset = 31 * 60_000L
+            advanceTimeBy(1_000)
+            h.sightings.send(beacon(a))
+            runCurrent()
+            assertEquals(keys, h.nearby.devices.value.map { it.key }.toSet())
+            // And A still leaves on time.
+            advanceTimeBy(5_000)
+            runCurrent()
+            assertEquals(listOf(record.instanceName), h.nearby.devices.value.single().lanEndpoints.map { it.instanceName })
+        }
+
+    @Test
     fun fJ1_trustedBubbleSurvivesAnIdRotation() =
         runTest {
             val h = start()
             val secret = Secrets.secret(4)
-            h.peers.value = listOf(TrustedPeer("peer-4", secret))
+            h.trust.value = TrustState(listOf(ownSecret), listOf(TrustedPeer("peer-4", secret)))
             runCurrent()
             // Beacon every second across the next epoch boundary.
             val untilBoundary = EphemeralIds.millisUntilNextEpoch(base + testScheduler.currentTime)
@@ -154,6 +226,27 @@ class NearbyDevicesTest {
             }
             assertEquals(setOf("t:peer-4"), keys)
             assertEquals(2, ids.size, "the ID rotated once")
+        }
+
+    @Test
+    fun fJ1_aSessionKeepsAStrangersBubbleAcrossItsRotation() =
+        runTest {
+            val h = start()
+            val secret = Secrets.secret(8)
+            h.sightings.send(beacon(secret, address = "5A:00:00:00:00:01"))
+            runCurrent()
+            val key = h.nearby.devices.value.single().key
+            val next = EphemeralIds.at(crypto, secret, base + EphemeralIds.EPOCH_MILLIS)
+            assertTrue(h.nearby.link(key, next))
+            runCurrent()
+            // Heard next epoch from a fresh address, far from the boundary: without the link this would be a new bubble.
+            val later = base + EphemeralIds.EPOCH_MILLIS + 60_000
+            val ad = BeaconAdvertisement.create(crypto, secret, state, BeaconCarrier.SERVICE_DATA, later)
+            h.sightings.send(BeaconSighting.fromAdvertisingData(ad.advertisingData(), -50, "5A:00:00:00:00:02", later)!!)
+            advanceTimeBy(100)
+            runCurrent()
+            assertEquals(key, h.nearby.devices.value.single().key)
+            assertEquals(next, h.nearby.devices.value.single().ephemeralId)
         }
 
     @Test
@@ -182,10 +275,30 @@ class NearbyDevicesTest {
         }
 
     @Test
+    fun aFloodIsPublishedAtMostTenTimesASecond() =
+        runTest {
+            val h = start()
+            val published = ArrayList<List<NearbyDevice>>()
+            backgroundScope.launch { h.nearby.devices.collect { published += it } }
+            runCurrent()
+            // A flooder sends a new random ID every 5 ms for a second (seeds 1–200: none is our own secret 0).
+            repeat(200) { i ->
+                h.sightings.send(beacon(Secrets.secret(1 + i)))
+                runCurrent()
+                advanceTimeBy(5)
+            }
+            advanceTimeBy(100)
+            runCurrent()
+            assertEquals(200, h.nearby.devices.value.size, "the last change is published too")
+            assertTrue(published.size in 2..15, "${published.size} lists published for 200 changes")
+        }
+
+    @Test
     fun stoppingClearsTheRadarAndASecondRunIsRefused() =
         runTest {
-            val clock = WallClock { base + testScheduler.currentTime }
-            val nearby = NearbyDevices(crypto, clock, ownSecret)
+            val wall = WallClock { base + testScheduler.currentTime }
+            val monotonic = MonotonicClock { testScheduler.currentTime }
+            val nearby = NearbyDevices(crypto, wall, monotonic)
             val sightings = Channel<BeaconSighting>(Channel.UNLIMITED)
             val job = nearby.launchIn(backgroundScope, sightings.receiveAsFlow())
             runCurrent()
@@ -199,6 +312,7 @@ class NearbyDevicesTest {
             job.cancel()
             runCurrent()
             assertTrue(nearby.devices.value.isEmpty())
+            assertFalse(nearby.link("e:000000000000", EphemeralId(1)), "no run, no link")
             // It can run again after it stopped.
             nearby.launchIn(backgroundScope, sightings.receiveAsFlow())
             runCurrent()

@@ -67,13 +67,53 @@ class RssiSmoothingTest {
     }
 
     @Test
-    fun gapsAreSkippedNotDecayed() {
+    fun emptyWindowsAreBridgedAsIfTheNewSampleHadBeenHeardInEach() {
+        // One reading after three empty windows (a 1 s advertiser) ...
+        val sparse = smoothing.start(-80, 0).add(-50, 1_000).advanceTo(1_250)
+        // ... lands exactly where one reading in each of those windows would have taken it (sample and hold).
+        var held = smoothing.start(-80, 0)
+        for (t in listOf(250L, 500L, 750L, 1_000L)) held = held.add(-50, t)
+        held = held.advanceTo(1_250)
+        assertTrue(abs(sparse.valueDbm - held.valueDbm) < 1e-9, "${sparse.valueDbm} vs ${held.valueDbm}")
+        assertTrue(abs(sparse.valueDbm - (-80.0 + (1 - 0.8.pow(4)) * 30)) < 1e-9)
+        assertEquals(2, sparse.samples)
+    }
+
+    @Test
+    fun aLongSilenceCountsForAtMostTwoSeconds() {
         var s = smoothing.start(-60, 0)
         s = s.add(-80, 60_000)
         assertEquals(-60.0, s.valueDbm)
         assertEquals(1, s.samples)
         s = s.advanceTo(60_250)
-        assertEquals(-64.0, s.valueDbm)
+        // k is capped at 8 windows: weight 1 − 0.8⁸.
+        assertTrue(abs(s.valueDbm - (-60.0 - 20.0 * (1 - 0.8.pow(8)))) < 1e-9, "${s.valueDbm}")
+        assertEquals(8, RssiSmoothing.DEFAULT_MAX_BRIDGED_WINDOWS)
+    }
+
+    @Test
+    fun fA2_settleTimeFollowsWallTimeNotTheAdvertisingRate() {
+        // A 30 dB step from −80 to −50 at 5 s, for foreground (100 ms) and background (1 s) advertisers and in between.
+        val settle =
+            listOf(100L, 250L, 500L, 1_000L).associateWith { interval ->
+                var s = smoothing.start(-80, 0)
+                var t = interval
+                var reached: Long? = null
+                // Readings every [interval]; the smoother is also advanced at every window end, as the tracker does.
+                var now = 0L
+                while (reached == null && now < 20_000) {
+                    now += 50
+                    if (now >= t) {
+                        s = s.add(if (t >= 5_000) -50 else -80, t)
+                        t += interval
+                    }
+                    s = s.advanceTo(now)
+                    if (rings.classify(s.valueDbm, Ring.OUTER) == Ring.INNER) reached = now - 5_000
+                }
+                reached!!
+            }
+        // Before bridging, the 1 s advertiser needed 9 s; now every rate reaches the inner ring 2.25 s after the step.
+        for ((interval, millis) in settle) assertTrue(millis <= 2_500, "interval $interval ms: inner ring after $millis ms")
     }
 
     @Test

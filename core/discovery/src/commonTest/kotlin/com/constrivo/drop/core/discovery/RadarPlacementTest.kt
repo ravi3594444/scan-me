@@ -156,17 +156,53 @@ class RadarPlacementTest {
     }
 
     @Test
-    fun layoutsThatCannotFitAreBestEffortAndStayInTheirArcs() {
+    fun layoutsThatCannotFitSpillInsteadOfOverlapping() {
         val tiny = RadarGeometry(RingGeometry(100.0), RingGeometry(150.0), RingGeometry(200.0))
         val random = Random(9)
+        var spilledSome = false
         repeat(300) {
             val items = randomItems(random, random.nextInt(8, 13), perRing = 5)
             val layout = RadarPlacement.layout(items, tiny)
             assertEquals(layout, RadarPlacement.layout(items.shuffled(random), tiny))
+            assertMinimumDistance(layout, tiny.minCenterDistanceDp)
+            assertEquals(items.map { it.key }.toSet(), layout.bubbles.map { it.key }.toSet() + (layout.overflow?.keys ?: emptyList()))
+            if (layout.overflow != null) spilledSome = true
             for (b in layout.bubbles) {
                 val g = tiny.ring(b.ring)
                 assertTrue(b.angleDegrees >= g.arcStartDegrees - 1e-9 && b.angleDegrees <= g.arcEndDegrees + 1e-9, "$b outside its arc")
             }
+        }
+        assertTrue(spilledSome)
+    }
+
+    @Test
+    fun narrowViewportsNeverOverlap() {
+        // Split screen: 233 × 924 dp, rings 70 / 128 / 186 dp, closer together than 72 dp.
+        val narrow = RadarGeometry.forViewport(widthDp = 233.0, heightDp = 924.0)
+        val random = Random(233)
+        repeat(1_000) {
+            val items = randomItems(random, random.nextInt(1, 20), perRing = 19)
+            val layout = RadarPlacement.layout(items, narrow)
+            assertMinimumDistance(layout, narrow.minCenterDistanceDp)
+            assertEquals(items.size, layout.bubbles.size + (layout.overflow?.count ?: 0), "every device is shown or listed")
+            // Trusted devices are spilled last: a spilled trusted device means every one still shown on its ring is trusted.
+            val overflow = layout.overflow ?: return@repeat
+            val shown = layout.bubbles.map { b -> items.single { it.key == b.key } }
+            for (item in items.filter { it.key in overflow.keys && it.trusted && it.ring != Ring.OUTER }) {
+                assertTrue(shown.filter { it.ring == item.ring }.all { it.trusted }, "$item spilled before an untrusted device")
+            }
+        }
+    }
+
+    @Test
+    fun randomViewportsNeverOverlap() {
+        val random = Random(3_000)
+        repeat(3_000) {
+            val geometry = RadarGeometry.forViewport(random.nextDouble(200.0, 1_400.0), random.nextDouble(200.0, 1_400.0))
+            val items = randomItems(random, random.nextInt(1, 20), perRing = 19)
+            val layout = RadarPlacement.layout(items, geometry)
+            assertMinimumDistance(layout, geometry.minCenterDistanceDp)
+            assertEquals(items.size, layout.bubbles.size + (layout.overflow?.count ?: 0))
         }
     }
 
@@ -208,6 +244,22 @@ class RadarPlacementTest {
                 )
         }
         return out
+    }
+
+    /** Every pair of bubbles, the "+N more" bubble included, is at least [minimum] apart. */
+    private fun assertMinimumDistance(
+        layout: RadarLayout,
+        minimum: Double,
+    ) {
+        val points =
+            layout.bubbles.map { Triple(it.key, it.xDp, it.yDp) } +
+                listOfNotNull(layout.overflow?.let { Triple("+N", it.xDp, it.yDp) })
+        for (i in points.indices) {
+            for (j in i + 1 until points.size) {
+                val d = hypot(points[i].second - points[j].second, points[i].third - points[j].third)
+                assertTrue(d >= minimum - 1e-6, "${points[i].first} and ${points[j].first} are $d dp apart in $layout")
+            }
+        }
     }
 
     private fun assertMinimumDistance(

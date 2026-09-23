@@ -28,12 +28,16 @@ data class LocalBeaconState(
 )
 
 /**
- * What the platform advertises for one epoch: the carrier payload for the advertising data and, unless the device is
- * in Trusted-only mode, a nickname record for the scan response (architecture §5.1, spec changes S10, S11, N4).
+ * What the platform advertises for one epoch: the carrier payload for the advertising data and, with the
+ * service-data carrier outside Trusted-only mode, a nickname for the scan response (architecture §5.1, spec changes
+ * S10, S11, N4).
  *
- * Platform APIs take structured fields, so each part is offered separately: [serviceUuid16] / [companyId], the
- * [carrierPayload] and the [scanResponsePayload] (same framing). [advertisingData] and [scanResponseData] are the
- * complete on-air bytes, used for size accounting and by stacks that take raw bytes.
+ * Platform APIs take structured fields, so each part is offered separately. Advertising data: [carrierPayload] as
+ * service data under [serviceUuid16] ([BeaconCarrier.SERVICE_DATA], plus [serviceUuid16] in the service UUID list)
+ * or as manufacturer data under [companyId] ([BeaconCarrier.MANUFACTURER_DATA]). Scan response:
+ * [scanResponseManufacturerData] as manufacturer data under [companyId], never as service data, because scanners
+ * that key service data by UUID would let it replace the beacon body. [advertisingData] and [scanResponseData] are
+ * the complete on-air bytes, used for size accounting and by stacks that take raw bytes.
  *
  * N4: the advertisement is valid until [validUntilMillis], the next epoch boundary; the platform then builds a new
  * one and restarts its advertising set, so the OS-level address rotates together with the ephemeral ID.
@@ -41,7 +45,10 @@ data class LocalBeaconState(
 class BeaconAdvertisement(
     val carrier: BeaconCarrier,
     val body: BeaconBody,
-    /** Sanitised nickname for the scan response; null when none is advertised (Trusted-only, N4). */
+    /**
+     * This device's sanitised nickname; null in Trusted-only mode (N4). Only the service-data carrier sends it in a
+     * scan response; with the manufacturer-data carrier it travels over mDNS only.
+     */
     val nickname: String?,
     val validUntilMillis: Long,
 ) {
@@ -59,14 +66,20 @@ class BeaconAdvertisement(
     /** Service data after the UUID, or manufacturer data after the company identifier. */
     fun carrierPayload(): ByteArray = BeaconAdvertisements.carrierPayload(body, carrier)
 
-    /** The nickname record for the scan response under the same carrier, or null. */
-    fun scanResponsePayload(): ByteArray? = nickname?.let { BeaconAdvertisements.nicknamePayload(it, carrier) }
+    /** Whether the platform sends a scan response: only the service-data carrier with a nickname does. */
+    val hasScanResponse: Boolean get() = carrier == BeaconCarrier.SERVICE_DATA && nickname != null
+
+    /**
+     * The scan-response manufacturer data after [companyId] (marker ‖ nickname record), or null when no scan
+     * response is sent ([hasScanResponse]).
+     */
+    fun scanResponseManufacturerData(): ByteArray? = if (hasScanResponse) BeaconAdvertisements.nicknamePayload(nickname!!) else null
 
     /** Complete legacy advertising data (≤ 31 bytes). */
     fun advertisingData(): ByteArray = BeaconAdvertisements.advertisingData(body, carrier)
 
-    /** Complete scan response data (≤ 31 bytes), or null when no nickname is advertised. */
-    fun scanResponseData(): ByteArray? = nickname?.let { BeaconAdvertisements.scanResponseData(it, carrier) }
+    /** Complete scan response data (≤ 31 bytes), or null when no scan response is sent ([hasScanResponse]). */
+    fun scanResponseData(): ByteArray? = if (hasScanResponse) BeaconAdvertisements.scanResponseData(nickname!!) else null
 
     override fun toString(): String = "BeaconAdvertisement($carrier, $body, nickname=$nickname, validUntil=$validUntilMillis)"
 
@@ -75,7 +88,8 @@ class BeaconAdvertisement(
          * Builds this device's advertisement for the epoch containing [nowMillis].
          *
          * Visibility rules (F‑A5, N4):
-         * - [Visibility.HIDDEN] never advertises: this is a programming error (`IllegalArgumentException`).
+         * - [Visibility.HIDDEN] never advertises and [DevicePlatform.UNKNOWN] is never sent: both are programming errors
+         *   (`IllegalArgumentException`).
          * - [Visibility.TRUSTED_ONLY]: no nickname (no scan response), network hint zeroed with
          *   [Capabilities.Flag.CONNECTED_TO_WIFI] and [Capabilities.Flag.STATION_ON_5GHZ] cleared, and no Classic
          *   address (a permanent MAC would link every epoch). Only trusted peers can resolve the ephemeral ID.
@@ -92,6 +106,7 @@ class BeaconAdvertisement(
             nowMillis: Long,
         ): BeaconAdvertisement {
             require(state.visibility != Visibility.HIDDEN) { "a HIDDEN device never advertises (F-A5)" }
+            require(state.platform.isKnown) { "a device never advertises an unknown platform" }
             val trustedOnly = state.visibility == Visibility.TRUSTED_ONLY
             val hint = if (trustedOnly) NetworkHint.NONE else state.networkHint
             val capabilities =
@@ -149,7 +164,7 @@ class BeaconSighting(
         ): BeaconSighting? {
             val parsed = BeaconAdvertisements.parse(record) ?: return null
             return BeaconSighting(
-                body = parsed.body.encode(),
+                body = parsed.bodyBytes,
                 carrier = parsed.carrier,
                 localName = parsed.nickname,
                 rssiDbm = rssiDbm,

@@ -14,18 +14,25 @@ package com.constrivo.drop.core.discovery
  * | 9 | 4 | [networkHint]: bytes 0–3 of the digest, in order (N6); zero when not connected |
  * | 13 | 1 | bits 7–6 [visibility] code, bits 5–3 [platform] code, bits 2–0 reserved (sent as 0, ignored) |
  * | 14 | 6 | optional [classicAddress], display order (`AA:BB:…` → `AA BB …`) |
+ * | 20 | … | fields of later minor versions (none in v1) |
  *
  * Versioning: the first byte of every drop record says what it is. `0x01`–`0x0F` are beacon bodies sharing this
- * layout: a v1 body must be exactly 14 or 20 bytes, while a later minor version (`0x02`–`0x0F`) may append fields,
- * so decoding reads bytes 0–13 and ignores the rest (including anything at offset 14). `0x10`–`0x7F` are reserved
- * for incompatible layouts ([UnsupportedBeaconVersionException]); `0x00` is invalid; `0x80`–`0xFF` are auxiliary
- * records such as the scan-response nickname, never beacon bodies.
+ * layout: a v1 body is exactly 14 or 20 bytes. A later minor version (`0x02`–`0x0F`) keeps bytes 0–19 as they are
+ * here and may only append fields from offset 20: it is 14 bytes, or at least 20 with bytes 14–19 holding the Classic
+ * address (six zero bytes when it has none). Decoding reads bytes 0–19 and ignores anything after them, so a v1
+ * scanner still sees a newer desktop's Classic address (S10). `0x10`–`0x7F` are reserved for incompatible layouts
+ * ([UnsupportedBeaconVersionException]); `0x00` is invalid; `0x80`–`0xFF` are auxiliary records such as the
+ * scan-response nickname, never beacon bodies.
+ *
+ * Platform codes are decoded leniently: a code this build does not know (4–7) reads as [DevicePlatform.UNKNOWN], in
+ * every compatible version, so a platform added later stays visible to older scanners. [encode] refuses
+ * [DevicePlatform.UNKNOWN].
  *
  * Invariants, checked on construction (as `IllegalArgumentException`) and on decoding (as
  * [DiscoveryFormatException]): [visibility] is never [Visibility.HIDDEN] (a hidden device does not advertise, F‑A5);
  * [Capabilities.Flag.CONNECTED_TO_WIFI] is set exactly when [networkHint] is non-zero; [Capabilities.Flag.STATION_ON_5GHZ]
- * implies [Capabilities.Flag.CONNECTED_TO_WIFI]; a [classicAddress] is [BluetoothAddress.isUsable]. A received v1
- * body with an all-zero (or otherwise unusable) address is read as having none: S10 lets phones send zeros there.
+ * implies [Capabilities.Flag.CONNECTED_TO_WIFI]; a [classicAddress] is [BluetoothAddress.isUsable]. A received body
+ * with an all-zero (or otherwise unusable) address is read as having none: S10 lets phones send zeros there.
  */
 data class BeaconBody(
     val ephemeralId: EphemeralId,
@@ -36,7 +43,7 @@ data class BeaconBody(
     val classicAddress: BluetoothAddress? = null,
 ) {
     init {
-        problem(capabilities, networkHint, visibility, platform, classicAddress)?.let {
+        problem(capabilities, networkHint, visibility, classicAddress)?.let {
             throw IllegalArgumentException(it)
         }
     }
@@ -44,8 +51,13 @@ data class BeaconBody(
     /** 14, or 20 with a [classicAddress]. */
     val encodedSize: Int get() = if (classicAddress == null) SIZE else SIZE_WITH_CLASSIC_ADDRESS
 
-    /** The version-1 wire form. */
+    /**
+     * The version-1 wire form.
+     *
+     * @throws IllegalArgumentException for [DevicePlatform.UNKNOWN], which only ever comes from decoding.
+     */
     fun encode(): ByteArray {
+        require(platform.isKnown) { "a beacon never advertises an unknown platform" }
         val out = ByteArray(encodedSize)
         out[0] = VERSION.toByte()
         Bytes.writeBigEndian(ephemeralId.value, out, 1, EphemeralId.SIZE)
@@ -71,8 +83,6 @@ data class BeaconBody(
         /** First byte values at or above this mark auxiliary records (for example the scan-response nickname). */
         internal const val AUXILIARY_RECORD_MIN: Int = 0x80
 
-        private const val MAX_PLATFORM_CODE = 7
-
         /**
          * Decodes a body.
          *
@@ -91,8 +101,10 @@ data class BeaconBody(
                 if (bytes.size != SIZE && bytes.size != SIZE_WITH_CLASSIC_ADDRESS) {
                     throw DiscoveryFormatException("a v1 beacon body is $SIZE or $SIZE_WITH_CLASSIC_ADDRESS bytes, was ${bytes.size}")
                 }
-            } else if (bytes.size < SIZE) {
-                throw DiscoveryFormatException("beacon body v$version is shorter than $SIZE bytes (${bytes.size})")
+            } else if (bytes.size != SIZE && bytes.size < SIZE_WITH_CLASSIC_ADDRESS) {
+                throw DiscoveryFormatException(
+                    "a v$version beacon body is $SIZE or at least $SIZE_WITH_CLASSIC_ADDRESS bytes, was ${bytes.size}",
+                )
             }
             val ephemeralId = EphemeralId.fromBytes(bytes, 1)
             val capabilities = Capabilities(Bytes.readBigEndian(bytes, 7, 2).toInt())
@@ -100,16 +112,14 @@ data class BeaconBody(
             val packed = bytes[13].toInt() and 0xFF
             // Two bits always map to a defined visibility; HIDDEN is rejected by the invariant check below.
             val visibility = Visibility.fromCode(packed ushr 6) ?: throw DiscoveryFormatException("bad visibility")
-            val platform =
-                DevicePlatform.fromCode((packed ushr 3) and 0x07)
-                    ?: throw DiscoveryFormatException("unknown platform code ${(packed ushr 3) and 0x07}")
+            val platform = DevicePlatform.fromCode((packed ushr 3) and DevicePlatform.MAX_CODE)
             val classicAddress =
-                if (version == VERSION && bytes.size == SIZE_WITH_CLASSIC_ADDRESS) {
+                if (bytes.size >= SIZE_WITH_CLASSIC_ADDRESS) {
                     BluetoothAddress.fromBytes(bytes, SIZE).takeIf { it.isUsable }
                 } else {
                     null
                 }
-            problem(capabilities, networkHint, visibility, platform, classicAddress)?.let {
+            problem(capabilities, networkHint, visibility, classicAddress)?.let {
                 throw DiscoveryFormatException(it)
             }
             return BeaconBody(ephemeralId, capabilities, networkHint, visibility, platform, classicAddress)
@@ -119,7 +129,6 @@ data class BeaconBody(
             capabilities: Capabilities,
             networkHint: NetworkHint,
             visibility: Visibility,
-            platform: DevicePlatform,
             classicAddress: BluetoothAddress?,
         ): String? =
             when {
@@ -137,10 +146,6 @@ data class BeaconBody(
 
                 classicAddress != null && !classicAddress.isUsable -> {
                     "unusable Classic address $classicAddress"
-                }
-
-                platform.code !in 0..MAX_PLATFORM_CODE -> {
-                    "platform code ${platform.code} does not fit 3 bits"
                 }
 
                 else -> {

@@ -6,6 +6,7 @@ import com.constrivo.drop.core.discovery.Secrets.EPOCH_START
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
 import kotlin.time.TimeSource
@@ -70,9 +71,39 @@ class EphemeralIdResolverTest {
     @Test
     fun ownBeaconIsRecognised() {
         val own = Secrets.secret(500)
-        val resolver = EphemeralIdResolver(crypto, peers, own)
+        val resolver = EphemeralIdResolver(crypto, peers, listOf(own))
         assertEquals(EphemeralIdResolution.Own, resolver.resolve(EphemeralIds.derive(crypto, own, EPOCH), EPOCH_START))
         assertEquals(EphemeralIdResolution.Own, resolver.resolve(EphemeralIds.derive(crypto, own, EPOCH + 1), EPOCH_START))
+    }
+
+    @Test
+    fun s3_everyGenerationOfAPeersSecretResolvesToThatPeer() {
+        // After a rotation the peer may still advertise with its previous k_adv until the new one is re-shared.
+        val current = Secrets.secret(40)
+        val previous = Secrets.secret(41)
+        val peer = TrustedPeer("bob", current, "Bob", previousAdvertisingSecrets = listOf(previous))
+        val resolver = EphemeralIdResolver(crypto, listOf(peer, TrustedPeer("carol", Secrets.secret(42))))
+        for (secret in listOf(current, previous)) {
+            val r = assertIs<EphemeralIdResolution.Trusted>(resolver.resolve(EphemeralIds.derive(crypto, secret, EPOCH), EPOCH_START))
+            assertEquals("bob", r.peer.deviceId)
+        }
+        // Several own generations are all recognised as our own echo.
+        val own = listOf(Secrets.secret(50), Secrets.secret(51))
+        val withOwn = EphemeralIdResolver(crypto, listOf(peer), own)
+        for (secret in own) {
+            assertEquals(EphemeralIdResolution.Own, withOwn.resolve(EphemeralIds.derive(crypto, secret, EPOCH), EPOCH_START))
+        }
+    }
+
+    @Test
+    fun trustStatesCompareByContent() {
+        val a = TrustState(listOf(Secrets.secret(1)), listOf(TrustedPeer("p", Secrets.secret(2), "P")))
+        val b = TrustState(listOf(Secrets.secret(1)), listOf(TrustedPeer("p", Secrets.secret(2), "P")))
+        assertTrue(a.sameAs(b))
+        assertFalse(a.sameAs(TrustState(listOf(Secrets.secret(3)), a.peers)))
+        assertFalse(a.sameAs(TrustState(listOf(Secrets.secret(1)), listOf(TrustedPeer("p", Secrets.secret(4), "P")))))
+        assertFalse(a.sameAs(TrustState(listOf(Secrets.secret(1)), listOf(TrustedPeer("p", Secrets.secret(2), "Renamed")))))
+        assertEquals("TrustState(own=1, peers=1)", a.toString(), "no secret is printed")
     }
 
     @Test
@@ -83,7 +114,7 @@ class EphemeralIdResolverTest {
         val id = EphemeralId.fromBytes(ByteArray(6) { 0x11 })
         assertEquals(EphemeralIdResolution.Unknown, twoPeers.resolve(id, EPOCH_START))
         // With our own secret in the mix, the conservative answer is "own" (never show ourselves).
-        val withOwn = EphemeralIdResolver(colliding, listOf(TrustedPeer("a", Secrets.secret(1))), Secrets.secret(9))
+        val withOwn = EphemeralIdResolver(colliding, listOf(TrustedPeer("a", Secrets.secret(1))), listOf(Secrets.secret(9)))
         assertEquals(EphemeralIdResolution.Own, withOwn.resolve(id, EPOCH_START))
         // A single peer whose IDs coincide across epochs is still that peer.
         val single = EphemeralIdResolver(colliding, listOf(TrustedPeer("a", Secrets.secret(1))))
@@ -97,7 +128,9 @@ class EphemeralIdResolverTest {
         assertFailsWith<IllegalArgumentException> {
             EphemeralIdResolver(crypto, listOf(TrustedPeer("x", Secrets.secret(1)), TrustedPeer("x", Secrets.secret(2))))
         }
-        assertFailsWith<IllegalArgumentException> { EphemeralIdResolver(crypto, emptyList(), ByteArray(5)) }
+        assertFailsWith<IllegalArgumentException> { EphemeralIdResolver(crypto, emptyList(), listOf(ByteArray(5))) }
+        assertFailsWith<IllegalArgumentException> { TrustedPeer("x", Secrets.secret(1), previousAdvertisingSecrets = listOf(ByteArray(3))) }
+        assertFailsWith<IllegalArgumentException> { TrustState(ownAdvertisingSecrets = listOf(ByteArray(31))) }
         assertEquals("TrustedPeer(x)", TrustedPeer("x", Secrets.secret(1)).toString(), "the secret is never printed")
         // The peer keeps its own copy of the secret.
         val secret = Secrets.secret(3)
@@ -110,7 +143,7 @@ class EphemeralIdResolverTest {
     @Test
     fun resolutionIsATableLookupWithinBudgetFor100Peers() {
         val counting = CountingCrypto()
-        val resolver = EphemeralIdResolver(counting, peers, Secrets.secret(999))
+        val resolver = EphemeralIdResolver(counting, peers, listOf(Secrets.secret(999)))
         resolver.precompute(EPOCH_START)
         assertEquals(3 * 101, counting.hmacCalls, "three epochs × (100 peers + own)")
         val sightings = (0 until 10_000).map { i -> idOf(1 + i % 120, EPOCH + (i % 3) - 1) }

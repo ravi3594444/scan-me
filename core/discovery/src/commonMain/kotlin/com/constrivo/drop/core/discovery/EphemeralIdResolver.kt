@@ -7,27 +7,78 @@ import kotlin.concurrent.Volatile
  * A trusted peer as beacon resolution sees it: its device ID (hex of `device_id`, as stored in the `device` table,
  * architecture §12) and the advertising secret `k_adv` it shared with us in the encrypted handshake (spec change S3).
  *
+ * [previousAdvertisingSecrets] are older generations of the peer's `k_adv` that it may still advertise with: after
+ * the peer rotates `k_adv` ("Forget", §5.3) it keeps advertising IDs of the old one for a grace period, so keeping
+ * the previous generation here leaves no gap in recognition while the new one is re-shared.
+ *
  * [nickname] is the name stored when the peer was trusted. The radar prefers it over any name heard over the air,
  * because scan responses and TXT records are unauthenticated and a replayed beacon could carry a false name.
- * [toString] never prints the secret.
+ * [toString] never prints the secrets.
  */
 class TrustedPeer(
     val deviceId: String,
     advertisingSecret: ByteArray,
     val nickname: String? = null,
+    previousAdvertisingSecrets: Collection<ByteArray> = emptyList(),
 ) {
-    internal val secret: ByteArray
+    /** The current `k_adv` first, then the previous generations. */
+    internal val secrets: List<ByteArray>
 
     init {
         require(deviceId.isNotBlank()) { "deviceId must not be blank" }
-        require(advertisingSecret.size == EphemeralIds.ADVERTISING_SECRET_SIZE) {
-            "k_adv must be ${EphemeralIds.ADVERTISING_SECRET_SIZE} bytes, was ${advertisingSecret.size}"
+        val all = listOf(advertisingSecret) + previousAdvertisingSecrets
+        for (secret in all) {
+            require(secret.size == EphemeralIds.ADVERTISING_SECRET_SIZE) {
+                "k_adv must be ${EphemeralIds.ADVERTISING_SECRET_SIZE} bytes, was ${secret.size}"
+            }
         }
-        secret = advertisingSecret.copyOf()
+        secrets = all.map { it.copyOf() }
     }
+
+    /** Same device, name and secrets. */
+    internal fun sameAs(other: TrustedPeer): Boolean =
+        deviceId == other.deviceId && nickname == other.nickname && sameSecrets(secrets, other.secrets)
 
     override fun toString(): String = "TrustedPeer($deviceId)"
 }
+
+/**
+ * Everything the radar needs to know about trust (S3), delivered as one reactive value so that a change of either
+ * part reaches [NearbyDevices] at once.
+ *
+ * @param ownAdvertisingSecrets this device's own `k_adv`, current first, plus any previous generation it may still be
+ *   advertising with, so its own beacon and mDNS record never appear on its radar. When a secret disappears from this
+ *   list (rotation on "Forget" or "Reset identity"), [NearbyDeviceTracker] keeps recognising it for
+ *   [NearbyConfig.ownSecretRetentionMillis] (two epochs), because echoes of the last advertisement can still arrive.
+ * @param peers the trusted peers; should a device ID appear twice, its first entry wins.
+ */
+class TrustState(
+    ownAdvertisingSecrets: Collection<ByteArray> = emptyList(),
+    peers: Collection<TrustedPeer> = emptyList(),
+) {
+    internal val ownSecrets: List<ByteArray>
+    val peers: List<TrustedPeer> = peers.toList()
+
+    init {
+        for (secret in ownAdvertisingSecrets) {
+            require(secret.size == EphemeralIds.ADVERTISING_SECRET_SIZE) { "own k_adv must be 32 bytes, was ${secret.size}" }
+        }
+        ownSecrets = ownAdvertisingSecrets.map { it.copyOf() }
+    }
+
+    /** Same own secrets and same peers, in the same order. */
+    internal fun sameAs(other: TrustState): Boolean =
+        sameSecrets(ownSecrets, other.ownSecrets) &&
+            peers.size == other.peers.size &&
+            peers.indices.all { peers[it].sameAs(other.peers[it]) }
+
+    override fun toString(): String = "TrustState(own=${ownSecrets.size}, peers=${peers.size})"
+}
+
+private fun sameSecrets(
+    a: List<ByteArray>,
+    b: List<ByteArray>,
+): Boolean = a.size == b.size && a.indices.all { a[it].contentEquals(b[it]) }
 
 /** What an [EphemeralId] heard over the air belongs to. */
 sealed interface EphemeralIdResolution {
@@ -54,20 +105,23 @@ sealed interface EphemeralIdResolution {
  * At a rotation only the new neighbour epoch is computed; tables more than two epochs from the latest sighting are
  * evicted. A backwards clock step simply computes the older tables again.
  *
+ * Every generation of a peer's secret (its current and previous `k_adv`) resolves to that peer, and every
+ * own secret to [EphemeralIdResolution.Own].
+ *
  * An instance is immutable with respect to its peer set: build a new one when trust changes (pairing, "Forget",
  * a re-shared `k_adv`). It is safe to call from several threads; concurrent callers may at worst compute the same
  * table twice.
  *
- * @param ownAdvertisingSecret this device's `k_adv`, so its own beacon heard back resolves to
+ * @param ownAdvertisingSecrets this device's `k_adv` generations, so its own beacon heard back resolves to
  *   [EphemeralIdResolution.Own] instead of showing up as a stranger.
  */
 class EphemeralIdResolver(
     private val crypto: CryptoProvider,
     peers: Collection<TrustedPeer>,
-    ownAdvertisingSecret: ByteArray? = null,
+    ownAdvertisingSecrets: Collection<ByteArray> = emptyList(),
 ) {
     private val peers: List<TrustedPeer> = peers.toList()
-    private val own: ByteArray? = ownAdvertisingSecret?.copyOf()
+    private val own: List<ByteArray> = ownAdvertisingSecrets.map { it.copyOf() }
 
     @Volatile
     private var tables: Map<Long, Map<Long, Int>> = emptyMap()
@@ -75,9 +129,7 @@ class EphemeralIdResolver(
     init {
         val ids = HashSet<String>()
         for (p in this.peers) require(ids.add(p.deviceId)) { "duplicate trusted peer ${p.deviceId}" }
-        if (own != null) {
-            require(own.size == EphemeralIds.ADVERTISING_SECRET_SIZE) { "own k_adv must be 32 bytes" }
-        }
+        for (secret in own) require(secret.size == EphemeralIds.ADVERTISING_SECRET_SIZE) { "own k_adv must be 32 bytes" }
     }
 
     /** Number of trusted peers this resolver checks. */
@@ -138,17 +190,19 @@ class EphemeralIdResolver(
 
     private fun buildTable(epoch: Long): Map<Long, Int> {
         if (epoch < 0) return emptyMap()
-        val table = HashMap<Long, Int>(peers.size * 2 + 2)
-        if (own != null) table[EphemeralIds.derive(crypto, own, epoch).value] = OWN
+        val table = HashMap<Long, Int>(peers.size * 2 + own.size * 2 + 2)
+        for (secret in own) table[EphemeralIds.derive(crypto, secret, epoch).value] = OWN
         for (i in peers.indices) {
-            val key = EphemeralIds.derive(crypto, peers[i].secret, epoch).value
-            val existing = table[key]
-            table[key] =
-                when {
-                    existing == null -> i
-                    existing == OWN -> OWN
-                    else -> AMBIGUOUS
-                }
+            for (secret in peers[i].secrets) {
+                val key = EphemeralIds.derive(crypto, secret, epoch).value
+                val existing = table[key]
+                table[key] =
+                    when {
+                        existing == null || existing == i -> i
+                        existing == OWN -> OWN
+                        else -> AMBIGUOUS
+                    }
+            }
         }
         return table
     }

@@ -8,9 +8,19 @@ import kotlin.jvm.JvmInline
  *
  * All-zero ([NONE]) means "not connected to a Wi‑Fi network, or nothing to derive a hint from". A non-zero hint
  * always comes with capability bit [Capabilities.Flag.CONNECTED_TO_WIFI] and vice versa (§5.2 bit 11).
- * Equal hints on two devices suggest a shared LAN; the ladder still treats mDNS reachability as the real test
- * (N6), because a hint can differ on one network (for example one device without IPv6) and, being 32 bits, can
- * collide across networks.
+ *
+ * The hint is a weak prior, never evidence, in both directions:
+ * - Equal hints do not mean a shared network. On an IPv4-only network the input is just the gateway and DHCP server
+ *   addresses, so every network on the same factory default (`192.168.1.1`, `192.168.0.1`, `10.0.0.1`) and every
+ *   Android or iPhone hotspot (`192.168.43.1`, `172.20.10.1`) gives the same hint. Collisions are systematic, not
+ *   1 in 2³².
+ * - Different hints do not mean different networks: two devices on one LAN disagree when one of them lacks IPv6, has
+ *   not learnt the DHCP server address, or lists a different gateway.
+ *
+ * So the transport ladder (WP5) may use it only to order its attempts; whether two devices share a LAN is decided by
+ * mDNS reachability (N6). Per-network entropy that needs no location permission would reduce the collisions (the
+ * DHCP domain, the router's IPv6 link-local address, which already enters as a gateway when IPv6 is present) but not
+ * the disagreements, so the derivation stays as it is.
  */
 @JvmInline
 value class NetworkHint(

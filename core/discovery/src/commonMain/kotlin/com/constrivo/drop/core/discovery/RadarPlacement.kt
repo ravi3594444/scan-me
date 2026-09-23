@@ -126,8 +126,11 @@ data class RadarLayout(
  * 3. Repulsion: on each ring bubbles are spread along the arc to at least [RadarGeometry.minCenterDistanceDp]
  *    centre to centre, moving them as little as possible (least squares, solved exactly by pool-adjacent-violators)
  *    while keeping their angular order. When rings are closer together than the minimum distance (viewports whose
- *    shorter side is under about 288 dp), bubbles on neighbouring rings are separated too, by solving the same
- *    least-squares problem over all bubbles at once; only a layout that cannot fit is best effort.
+ *    shorter side is under about 288 dp, such as split screen or a narrow desktop window), bubbles on neighbouring
+ *    rings are separated too, by solving the same least-squares problem over all bubbles at once.
+ * 4. When that joint problem has no solution, bubbles spill instead of overlapping: the outer ring collapses into
+ *    "+N more" first, then the lowest-priority remaining bubble joins it, one at a time, until the layout fits. So
+ *    every returned layout keeps the minimum distance between all bubbles, the "+N more" one included.
  *
  * mDNS-only devices have no RSSI and are passed in on [Ring.MIDDLE] (design §3.2).
  */
@@ -166,7 +169,7 @@ object RadarPlacement {
     ): RadarLayout {
         require(items.map { it.key }.toSet().size == items.size) { "radar items must have distinct keys" }
         val byRing = Ring.entries.associateWith { ring -> items.filter { it.ring == ring }.sortedBy { it.key } }
-        val kept = HashMap<Ring, List<RadarItem>>()
+        val kept = HashMap<Ring, MutableList<RadarItem>>()
         val spilled = ArrayList<RadarItem>()
         var collapse = items.size > geometry.maxBubbles
         for (ring in listOf(Ring.INNER, Ring.MIDDLE)) {
@@ -174,19 +177,43 @@ object RadarPlacement {
             val capacity = capacity(geometry, ring)
             if (members.size > capacity) {
                 val ranked = members.sortedWith(PRIORITY)
-                kept[ring] = ranked.take(capacity)
+                kept[ring] = ranked.take(capacity).toMutableList()
                 spilled += ranked.drop(capacity)
                 collapse = true
             } else {
-                kept[ring] = members
+                kept[ring] = members.toMutableList()
             }
         }
         val outer = byRing.getValue(Ring.OUTER)
         if (!collapse && outer.size > capacity(geometry, Ring.OUTER)) collapse = true
         if (collapse) spilled += outer
-        kept[Ring.OUTER] = if (collapse) emptyList() else outer
+        kept[Ring.OUTER] = if (collapse) mutableListOf() else outer.toMutableList()
 
-        // Angles to solve, per ring: key → target angle.
+        while (true) {
+            val slots = slotsFor(kept, spilled.isNotEmpty(), geometry)
+            for (ring in Ring.entries) projectRing(slots, ring, geometry)
+            if (solveAcrossRings(slots, geometry)) return toLayout(slots, spilled, geometry)
+            // The rings are too close for these bubbles: collapse the outer ring, then spill by priority.
+            if (!collapse) {
+                collapse = true
+                spilled += kept.getValue(Ring.OUTER)
+                kept.getValue(Ring.OUTER).clear()
+                continue
+            }
+            val victim =
+                (kept.getValue(Ring.INNER) + kept.getValue(Ring.MIDDLE)).sortedWith(PRIORITY).lastOrNull()
+                    ?: return toLayout(slots, spilled, geometry)
+            kept.getValue(victim.ring).remove(victim)
+            spilled += victim
+        }
+    }
+
+    /** One slot per kept item at its hash angle on its ring's arc, plus the "+N more" slot at the end of the outer arc. */
+    private fun slotsFor(
+        kept: Map<Ring, List<RadarItem>>,
+        withOverflow: Boolean,
+        geometry: RadarGeometry,
+    ): List<Slot> {
         val slots = ArrayList<Slot>()
         for (ring in Ring.entries) {
             val g = geometry.ring(ring)
@@ -194,10 +221,15 @@ object RadarPlacement {
                 slots += Slot(item.key, ring, g.arcStartDegrees + stableAngleDegrees(item.key) / 360.0 * g.arcWidthDegrees)
             }
         }
-        if (spilled.isNotEmpty()) slots += Slot(OVERFLOW_KEY, Ring.OUTER, geometry.outer.arcEndDegrees)
-        for (ring in Ring.entries) projectRing(slots, ring, geometry)
-        solveAcrossRings(slots, geometry)
+        if (withOverflow) slots += Slot(OVERFLOW_KEY, Ring.OUTER, geometry.outer.arcEndDegrees)
+        return slots
+    }
 
+    private fun toLayout(
+        slots: List<Slot>,
+        spilled: List<RadarItem>,
+        geometry: RadarGeometry,
+    ): RadarLayout {
         val bubbles =
             slots
                 .filter { it.key != OVERFLOW_KEY }
@@ -308,13 +340,15 @@ object RadarPlacement {
      * subject to every pairwise separation and the arc bounds, by Hildreth's dual coordinate ascent (which converges
      * to the optimum of this convex problem), followed by one exact repair pass that removes the solver's residual.
      * Whether the layout fits at all is known beforehand from the earliest and latest feasible angle of each bubble
-     * (longest paths through the ordered constraints); a layout that cannot fit (only on tiny viewports) skips the
-     * solver and gets the repair pass alone, clamped to the arcs: best effort.
+     * (longest paths through the ordered constraints).
+     *
+     * @return false, leaving the angles alone, when the layout cannot fit (only on small viewports): the caller then
+     *   spills a bubble and tries again.
      */
     private fun solveAcrossRings(
         slots: List<Slot>,
         geometry: RadarGeometry,
-    ) {
+    ): Boolean {
         val order = slots.sortedWith(compareBy<Slot> { it.target }.thenBy { it.key })
         val n = order.size
         val pairI = ArrayList<Int>()
@@ -335,7 +369,7 @@ object RadarPlacement {
                 pairGap += g
             }
         }
-        if (!crossRing) return
+        if (!crossRing) return true
         val lower = DoubleArray(n)
         val upper = DoubleArray(n)
         for (i in 0 until n) {
@@ -349,8 +383,9 @@ object RadarPlacement {
         val latest = upper.copyOf()
         for (k in pairGap.indices.reversed()) latest[pairI[k]] = minOf(latest[pairI[k]], latest[pairJ[k]] - pairGap[k])
         val fits = (0 until n).all { earliest[it] <= latest[it] + EPSILON }
-        val x = DoubleArray(n) { if (fits) order[it].target else order[it].angle }
-        if (fits) hildreth(x, lower, upper, pairI, pairJ, pairGap)
+        if (!fits) return false
+        val x = DoubleArray(n) { order[it].target }
+        hildreth(x, lower, upper, pairI, pairJ, pairGap)
         // Repair: push each bubble just past its predecessors, never beyond its latest feasible angle.
         for (j in 0 until n) x[j] = minOf(latest[j], maxOf(x[j], earliest[j]))
         for (k in pairGap.indices) {
@@ -358,6 +393,7 @@ object RadarPlacement {
             x[j] = minOf(latest[j], maxOf(x[j], x[pairI[k]] + pairGap[k]))
         }
         for (i in 0 until n) order[i].angle = x[i].coerceIn(lower[i], upper[i])
+        return true
     }
 
     /** Hildreth's method for `min ½‖x − target‖²` subject to `x[j] − x[i] ≥ gap` and `lower ≤ x ≤ upper`, in place. */

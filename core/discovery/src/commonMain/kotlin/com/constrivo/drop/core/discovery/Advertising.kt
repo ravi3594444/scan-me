@@ -54,17 +54,11 @@ object AdvertisingFormat {
     /** Drop record type of a nickname shortened to fit the scan response. */
     const val RECORD_NICKNAME_SHORTENED: Int = 0x82
 
-    /** Room for nickname bytes in a service-data scan response: 31 − (length, type, UUID, record type). */
-    const val MAX_NICKNAME_BYTES_SERVICE_DATA: Int = LEGACY_PAYLOAD_MAX - 5
-
-    /** Room for nickname bytes in a manufacturer-data scan response: 31 − (length, type, company, marker, record type). */
-    const val MAX_NICKNAME_BYTES_MANUFACTURER_DATA: Int = LEGACY_PAYLOAD_MAX - 7
-
-    fun maxNicknameBytes(carrier: BeaconCarrier): Int =
-        when (carrier) {
-            BeaconCarrier.SERVICE_DATA -> MAX_NICKNAME_BYTES_SERVICE_DATA
-            BeaconCarrier.MANUFACTURER_DATA -> MAX_NICKNAME_BYTES_MANUFACTURER_DATA
-        }
+    /**
+     * Room for nickname bytes in the scan response, which carries the name as manufacturer data:
+     * 31 − (length, type, company identifier, marker, record type) = 24.
+     */
+    const val MAX_NICKNAME_BYTES: Int = LEGACY_PAYLOAD_MAX - 7
 }
 
 /**
@@ -115,6 +109,10 @@ sealed interface DropRecord {
          * For scanners that hand over service data per UUID (BlueZ `ServiceData`, CoreBluetooth
          * `kCBAdvDataServiceData`): [payload] is the data after the UUID. Returns null when [uuid16] is not ours.
          *
+         * Such scanners keep one value per UUID, merging advertising data and scan response with the later one
+         * winning, which is why a drop device never sends two records under the same AD key: the beacon body is
+         * service data, the scan-response nickname is manufacturer data ([BeaconAdvertisements]).
+         *
          * @throws DiscoveryFormatException as [decode].
          */
         fun fromServiceData(
@@ -123,9 +121,10 @@ sealed interface DropRecord {
         ): DropRecord? = if (uuid16 == AdvertisingFormat.SERVICE_UUID_16) decode(payload) else null
 
         /**
-         * For scanners that hand over manufacturer data per company (BlueZ `ManufacturerData`, WinRT
-         * `BluetoothLEManufacturerData`): [data] is what follows the company identifier. Returns null when the
-         * company or the marker is not ours.
+         * For scanners that hand over manufacturer data per company (BlueZ `ManufacturerData`, CoreBluetooth
+         * `kCBAdvDataManufacturerData`, WinRT `BluetoothLEManufacturerData`): [data] is what follows the company
+         * identifier. Returns null when the company or the marker is not ours. A phone's scan-response nickname
+         * arrives here; so does a Windows beacon body.
          *
          * @throws DiscoveryFormatException as [decode].
          */
@@ -149,13 +148,40 @@ class AdStructure(
     override fun toString(): String = "AdStructure(type=0x${Bytes.hex(type.toLong(), 2)}, data=${Bytes.hex(data)})"
 }
 
-/** What [BeaconAdvertisements.parse] found in one received advertisement. */
-data class ParsedAdvertisement(
+/**
+ * What [BeaconAdvertisements.parse] found in one received advertisement.
+ *
+ * [bodyBytes] is the drop record exactly as received. It is what a [BeaconSighting] carries: a body of a later minor
+ * version, or with a platform this build does not know, decodes fine but must not be re-encoded
+ * ([DevicePlatform.UNKNOWN] is never sent). Equality ignores it.
+ */
+class ParsedAdvertisement(
     val body: BeaconBody,
     val carrier: BeaconCarrier,
     val nickname: String?,
     val nicknameTruncated: Boolean,
-)
+    bodyBytes: ByteArray,
+) {
+    private val raw = bodyBytes.copyOf()
+
+    val bodyBytes: ByteArray get() = raw.copyOf()
+
+    override fun equals(other: Any?): Boolean =
+        other is ParsedAdvertisement &&
+            body == other.body &&
+            carrier == other.carrier &&
+            nickname == other.nickname &&
+            nicknameTruncated == other.nicknameTruncated
+
+    override fun hashCode(): Int {
+        var h = body.hashCode()
+        h = h * 31 + carrier.hashCode()
+        h = h * 31 + nickname.hashCode()
+        return h * 31 + nicknameTruncated.hashCode()
+    }
+
+    override fun toString(): String = "ParsedAdvertisement($body, $carrier, nickname=$nickname, truncated=$nicknameTruncated)"
+}
 
 /**
  * Builds and parses the complete legacy advertising payloads of both carriers (S11):
@@ -165,11 +191,16 @@ data class ParsedAdvertisement(
  * - [BeaconCarrier.MANUFACTURER_DATA] (Windows): Flags `02 01 06` ‖ Manufacturer Specific `LL FF cc cc 64 72` + body.
  *   23 bytes, or 29 with the Classic address. Windows sets Flags itself; they are included here so the size
  *   accounting matches what goes on air.
- * - Scan response: Service Data `LL 16 uu uu 81|82` + nickname (UTF-8, cut at a code point boundary to at most
- *   26 bytes), or for platforms whose scanners key manufacturer data separately, Manufacturer Specific
- *   `LL FF cc cc 64 72 81|82` + nickname (at most 24 bytes). No 128-bit UUID: with the 16-bit UUID of decision 5 it
- *   is not needed and would not fit next to a useful name. Type `0x82` marks a shortened name.
+ * - Scan response, sent only with the service-data carrier: Manufacturer Specific `LL FF cc cc 64 72 81|82` +
+ *   nickname (UTF-8, cut at a code point boundary to at most 24 bytes; type `0x82` marks a shortened name).
+ *   It must not be service data under our UUID: BlueZ (`Device1.ServiceData`) and CoreBluetooth
+ *   (`kCBAdvDataServiceData`) keep one value per UUID, so the name arriving in the scan response would replace the
+ *   beacon body. Advertising data and scan response therefore never share an AD key. The manufacturer-data carrier
+ *   sends no scan response: its body already uses the company key (and WinRT cannot set a scan response); such
+ *   devices are named over mDNS. No 128-bit UUID: with the 16-bit UUID of decision 5 it is not needed and would not
+ *   fit next to a useful name.
  *
+ * Parsing accepts a nickname record under either key, so it also reads older or foreign encoders.
  * Every built payload is checked to fit [AdvertisingFormat.LEGACY_PAYLOAD_MAX].
  */
 object BeaconAdvertisements {
@@ -187,27 +218,19 @@ object BeaconAdvertisements {
         }
 
     /**
-     * The scan-response record payload for [nickname] (same framing as [carrierPayload]), or null when the
-     * sanitised nickname is empty.
+     * The scan-response nickname as the manufacturer data the platform API takes (marker ‖ record, sent under
+     * [AdvertisingFormat.COMPANY_ID]), or null when the sanitised nickname is empty.
      */
-    fun nicknamePayload(
-        nickname: String,
-        carrier: BeaconCarrier,
-    ): ByteArray? {
+    fun nicknamePayload(nickname: String): ByteArray? {
         val clean = Nicknames.normalize(nickname, Nicknames.MAX_BYTES) ?: return null
-        val cut = Nicknames.truncateUtf8(clean.text, AdvertisingFormat.maxNicknameBytes(carrier)).trimEnd()
-        if (cut.isEmpty()) return null
+        val cut = Nicknames.normalize(clean.text, AdvertisingFormat.MAX_NICKNAME_BYTES) ?: return null
         val type =
-            if (clean.truncated || cut.length != clean.text.length) {
+            if (clean.truncated || cut.truncated) {
                 AdvertisingFormat.RECORD_NICKNAME_SHORTENED
             } else {
                 AdvertisingFormat.RECORD_NICKNAME_COMPLETE
             }
-        val record = byteArrayOf(type.toByte()) + cut.encodeToByteArray()
-        return when (carrier) {
-            BeaconCarrier.SERVICE_DATA -> record
-            BeaconCarrier.MANUFACTURER_DATA -> markerBytes() + record
-        }
+        return markerBytes() + byteArrayOf(type.toByte()) + cut.text.encodeToByteArray()
     }
 
     /** The complete legacy advertising data for [body] on [carrier]. */
@@ -232,17 +255,13 @@ object BeaconAdvertisements {
         return payload
     }
 
-    /** The complete scan response data for [nickname], or null when there is nothing printable to send. */
-    fun scanResponseData(
-        nickname: String,
-        carrier: BeaconCarrier = BeaconCarrier.SERVICE_DATA,
-    ): ByteArray? {
-        val record = nicknamePayload(nickname, carrier) ?: return null
-        val payload =
-            when (carrier) {
-                BeaconCarrier.SERVICE_DATA -> structure(AdvertisingFormat.AD_TYPE_SERVICE_DATA_16BIT, uuidBytes() + record)
-                BeaconCarrier.MANUFACTURER_DATA -> structure(AdvertisingFormat.AD_TYPE_MANUFACTURER_DATA, companyBytes() + record)
-            }
+    /**
+     * The complete scan response data for [nickname] (one Manufacturer Specific AD), or null when there is nothing
+     * printable to send. Only the service-data carrier sends it (see [BeaconAdvertisement.scanResponseData]).
+     */
+    fun scanResponseData(nickname: String): ByteArray? {
+        val record = nicknamePayload(nickname) ?: return null
+        val payload = structure(AdvertisingFormat.AD_TYPE_MANUFACTURER_DATA, companyBytes() + record)
         checkFits(payload, "scan response")
         return payload
     }
@@ -283,32 +302,38 @@ object BeaconAdvertisements {
      */
     fun parse(record: ByteArray): ParsedAdvertisement? {
         var body: BeaconBody? = null
+        var bodyBytes: ByteArray? = null
         var carrier: BeaconCarrier? = null
         var nickname: DropRecord.Nickname? = null
         for (s in parseStructures(record)) {
-            val (decoded, via) =
-                when (s.type) {
-                    AdvertisingFormat.AD_TYPE_SERVICE_DATA_16BIT -> {
-                        if (s.data.size < 2) continue
-                        (DropRecord.fromServiceData(le16(s.data), s.data.copyOfRange(2, s.data.size)) ?: continue) to
-                            BeaconCarrier.SERVICE_DATA
-                    }
-
-                    AdvertisingFormat.AD_TYPE_MANUFACTURER_DATA -> {
-                        if (s.data.size < 2) continue
-                        (DropRecord.fromManufacturerData(le16(s.data), s.data.copyOfRange(2, s.data.size)) ?: continue) to
-                            BeaconCarrier.MANUFACTURER_DATA
-                    }
-
-                    else -> {
-                        continue
-                    }
+            if (s.data.size < 2) continue
+            val key = le16(s.data)
+            val payload: ByteArray
+            val via: BeaconCarrier
+            when (s.type) {
+                AdvertisingFormat.AD_TYPE_SERVICE_DATA_16BIT -> {
+                    if (key != AdvertisingFormat.SERVICE_UUID_16) continue
+                    payload = s.data.copyOfRange(2, s.data.size)
+                    via = BeaconCarrier.SERVICE_DATA
                 }
-            when (decoded) {
+
+                AdvertisingFormat.AD_TYPE_MANUFACTURER_DATA -> {
+                    val data = s.data.copyOfRange(2, s.data.size)
+                    if (!isOurManufacturerData(key, data)) continue
+                    payload = data.copyOfRange(2, data.size)
+                    via = BeaconCarrier.MANUFACTURER_DATA
+                }
+
+                else -> {
+                    continue
+                }
+            }
+            when (val decoded = DropRecord.decode(payload)) {
                 is DropRecord.Beacon -> {
                     if (body != null && body != decoded.body) throw DiscoveryFormatException("two different beacon bodies")
                     if (body == null) {
                         body = decoded.body
+                        bodyBytes = payload
                         carrier = via
                     }
                 }
@@ -323,7 +348,7 @@ object BeaconAdvertisements {
             }
         }
         val found = body ?: return null
-        return ParsedAdvertisement(found, carrier!!, nickname?.text, nickname?.truncated ?: false)
+        return ParsedAdvertisement(found, carrier!!, nickname?.text, nickname?.truncated ?: false, bodyBytes!!)
     }
 
     private fun structure(
@@ -351,6 +376,15 @@ object BeaconAdvertisements {
         byteArrayOf((AdvertisingFormat.MANUFACTURER_MARKER ushr 8).toByte(), AdvertisingFormat.MANUFACTURER_MARKER.toByte())
 
     private fun le16Bytes(v: Int): ByteArray = byteArrayOf(v.toByte(), (v ushr 8).toByte())
+
+    /** Manufacturer data after the company identifier that is ours: our company and the `"dr"` marker. */
+    private fun isOurManufacturerData(
+        companyId: Int,
+        data: ByteArray,
+    ): Boolean =
+        companyId == AdvertisingFormat.COMPANY_ID &&
+            data.size >= 2 &&
+            ((data[0].toInt() and 0xFF) shl 8 or (data[1].toInt() and 0xFF)) == AdvertisingFormat.MANUFACTURER_MARKER
 
     private fun le16(data: ByteArray): Int = (data[0].toInt() and 0xFF) or ((data[1].toInt() and 0xFF) shl 8)
 }

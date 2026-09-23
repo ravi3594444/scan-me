@@ -43,8 +43,9 @@ class AdvertisingTest {
     fun scanResponseGoldenBytes() {
         assertEquals(Fixtures.SCAN_RESPONSE_HEX, hex(BeaconAdvertisements.scanResponseData(Fixtures.NICKNAME)!!))
         assertEquals(
-            Fixtures.SCAN_RESPONSE_MANUFACTURER_HEX,
-            hex(BeaconAdvertisements.scanResponseData(Fixtures.NICKNAME, BeaconCarrier.MANUFACTURER_DATA)!!),
+            "6472" + "81" + hex(Fixtures.NICKNAME.encodeToByteArray()),
+            hex(BeaconAdvertisements.nicknamePayload(Fixtures.NICKNAME)!!),
+            "the platform API takes the manufacturer data after the company identifier",
         )
     }
 
@@ -54,15 +55,85 @@ class AdvertisingTest {
         assertEquals(Fixtures.SCAN_RESPONSE_SHORTENED_HEX, hex(payload))
         assertEquals(30, payload.size)
         val parsed = BeaconAdvertisements.parse(bytes(Fixtures.SERVICE_DATA_HEX) + payload)!!
-        assertEquals("ABCDEFGHIJKLMNOPQRSTUVWXY", parsed.nickname)
+        assertEquals("ABCDEFGHIJKLMNOPQRSTUVW", parsed.nickname)
         assertTrue(parsed.nicknameTruncated)
     }
 
     @Test
-    fun scanResponseHasNo128BitUuid() {
+    fun scanResponseHasNo128BitUuidAndNoServiceData() {
         val structures = BeaconAdvertisements.parseStructures(BeaconAdvertisements.scanResponseData(Fixtures.NICKNAME)!!)
-        assertEquals(listOf(AdvertisingFormat.AD_TYPE_SERVICE_DATA_16BIT), structures.map { it.type })
+        assertEquals(listOf(AdvertisingFormat.AD_TYPE_MANUFACTURER_DATA), structures.map { it.type })
     }
+
+    /**
+     * BlueZ (`Device1.ServiceData` / `ManufacturerData`) and CoreBluetooth (`kCBAdvDataServiceData` /
+     * `kCBAdvDataManufacturerData`) fold advertising data and scan response into one value per UUID and per company,
+     * the later one winning. Both the beacon body and the nickname must survive that.
+     */
+    @Test
+    fun dictionaryScannersKeepBothTheBodyAndTheNickname() {
+        val random = Random(5)
+        repeat(500) {
+            val body = Fixtures.randomBody(random)
+            val nickname = Nicknames.normalize(Fixtures.randomNickname(random))?.text ?: "Anna"
+            // A phone or Linux desktop: body as service data, nickname in the scan response.
+            val ad = BeaconAdvertisements.advertisingData(body, BeaconCarrier.SERVICE_DATA)
+            val sr = BeaconAdvertisements.scanResponseData(nickname)!!
+            for (order in listOf(listOf(ad, sr), listOf(sr, ad))) {
+                val (service, manufacturer) = dictionaryScan(order)
+                val uuid = AdvertisingFormat.SERVICE_UUID_16
+                val company = AdvertisingFormat.COMPANY_ID
+                val records =
+                    listOfNotNull(
+                        service[uuid]?.let { DropRecord.fromServiceData(uuid, it) },
+                        manufacturer[company]?.let { DropRecord.fromManufacturerData(company, it) },
+                    )
+                assertEquals(DropRecord.Beacon(body), records.filterIsInstance<DropRecord.Beacon>().single())
+                assertEquals(
+                    Nicknames.normalize(nickname, AdvertisingFormat.MAX_NICKNAME_BYTES)!!.text,
+                    records.filterIsInstance<DropRecord.Nickname>().single().text,
+                )
+            }
+            // No AD key is used twice across advertising data and scan response.
+            val adKeys = adKeys(ad)
+            assertTrue(adKeys.intersect(adKeys(sr)).isEmpty(), "shared AD keys ${adKeys.intersect(adKeys(sr))}")
+            // A Windows desktop: body as manufacturer data and no scan response to collide with.
+            val windows = BeaconAdvertisements.advertisingData(body, BeaconCarrier.MANUFACTURER_DATA)
+            val (_, windowsManufacturer) = dictionaryScan(listOf(windows))
+            assertEquals(
+                DropRecord.Beacon(body),
+                DropRecord.fromManufacturerData(AdvertisingFormat.COMPANY_ID, windowsManufacturer.getValue(AdvertisingFormat.COMPANY_ID)),
+            )
+        }
+    }
+
+    /** Service data by UUID and manufacturer data by company, last one wins, as dictionary-style scanners report them. */
+    private fun dictionaryScan(payloads: List<ByteArray>): Pair<Map<Int, ByteArray>, Map<Int, ByteArray>> {
+        val service = HashMap<Int, ByteArray>()
+        val manufacturer = HashMap<Int, ByteArray>()
+        for (payload in payloads) {
+            for (s in BeaconAdvertisements.parseStructures(payload)) {
+                if (s.data.size < 2) continue
+                val key = (s.data[0].toInt() and 0xFF) or ((s.data[1].toInt() and 0xFF) shl 8)
+                val value = s.data.copyOfRange(2, s.data.size)
+                when (s.type) {
+                    AdvertisingFormat.AD_TYPE_SERVICE_DATA_16BIT -> service[key] = value
+                    AdvertisingFormat.AD_TYPE_MANUFACTURER_DATA -> manufacturer[key] = value
+                }
+            }
+        }
+        return service to manufacturer
+    }
+
+    /** (AD type, UUID or company) of every keyed structure in [payload]. */
+    private fun adKeys(payload: ByteArray): Set<Pair<Int, Int>> =
+        BeaconAdvertisements
+            .parseStructures(payload)
+            .filter {
+                (it.type == AdvertisingFormat.AD_TYPE_SERVICE_DATA_16BIT || it.type == AdvertisingFormat.AD_TYPE_MANUFACTURER_DATA) &&
+                    it.data.size >= 2
+            }.map { it.type to ((it.data[0].toInt() and 0xFF) or ((it.data[1].toInt() and 0xFF) shl 8)) }
+            .toSet()
 
     @Test
     fun emptyNicknameGivesNoScanResponse() {
@@ -79,7 +150,7 @@ class AdvertisingTest {
             for (carrier in BeaconCarrier.entries) {
                 val ad = BeaconAdvertisements.advertisingData(body, carrier)
                 assertTrue(ad.size <= AdvertisingFormat.LEGACY_PAYLOAD_MAX, "advertising data ${ad.size} bytes")
-                val sr = BeaconAdvertisements.scanResponseData(nickname, carrier)
+                val sr = BeaconAdvertisements.scanResponseData(nickname)
                 if (sr != null) {
                     assertTrue(sr.size <= AdvertisingFormat.LEGACY_PAYLOAD_MAX, "scan response ${sr.size} bytes")
                     val parsed = BeaconAdvertisements.parse(ad + sr)!!
@@ -111,7 +182,8 @@ class AdvertisingTest {
     fun androidStyleZeroPaddedRecordParses() {
         // ScanRecord.getBytes() can hand over the advertising data padded to 31 bytes, then the scan response.
         val ad = bytes(Fixtures.SERVICE_DATA_HEX)
-        val padded = ad + ByteArray(31 - ad.size) + bytes(Fixtures.SCAN_RESPONSE_HEX) + ByteArray(62 - 31 - 17)
+        val scanResponse = bytes(Fixtures.SCAN_RESPONSE_HEX)
+        val padded = ad + ByteArray(31 - ad.size) + scanResponse + ByteArray(31 - scanResponse.size)
         val sighting = BeaconSighting.fromAdvertisingData(padded, rssiDbm = -60, radioAddress = "5A:11:22:33:44:55", atMillis = 1)!!
         assertEquals(Fixtures.BODY, BeaconBody.decode(sighting.body))
         assertEquals(Fixtures.NICKNAME, sighting.localName)
@@ -177,8 +249,11 @@ class AdvertisingTest {
         assertNull(DropRecord.fromManufacturerData(0x004C, manufacturer))
         assertNull(DropRecord.fromManufacturerData(AdvertisingFormat.COMPANY_ID, bytes("0102") + body))
         assertNull(DropRecord.fromManufacturerData(AdvertisingFormat.COMPANY_ID, bytes("64")))
-        val name = BeaconAdvertisements.nicknamePayload(Fixtures.NICKNAME, BeaconCarrier.SERVICE_DATA)!!
-        assertEquals(DropRecord.Nickname(Fixtures.NICKNAME, false), DropRecord.fromServiceData(AdvertisingFormat.SERVICE_UUID_16, name))
+        val name = BeaconAdvertisements.nicknamePayload(Fixtures.NICKNAME)!!
+        assertEquals(DropRecord.Nickname(Fixtures.NICKNAME, false), DropRecord.fromManufacturerData(AdvertisingFormat.COMPANY_ID, name))
+        // A nickname record under the service UUID (an older encoder) is still read.
+        val legacy = byteArrayOf(0x81.toByte()) + Fixtures.NICKNAME.encodeToByteArray()
+        assertEquals(DropRecord.Nickname(Fixtures.NICKNAME, false), DropRecord.fromServiceData(AdvertisingFormat.SERVICE_UUID_16, legacy))
     }
 
     @Test
@@ -226,7 +301,7 @@ class AdvertisingTest {
                             }
 
                             else -> {
-                                Unit
+                                // this round leaves the input as it is
                             }
                         }
                     }

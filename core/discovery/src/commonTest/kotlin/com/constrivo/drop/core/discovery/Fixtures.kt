@@ -33,12 +33,16 @@ internal object Fixtures {
     const val MANUFACTURER_DATA_WITH_ADDRESS_HEX = "02010619ffffff6472$BODY_WITH_ADDRESS_HEX"
 
     const val NICKNAME = "Anna's Pixel"
-    const val SCAN_RESPONSE_HEX = "101601df81416e6e61277320506978656c"
-    const val SCAN_RESPONSE_MANUFACTURER_HEX = "12ffffff647281416e6e61277320506978656c"
 
-    /** 25 ASCII letters and a 3-byte euro sign: 28 bytes, cut to 25 for the 26-byte budget. */
-    const val LONG_NICKNAME = "ABCDEFGHIJKLMNOPQRSTUVWXY€"
-    const val SCAN_RESPONSE_SHORTENED_HEX = "1d1601df824142434445464748494a4b4c4d4e4f50515253545556575859"
+    /** The scan response is manufacturer data (never service data under the beacon's UUID): `LL FF ffff 6472 81` + name. */
+    const val SCAN_RESPONSE_HEX = "12ffffff647281416e6e61277320506978656c"
+
+    /** 23 ASCII letters and a 3-byte euro sign: 26 bytes, cut to 23 for the 24-byte budget (the euro sign is not split). */
+    const val LONG_NICKNAME = "ABCDEFGHIJKLMNOPQRSTUVW€"
+    const val SCAN_RESPONSE_SHORTENED_HEX = "1dffffff6472824142434445464748494a4b4c4d4e4f5051525354555657"
+
+    /** The platforms a device can advertise ([DevicePlatform.UNKNOWN] is only ever decoded). */
+    val KNOWN_PLATFORMS = DevicePlatform.entries.filter { it.isKnown }
 
     fun hex(bytes: ByteArray): String = Bytes.hex(bytes)
 
@@ -68,12 +72,15 @@ internal object Fixtures {
             capabilities = caps,
             networkHint = hint,
             visibility = listOf(Visibility.EVERYONE, Visibility.EVERYONE_TEN_MINUTES, Visibility.TRUSTED_ONLY).random(random),
-            platform = DevicePlatform.entries.random(random),
+            platform = KNOWN_PLATFORMS.random(random),
             classicAddress = address,
         )
     }
 
-    /** Random text mixing ASCII, accents, CJK, emoji, controls, bidi overrides and lone surrogates. */
+    /**
+     * Random text mixing ASCII, accents, CJK, emoji, controls, bidi overrides, lone surrogates, blank fillers, format
+     * characters, joiners, a variation selector, a tag character and the black flag that starts tag sequences.
+     */
     fun randomNickname(random: Random): String {
         val pieces =
             listOf(
@@ -96,6 +103,13 @@ internal object Fixtures {
                 "\uDC00",
                 "'",
                 "\u00A0",
+                "\u3164",
+                "\u2060",
+                "\u00AD",
+                "\u200C",
+                "\uFE0F",
+                "\uDB40\uDC41",
+                "\uD83C\uDFF4",
             )
         return buildString { repeat(random.nextInt(0, 40)) { append(pieces.random(random)) } }
     }

@@ -1,35 +1,56 @@
 package com.constrivo.drop.core.discovery
 
+import kotlin.math.pow
+
 /** The three radar rings of design §3.2, nearest first. */
 enum class Ring { INNER, MIDDLE, OUTER }
 
 /**
  * Parameters of the RSSI smoother (design §3.2): an exponential moving average over fixed sample windows.
  *
- * Readings are grouped into windows of [sampleIntervalMillis] aligned to multiples of it (unix time); a window's
- * mean is one sample, folded in as `s ← s + α·(sample − s)` when the window closes. Windows without readings are
- * skipped, not decayed. With α = 0.2 and 250 ms windows the estimate settles in about 1–2 s (0.8⁸ ≈ 0.17 after 2 s).
+ * Readings are grouped into windows of [sampleIntervalMillis] aligned to multiples of it (on the monotonic clock the
+ * caller uses); a window's mean is one sample, folded in when the window closes. Windows without readings are
+ * bridged, not skipped: a sample that follows `k` windows since the previous one (`k − 1` of them empty) is folded
+ * with weight `α_k = 1 − (1 − α)^k`, `k` capped at [maxBridgedWindows]. That is exactly the average the smoother would
+ * reach had the new value been heard in every one of those windows (sample and hold), so the estimate settles in wall
+ * time, not in advertisements: with α = 0.2 and 250 ms windows a 30 dB step leaves `30 × 0.8⁸ ≈ 5 dB` after 2 s,
+ * whether the peer advertises every 100 ms (foreground) or every second (background, architecture §5.1). A sparse
+ * advertiser can only move as often as it is heard, so its bubble settles within about 2 s plus one advertising
+ * interval. The cap (2 s by default) keeps one reading after a long silence from counting for more than 2 s of
+ * readings.
  */
 data class RssiSmoothing(
     val alpha: Double = DEFAULT_ALPHA,
     val sampleIntervalMillis: Long = DEFAULT_SAMPLE_INTERVAL_MILLIS,
+    val maxBridgedWindows: Int = DEFAULT_MAX_BRIDGED_WINDOWS,
 ) {
     init {
         require(alpha > 0.0 && alpha <= 1.0) { "alpha must be in (0, 1]" }
         require(sampleIntervalMillis > 0) { "sample interval must be positive" }
+        require(maxBridgedWindows >= 1) { "at least one window must be bridged" }
     }
+
+    /** `weights[k − 1] = 1 − (1 − α)^k` for `k = 1…maxBridgedWindows`. */
+    private val weights = DoubleArray(maxBridgedWindows) { 1.0 - (1.0 - alpha).pow(it + 1) }
 
     /** The state after the first reading. */
     fun start(
         rssiDbm: Int,
         atMillis: Long,
-    ): SmoothedRssi = SmoothedRssi(this, null, windowOf(atMillis), rssiDbm.toDouble(), 1, 0)
+    ): SmoothedRssi {
+        val window = windowOf(atMillis)
+        return SmoothedRssi(this, null, window, window, rssiDbm.toDouble(), 1, 0)
+    }
 
     internal fun windowOf(atMillis: Long): Long = atMillis.floorDiv(sampleIntervalMillis)
+
+    /** The fold weight of a sample `windows` windows after the previous one. */
+    internal fun weight(windows: Long): Double = weights[(windows.coerceIn(1, maxBridgedWindows.toLong()) - 1).toInt()]
 
     companion object {
         const val DEFAULT_ALPHA: Double = 0.2
         const val DEFAULT_SAMPLE_INTERVAL_MILLIS: Long = 250
+        const val DEFAULT_MAX_BRIDGED_WINDOWS: Int = 8
     }
 }
 
@@ -43,6 +64,8 @@ data class RssiSmoothing(
 class SmoothedRssi internal constructor(
     val params: RssiSmoothing,
     private val average: Double?,
+    /** The window of the last sample folded into [average] (meaningless while it is null). */
+    private val sampleWindow: Long,
     private val window: Long,
     private val windowSum: Double,
     private val windowCount: Int,
@@ -62,7 +85,15 @@ class SmoothedRssi internal constructor(
     ): SmoothedRssi {
         val w = params.windowOf(atMillis)
         val base = if (w > window) closeInto(w) else this
-        return SmoothedRssi(params, base.average, base.window, base.windowSum + rssiDbm, base.windowCount + 1, base.samples)
+        return SmoothedRssi(
+            params,
+            base.average,
+            base.sampleWindow,
+            base.window,
+            base.windowSum + rssiDbm,
+            base.windowCount + 1,
+            base.samples,
+        )
     }
 
     /** Closes the open window if [nowMillis] is past its end. */
@@ -72,10 +103,10 @@ class SmoothedRssi internal constructor(
     }
 
     private fun closeInto(newWindow: Long): SmoothedRssi {
-        if (windowCount == 0) return SmoothedRssi(params, average, newWindow, 0.0, 0, samples)
+        if (windowCount == 0) return SmoothedRssi(params, average, sampleWindow, newWindow, 0.0, 0, samples)
         val mean = windowSum / windowCount
-        val next = average?.let { it + params.alpha * (mean - it) } ?: mean
-        return SmoothedRssi(params, next, newWindow, 0.0, 0, samples + 1)
+        val next = average?.let { it + params.weight(window - sampleWindow) * (mean - it) } ?: mean
+        return SmoothedRssi(params, next, window, newWindow, 0.0, 0, samples + 1)
     }
 
     override fun toString(): String = "SmoothedRssi(${valueDbm}dBm, samples=$samples)"
@@ -89,7 +120,8 @@ class SmoothedRssi internal constructor(
  * farther ring needs the value to drop [hysteresisDb] below the boundary: inner is left below −60, middle below −75.
  * So the bands `[−60, −55)` and `[−75, −70)` keep whatever ring the bubble already has, and a bubble can only flip
  * back after its smoothed value has crossed a whole 5 dB band. Smoothed noise of ±4 dBm raw moves the average far
- * less than that (≈ 0.5–0.8 dB standard deviation), so bubbles do not flap (F‑A2: no ring jump within 2 s).
+ * less than that (≈ 0.6 dB standard deviation for a 100 ms advertiser, ≈ 1.5 dB for a 1 s one, whose sparse
+ * samples are folded with more weight), so bubbles do not flap (F‑A2: no ring jump within 2 s).
  */
 data class RingThresholds(
     val innerMinDbm: Double = -55.0,

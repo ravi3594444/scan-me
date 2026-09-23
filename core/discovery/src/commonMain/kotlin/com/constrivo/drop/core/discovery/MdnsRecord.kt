@@ -13,7 +13,7 @@ import com.constrivo.drop.core.crypto.CryptoProvider
  * | `v` | `1` (decimal; later versions may only add keys) |
  * | `eph` | [ephemeralId], 12 lower-case hex digits (the same ID as the beacon, §5.3) |
  * | `cap` | [capabilities], 4 lower-case hex digits (§5.2) |
- * | `plat` | [platform] wire name: `phone`, `laptop`, `desktop` or `browser` |
+ * | `plat` | [platform]: `phone`, `laptop`, `desktop` or `browser`; other tokens `[a-z0-9-]{1,32}` read as [DevicePlatform.UNKNOWN] |
  * | `nick` | [nickname], UTF-8, at most 64 bytes; omitted in Trusted-only mode (N4) |
  * | `port` | [controlPort], decimal `1`–`65535` |
  * | `vis` | [visibility] code `0`, `1` or `2`; absent means `0` (added by WP1 so LAN honours F‑A5) |
@@ -24,7 +24,8 @@ import com.constrivo.drop.core.crypto.CryptoProvider
  *
  * Limits enforced on both sides (RFC 6763 §6): keys are printable US-ASCII without `=` (ours have at most nine
  * characters, as §6.4 recommends) and are compared case-insensitively; each `key=value` string is at most 255
- * bytes; the whole record is at most 1300 bytes. Unknown keys are ignored.
+ * bytes; the whole record is at most 1300 bytes. Unknown keys are ignored, and so are unknown `plat` tokens, so a
+ * record of a later version (`v` above 1, which may only add keys) stays readable.
  */
 data class MdnsRecord(
     val ephemeralId: EphemeralId,
@@ -47,8 +48,13 @@ data class MdnsRecord(
     /** DNS-SD instance name: `drop-<eph>`. Contains neither the nickname nor a permanent ID (N4). */
     val instanceName: String get() = "${AppIdentity.CODE_NAME}-${ephemeralId.toHex()}"
 
-    /** The TXT record as key → value, in the documented key order. */
+    /**
+     * The TXT record as key → value, in the documented key order.
+     *
+     * @throws IllegalArgumentException for [DevicePlatform.UNKNOWN], which only ever comes from decoding.
+     */
     fun toTxt(): Map<String, String> {
+        require(platform.isKnown) { "a record never announces an unknown platform" }
         val txt = LinkedHashMap<String, String>()
         txt[KEY_VERSION] = VERSION.toString()
         txt[KEY_EPH] = ephemeralId.toHex()
@@ -82,6 +88,7 @@ data class MdnsRecord(
         const val MAX_TXT_BYTES: Int = 1300
 
         private const val MAX_PORT = 65535
+        private const val MAX_PLATFORM_NAME = 32
 
         /**
          * This device's record for the epoch containing [nowMillis], with the visibility rules of
@@ -133,7 +140,11 @@ data class MdnsRecord(
             if (version == null || version !in 1L..255L) throw DiscoveryFormatException("bad TXT version")
             val eph = EphemeralId.parseHex(required(KEY_EPH))
             val cap = Bytes.parseHex(required(KEY_CAP), 4) ?: throw DiscoveryFormatException("cap must be 4 hex digits")
-            val platform = DevicePlatform.fromWire(required(KEY_PLATFORM)) ?: throw DiscoveryFormatException("unknown plat")
+            val platformName = required(KEY_PLATFORM)
+            if (platformName.length !in 1..MAX_PLATFORM_NAME || platformName.any { it !in 'a'..'z' && it !in '0'..'9' && it != '-' }) {
+                throw DiscoveryFormatException("plat must be a token of lower-case letters, digits and '-'")
+            }
+            val platform = DevicePlatform.fromWire(platformName)
             val port = Bytes.parseDecimal(required(KEY_PORT), 5)
             if (port == null || port !in 1L..MAX_PORT.toLong()) throw DiscoveryFormatException("bad port")
             val visibility =

@@ -59,7 +59,7 @@ class MdnsRecordTest {
                 MdnsRecord(
                     ephemeralId = EphemeralId(random.nextLong(0, EphemeralId.MAX_VALUE + 1)),
                     capabilities = Capabilities(random.nextInt(0x10000)),
-                    platform = DevicePlatform.entries.random(random),
+                    platform = Fixtures.KNOWN_PLATFORMS.random(random),
                     nickname =
                         if (visibility ==
                             Visibility.TRUSTED_ONLY
@@ -102,8 +102,10 @@ class MdnsRecordTest {
                 "cap" to "28999",
                 "cap" to "zz99",
                 "cap" to "-289",
-                "plat" to "tablet",
                 "plat" to "",
+                "plat" to "Phone",
+                "plat" to "tab let",
+                "plat" to "x".repeat(33),
                 "port" to "0",
                 "port" to "65536",
                 "port" to "080",
@@ -124,6 +126,19 @@ class MdnsRecordTest {
         assertEquals(Visibility.EVERYONE, MdnsRecord.fromTxt(golden - "vis").visibility)
         assertNull(MdnsRecord.fromTxt(golden - "nick").nickname)
         assertEquals(record, MdnsRecord.fromTxt(golden + ("v" to "2")), "later versions keep the v1 keys")
+    }
+
+    @Test
+    fun unknownPlatformsOfLaterVersionsStayReadable() {
+        // A later app adds a platform under a later `v`, which may only add keys: v1 scanners still see the device.
+        val later = MdnsRecord.fromTxt(golden + ("v" to "2") + ("plat" to "tablet") + ("tier" to "gold"))
+        assertEquals(DevicePlatform.UNKNOWN, later.platform)
+        assertEquals(record.copy(platform = DevicePlatform.UNKNOWN), later)
+        assertEquals(DevicePlatform.UNKNOWN, MdnsRecord.fromTxt(golden + ("plat" to "tv-2")).platform)
+        // Only decoding produces it: an unknown platform is never announced.
+        assertFailsWith<IllegalArgumentException> { later.toTxt() }
+        assertEquals(DevicePlatform.BROWSER_PROXY, DevicePlatform.fromWire("browser"))
+        assertEquals(DevicePlatform.UNKNOWN, DevicePlatform.fromWire(""))
     }
 
     @Test

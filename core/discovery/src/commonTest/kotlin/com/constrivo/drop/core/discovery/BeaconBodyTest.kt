@@ -44,7 +44,7 @@ class BeaconBodyTest {
         assertEquals("0001", hex(onlyBit0.encode().copyOfRange(7, 9)))
         // Visibility in bits 7–6, platform in bits 5–3.
         for (v in listOf(Visibility.EVERYONE, Visibility.EVERYONE_TEN_MINUTES, Visibility.TRUSTED_ONLY)) {
-            for (p in DevicePlatform.entries) {
+            for (p in Fixtures.KNOWN_PLATFORMS) {
                 val packed = onlyBit0.copy(visibility = v, platform = p).encode()[13].toInt() and 0xFF
                 assertEquals(v.code, packed ushr 6)
                 assertEquals(p.code, (packed ushr 3) and 7)
@@ -88,15 +88,24 @@ class BeaconBodyTest {
     }
 
     @Test
-    fun laterMinorVersionsIgnoreTrailingBytes() {
+    fun laterMinorVersionsKeepTheClassicAddressAndIgnoreFieldsAfterOffset20() {
         for (version in 2..BeaconBody.LAST_COMPATIBLE_VERSION) {
+            // S10: a newer desktop's Classic address stays readable to v1 scanners.
             val raw = bytes(Fixtures.BODY_WITH_ADDRESS_HEX) + bytes("0102030405")
             raw[0] = version.toByte()
-            val decoded = BeaconBody.decode(raw)
-            assertEquals(Fixtures.BODY_WITH_ADDRESS.copy(classicAddress = null), decoded)
+            assertEquals(Fixtures.BODY_WITH_ADDRESS, BeaconBody.decode(raw))
+            assertEquals(Fixtures.BODY_WITH_ADDRESS, BeaconBody.decode(raw.copyOfRange(0, BeaconBody.SIZE_WITH_CLASSIC_ADDRESS)))
+            // New fields without an address: six zero bytes hold the address slot.
+            val noAddress = bytes(Fixtures.BODY_HEX) + ByteArray(6) + bytes("0a0b")
+            noAddress[0] = version.toByte()
+            assertEquals(Fixtures.BODY, BeaconBody.decode(noAddress))
             val minimal = bytes(Fixtures.BODY_HEX).also { it[0] = version.toByte() }
             assertEquals(Fixtures.BODY, BeaconBody.decode(minimal))
             assertFailsWith<DiscoveryFormatException> { BeaconBody.decode(minimal.copyOfRange(0, 13)) }
+            // Lengths 15–19 would cut the address slot: malformed in every version.
+            for (n in BeaconBody.SIZE + 1 until BeaconBody.SIZE_WITH_CLASSIC_ADDRESS) {
+                assertFailsWith<DiscoveryFormatException>("v$version, $n bytes") { BeaconBody.decode(raw.copyOfRange(0, n)) }
+            }
         }
     }
 
@@ -150,12 +159,22 @@ class BeaconBodyTest {
     }
 
     @Test
-    fun unknownPlatformCodeIsRejected() {
-        for (code in 4..7) {
-            val raw = bytes(Fixtures.BODY_HEX)
-            raw[13] = ((raw[13].toInt() and 0xC7) or (code shl 3)).toByte()
-            assertFailsWith<DiscoveryFormatException> { BeaconBody.decode(raw) }
+    fun unknownPlatformCodesDecodeAsUnknownInEveryCompatibleVersion() {
+        for (version in listOf(1, 2, BeaconBody.LAST_COMPATIBLE_VERSION)) {
+            for (code in 4..7) {
+                val raw = bytes(Fixtures.BODY_HEX)
+                raw[0] = version.toByte()
+                raw[13] = ((raw[13].toInt() and 0xC7) or (code shl 3)).toByte()
+                val decoded = BeaconBody.decode(raw)
+                assertEquals(DevicePlatform.UNKNOWN, decoded.platform, "v$version code $code")
+                assertEquals(Fixtures.BODY.copy(platform = DevicePlatform.UNKNOWN), decoded)
+                // Only decoding produces it: an unknown platform is never sent.
+                assertFailsWith<IllegalArgumentException> { decoded.encode() }
+            }
         }
+        assertEquals(DevicePlatform.UNKNOWN, DevicePlatform.fromCode(5))
+        assertEquals(DevicePlatform.DESKTOP, DevicePlatform.fromCode(2))
+        assertFailsWith<IllegalArgumentException> { DevicePlatform.fromCode(8) }
     }
 
     @Test

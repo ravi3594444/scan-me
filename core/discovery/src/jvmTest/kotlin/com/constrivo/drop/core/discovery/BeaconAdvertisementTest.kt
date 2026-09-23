@@ -42,7 +42,12 @@ class BeaconAdvertisementTest {
         assertEquals(ad.body, parsed.body)
         assertEquals("Studio PC", parsed.nickname)
         assertContentEquals(ad.body.encode(), ad.carrierPayload())
-        assertContentEquals(byteArrayOf(0x81.toByte()) + "Studio PC".encodeToByteArray(), ad.scanResponsePayload())
+        assertTrue(ad.hasScanResponse)
+        assertContentEquals(
+            Fixtures.bytes("6472") + byteArrayOf(0x81.toByte()) + "Studio PC".encodeToByteArray(),
+            ad.scanResponseManufacturerData(),
+            "the nickname goes out as manufacturer data, never under the beacon's service UUID",
+        )
         assertEquals(AdvertisingFormat.SERVICE_UUID_16, ad.serviceUuid16)
         assertEquals(AdvertisingFormat.COMPANY_ID, ad.companyId)
     }
@@ -54,7 +59,8 @@ class BeaconAdvertisementTest {
             val ad = BeaconAdvertisement.create(crypto, K0, trustedOnly, carrier, EPOCH_START)
             assertNull(ad.nickname)
             assertNull(ad.scanResponseData())
-            assertNull(ad.scanResponsePayload())
+            assertNull(ad.scanResponseManufacturerData())
+            assertFalse(ad.hasScanResponse)
             assertTrue(ad.body.networkHint.isNone)
             assertFalse(Capabilities.Flag.CONNECTED_TO_WIFI in ad.body.capabilities)
             assertFalse(Capabilities.Flag.STATION_ON_5GHZ in ad.body.capabilities)
@@ -123,9 +129,21 @@ class BeaconAdvertisementTest {
         val sighting = assertNotNull(BeaconSighting.fromAdvertisingData(data, -48, "C0:FF:EE:00:00:01", EPOCH_START))
         assertEquals(BeaconCarrier.MANUFACTURER_DATA, sighting.carrier)
         assertEquals(ad.body, BeaconBody.decode(sighting.body))
-        val scanResponse = assertNotNull(ad.scanResponseData())
-        assertEquals(AdvertisingFormat.AD_TYPE_MANUFACTURER_DATA, BeaconAdvertisements.parseStructures(scanResponse).single().type)
-        assertEquals("Studio PC", BeaconAdvertisements.parse(data + scanResponse)!!.nickname)
+        // No scan response: the body already uses the company key, and WinRT cannot set one. The name goes over mDNS.
+        assertEquals("Studio PC", ad.nickname)
+        assertFalse(ad.hasScanResponse)
+        assertNull(ad.scanResponseData())
+        assertNull(ad.scanResponseManufacturerData())
+        assertEquals("Studio PC", MdnsRecord.create(crypto, K0, state, 49152, EPOCH_START).nickname)
+    }
+
+    @Test
+    fun anUnknownPlatformIsNeverAdvertised() {
+        val unknown = state.copy(platform = DevicePlatform.UNKNOWN)
+        assertFailsWith<IllegalArgumentException> {
+            BeaconAdvertisement.create(crypto, K0, unknown, BeaconCarrier.SERVICE_DATA, EPOCH_START)
+        }
+        assertFailsWith<IllegalArgumentException> { MdnsRecord.create(crypto, K0, unknown, 49152, EPOCH_START) }
     }
 
     @Test
