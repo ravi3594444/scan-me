@@ -1,8 +1,9 @@
 package com.constrivo.drop.core.crypto
 
 /**
- * The device's long-lived Ed25519 identity (F-B1). The private key stays inside the store
- * (Android Keystore or the OS keychain); callers only get [sign].
+ * The device's long-lived Ed25519 identity (F-B1). The private key stays inside the store; callers only get [sign].
+ * On every supported platform this is a software key wrapped at rest by a Keystore / keychain AES key
+ * (spec change N11): see [SoftwareIdentityKeyStore].
  */
 interface IdentityKey {
     /** 32-byte Ed25519 public key (`identity_pk`). */
