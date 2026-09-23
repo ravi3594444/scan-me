@@ -84,6 +84,24 @@ class ChunkHeaderTest {
     }
 
     @Test
+    fun viewsDecodeARangeWithoutCopyingThePayload() {
+        val header = ChunkHeader(TEST_ID, 3, 1, payloadLength = 4, hash = hash)
+        val encoded = ChunkFrame(header, "01020304".unhex()).encode()
+        val buffer = ByteArray(5) + encoded + ByteArray(3)
+        val view = ChunkView.decode(buffer, 5, encoded.size)
+        assertEquals(header, view.header)
+        assertTrue(view.buffer === buffer, "the view borrows the buffer")
+        assertEquals(5 + ChunkHeader.SIZE, view.payloadOffset)
+        assertEquals(4, view.payloadLength)
+        assertContentEquals("01020304".unhex(), view.copyPayload())
+        assertEquals(ChunkFrame.decode(encoded), view.toFrame())
+        assertProtocolError("range longer than the payload") { ChunkView.decode(buffer, 5, encoded.size + 1) }
+        assertProtocolError("shorter than a header") { ChunkView.decode(buffer, 5, ChunkHeader.SIZE - 1) }
+        assertProtocolError("range outside the buffer") { ChunkView.decode(buffer, 5, buffer.size) }
+        assertRejectsArgument { ChunkView(header, ByteArray(3), 0) }
+    }
+
+    @Test
     fun randomHeadersOnlyEverRaiseProtocolException() {
         val random = Random(5)
         repeat(50_000) {

@@ -129,6 +129,7 @@ object ControlCodec {
             is ControlMoved -> ProtocolCbor.encodeToByteArray(ControlMoved.serializer(), message)
             is TrustShare -> ProtocolCbor.encodeToByteArray(TrustShare.serializer(), message)
             is StreamOpen -> ProtocolCbor.encodeToByteArray(StreamOpen.serializer(), message)
+            is Retransmit -> ProtocolCbor.encodeToByteArray(Retransmit.serializer(), message)
         }
 
     private fun decodeBody(
@@ -151,6 +152,7 @@ object ControlCodec {
             ControlMessageType.CONTROL_MOVED -> ProtocolCbor.decodeFromByteArray(ControlMoved.serializer(), body)
             ControlMessageType.TRUST_SHARE -> ProtocolCbor.decodeFromByteArray(TrustShare.serializer(), body)
             ControlMessageType.STREAM_OPEN -> ProtocolCbor.decodeFromByteArray(StreamOpen.serializer(), body)
+            ControlMessageType.RETRANSMIT -> ProtocolCbor.decodeFromByteArray(Retransmit.serializer(), body)
         }
 }
 

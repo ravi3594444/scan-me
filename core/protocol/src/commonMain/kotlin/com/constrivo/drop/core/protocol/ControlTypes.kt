@@ -354,8 +354,8 @@ data class IndexRange(
 /**
  * Missing units of one tracking key (spec changes S1, S4): chunk [ranges] of file [fileIndex], or bundle ranges when
  * [fileIndex] is [ProtocolConstants.BUNDLE_FILE_INDEX]. [firstBlockOffset] says the receiver already holds bytes
- * `0 until firstBlockOffset` of the first missing unit (Bluetooth blocks), so the sender resumes it from there.
- * Ranges are ascending and separated by at least one present unit.
+ * `0 until firstBlockOffset` of the first unit of the first range (verified Bluetooth blocks, or the blocks before a
+ * bad one in a `Retransmit`), so the sender sends that unit from there. Ranges are ascending and coalesced.
  */
 @Serializable
 data class MissingChunks(
@@ -374,16 +374,17 @@ data class MissingChunks(
 }
 
 /**
- * What a receiver still needs (`Resume.missing`, `Accept.resume`; §7.6 with S1, S4):
- * - [chunks]: per tracking key, the missing unit ranges; entries in ascending unsigned `file_index` order, so the
- *   bundle entry (0xFFFFFFFF) comes last;
- * - [files]: ranges of file indices whose chunked files are missing entirely; bundled and empty files inside a range
+ * A set of units (`Resume.missing`, `Accept.resume`, `Retransmit.units`; §7.6 with S1, S4):
+ * - [chunks]: per tracking key, unit ranges; entries in ascending unsigned `file_index` order, so the bundle entry
+ *   (0xFFFFFFFF) comes last;
+ * - [files]: ranges of file indices whose chunked files are included entirely; bundled and empty files inside a range
  *   are ignored because bundles are tracked by the bundle entry. A file index in [chunks] must not also fall inside
  *   [files].
  *
- * Units not listed are present. An empty value means nothing is missing. Both lists are always written, even when
- * empty: the CBOR decoder reads an empty map in a nullable field as null, and `Accept.resume = {}` ("nothing is
- * missing") must not turn into `null` ("fresh transfer").
+ * In `Resume` and `Accept.resume` it is the complete missing set: units not listed are present, and an empty value
+ * means nothing is missing. In `Retransmit` it names only the units to send again. Both lists are always written,
+ * even when empty: the CBOR decoder reads an empty map in a nullable field as null, and `Accept.resume = {}`
+ * ("nothing is missing") must not turn into `null` ("fresh transfer").
  */
 @Serializable
 data class MissingUnits(

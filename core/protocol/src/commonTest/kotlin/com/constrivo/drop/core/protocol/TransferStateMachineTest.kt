@@ -367,7 +367,7 @@ class TransferStateMachineTest {
         d.on(WifiStreamConnected(LinkKind.P2P, 5180))
         val unit = TransferUnit(1, 4)
         d.on(ChunkHashMismatch(unit, listOf(1)))
-        assertEquals(listOf(Resume(TEST_ID, MissingUnits(chunks = listOf(MissingChunks(1, listOf(IndexRange(4, 1))))))), d.sent())
+        assertEquals(listOf(Retransmit(TEST_ID, MissingUnits(chunks = listOf(MissingChunks(1, listOf(IndexRange(4, 1))))))), d.sent())
         assertEquals(1, d.state.unitStrikes[unit])
         d.on(ChunkHashMismatch(unit, listOf(1)))
         assertEquals(2, d.state.unitStrikes[unit])
@@ -386,6 +386,21 @@ class TransferStateMachineTest {
         assertEquals(CompleteStatus.PARTIAL, complete.status)
         assertEquals(listOf(1), complete.failedFiles)
         assertEquals(2_000, complete.bytes)
+    }
+
+    @Test
+    fun aBadBluetoothBlockIsRequestedFromItsOffset() {
+        val d = receiver()
+        d.on(LocalAccept(accept))
+        d.on(FirstChunkOverBluetooth)
+        d.on(ChunkHashMismatch(TransferUnit(0, 0), listOf(0), blockOffset = 48 * ProtocolConstants.KIB))
+        val retransmit = assertIs<Retransmit>(d.sent().single())
+        val expected = MissingChunks(0, listOf(IndexRange(0, 1)), firstBlockOffset = 48 * ProtocolConstants.KIB)
+        assertEquals(listOf(expected), retransmit.units.chunks)
+        // The sender resends that chunk from the bad block, not from byte 0.
+        val layout = TransferLayout.of(listOf(2L * ProtocolConstants.MIB, 5L, 7L))
+        assertEquals(listOf(ResumeUnit(TransferUnit(0, 0), 48 * ProtocolConstants.KIB)), layout.expand(retransmit.units))
+        assertRejectsArgument { ChunkHashMismatch(TransferUnit(0, 0), listOf(0), blockOffset = ProtocolConstants.CHUNK_SIZE) }
     }
 
     @Test
@@ -411,13 +426,42 @@ class TransferStateMachineTest {
         d.on(FileHashMismatch(1, suspects))
         assertEquals(STREAMING_WIFI, d.phase)
         assertFalse(d.state.allUnitsAcked)
-        assertEquals(listOf(Resume(TEST_ID, suspects)), d.sent())
-        // Without suspects the whole file is requested again.
-        d.on(FileHashMismatch(1, MissingUnits.NONE))
-        assertEquals(listOf(Resume(TEST_ID, MissingUnits(files = listOf(IndexRange(1, 1))))), d.sent())
-        d.on(FileHashMismatch(1, MissingUnits.NONE))
+        assertEquals(listOf(Retransmit(TEST_ID, suspects)), d.sent())
+        val whole = MissingUnits(files = listOf(IndexRange(1, 1)))
+        d.on(FileHashMismatch(1, whole))
+        assertEquals(listOf(Retransmit(TEST_ID, whole)), d.sent())
+        d.on(FileHashMismatch(1, whole))
         assertEquals(DONE, d.phase, "third strike fails the file; everything else is verified")
         assertEquals(CompleteStatus.PARTIAL, d.state.completeStatus)
+    }
+
+    /** A bundled file is requested again through its bundle: the Retransmit must name units the sender can resend. */
+    @Test
+    fun wholeFileRetryOfABundledFileResendsItsBundle() {
+        // Files: 0 chunked (5 MiB, two chunks), 1 and 2 small, bundled together.
+        val layout = TransferLayout.of(listOf(5L * ProtocolConstants.MIB, 5L, 7L))
+        val d = Driver(TransferRole.RECEIVER, fileCount = 3)
+        d.on(LocalAccept(accept))
+        d.on(WifiStreamConnected(LinkKind.LAN))
+        d.on(FileHashMismatch(1, layout.unitsOf(1)))
+        val retransmit = assertIs<Retransmit>(d.sent().single())
+        val resent = layout.expand(retransmit.units)
+        assertEquals(listOf(ResumeUnit(TransferUnit(BUNDLE_FILE_INDEX, 0), 0)), resent)
+        assertEquals(listOf(ResumeUnit(TransferUnit(0, 0), 0), ResumeUnit(TransferUnit(0, 1), 0)), layout.expand(layout.unitsOf(0)))
+    }
+
+    /** Empty suspects (an empty file, which has no units): nothing can be resent, so the file fails at once. */
+    @Test
+    fun aMismatchWithNothingToResendFailsTheFileAtOnce() {
+        val layout = TransferLayout.of(listOf(5L * ProtocolConstants.MIB, 0L), bundleSmall = false)
+        assertTrue(layout.unitsOf(1).isEmpty)
+        val d = Driver(TransferRole.RECEIVER, fileCount = 2)
+        d.on(LocalAccept(accept))
+        d.on(WifiStreamConnected(LinkKind.LAN))
+        d.on(FileHashMismatch(1, layout.unitsOf(1)))
+        assertEquals(listOf(FileFailed(1)), d.effects.filterIsInstance<FileFailed>())
+        assertTrue(d.sent().isEmpty(), "no empty Retransmit")
+        assertTrue(1 in d.state.failedFiles)
     }
 
     @Test
@@ -425,7 +469,8 @@ class TransferStateMachineTest {
         val d = Driver(TransferRole.RECEIVER, fileCount = 1)
         d.on(LocalAccept(accept))
         d.on(FirstChunkOverBluetooth)
-        repeat(3) { d.on(FileHashMismatch(0, MissingUnits.NONE)) }
+        val whole = MissingUnits(files = listOf(IndexRange(0, 1)))
+        repeat(3) { d.on(FileHashMismatch(0, whole)) }
         assertEquals(FAILED, d.phase)
         assertEquals(CompleteStatus.FAILED, d.state.completeStatus)
         assertEquals(CancelReason.VERIFICATION, d.state.cancelReason)
@@ -446,19 +491,67 @@ class TransferStateMachineTest {
         assertEquals(RECONNECTING, d.phase)
     }
 
+    /** The last file verifies while the link is down: the Complete waits for the reconnect instead of being lost. */
+    @Test
+    fun receiverResolvedWhileReconnectingSendsCompleteAfterResuming() {
+        val d = Driver(TransferRole.RECEIVER, fileCount = 2)
+        d.on(LocalAccept(accept))
+        d.on(WifiStreamConnected(LinkKind.P2P, 5180))
+        d.on(FileVerified(0, 1_000))
+        d.on(LinkLost, t0 + 1_000)
+        d.on(FileVerified(1, 2_000), t0 + 2_000)
+        assertEquals(RECONNECTING, d.phase, "stays interrupted until the Complete can be delivered")
+        assertTrue(d.sent().isEmpty())
+        assertFalse(ReleaseLink in d.effects)
+        val pending = assertIs<Complete>(d.state.pendingComplete)
+        assertEquals(CompleteStatus.OK, pending.status)
+        assertEquals(3_000, pending.bytes)
+
+        d.on(Resumed(LinkKind.LAN), t0 + 30_000)
+        assertEquals(DONE, d.phase)
+        assertEquals(listOf(pending), d.sent())
+        assertTrue(StopReconnect in d.effects)
+        assertTrue(ReleaseLink in d.effects)
+        assertFalse(ClearPartials in d.effects)
+        assertNull(d.state.pendingComplete)
+        assertEquals(CompleteStatus.OK, d.state.completeStatus)
+    }
+
+    @Test
+    fun receiverResolvedWhileParkedEndsResolvedWhenTheWindowRunsOut() {
+        val d = Driver(TransferRole.RECEIVER, fileCount = 1)
+        d.on(LocalAccept(accept))
+        d.on(FirstChunkOverBluetooth)
+        d.on(LinkLost, t0 + 1_000)
+        d.advance(RECONNECT_WINDOW_MS)
+        d.fireDue()
+        assertEquals(PARKED, d.phase)
+        repeat(3) { d.on(ChunkHashMismatch(TransferUnit(0, 0), listOf(0))) }
+        assertEquals(PARKED, d.phase, "the last file failed while parked; the outcome waits")
+        assertEquals(CompleteStatus.FAILED, d.state.pendingComplete?.status)
+        d.advance(PARKED_WINDOW_MS)
+        d.fireDue()
+        assertEquals(FAILED, d.phase)
+        assertEquals(CancelReason.VERIFICATION, d.state.cancelReason)
+        assertTrue(d.sent().isEmpty(), "the link never came back")
+        assertTrue(StopWatchingForPeer in d.effects)
+    }
+
     @Test
     fun senderRetransmitsFromVerifying() {
         val d = sender()
         d.on(AcceptReceived(accept))
         d.on(WifiStreamConnected(LinkKind.P2P, 5180))
         d.on(AllChunksAcked)
-        d.on(RetransmitRequested(Resume(TEST_ID, MissingUnits(files = listOf(IndexRange(0, 1))))))
+        val units = MissingUnits(files = listOf(IndexRange(0, 1)))
+        d.on(RetransmitRequested(Retransmit(TEST_ID, units)))
         assertEquals(STREAMING_WIFI, d.phase)
-        d.on(RetransmitRequested(Resume(OTHER_ID, MissingUnits.NONE)))
+        d.on(RetransmitRequested(Retransmit(OTHER_ID, units)))
         assertFalse(d.last.handled)
-        d.on(RetransmitRequested(Resume(TEST_ID, MissingUnits.NONE)))
-        assertTrue(d.last.handled)
+        d.on(RetransmitRequested(Retransmit(TEST_ID, units)))
+        assertTrue(d.last.handled, "while streaming the engine just queues the units")
         assertTrue(d.effects.isEmpty())
+        assertRejectsArgument { Retransmit(TEST_ID, MissingUnits.NONE) }
     }
 
     @Test

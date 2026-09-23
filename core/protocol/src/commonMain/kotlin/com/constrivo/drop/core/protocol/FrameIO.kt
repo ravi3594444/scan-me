@@ -13,7 +13,9 @@ import kotlinx.coroutines.sync.withLock
  *   reader never allocates more than `limits.largestPayload` plus its own buffer per frame.
  *
  * Small frames are served from an internal buffer of [bufferSize] bytes; payloads larger than the buffer are read
- * straight into their destination array. Not safe for concurrent use: one coroutine reads a given stream.
+ * straight into their destination array. [readFrame] allocates a new payload array per frame; [readHeader] followed
+ * by [readPayload] lets the engine read chunk payloads into pooled buffers instead. Not safe for concurrent use: one
+ * coroutine reads a given stream. After an exception the reader is unusable and the channel must be closed.
  */
 class FrameReader(
     private val channel: DataChannel,
@@ -25,6 +27,7 @@ class FrameReader(
     private var start = 0
     private var end = 0
     private var endOfStream = false
+    private var pending: FrameHeader? = null
 
     /** Bytes consumed from the channel so far, frame headers included. */
     var bytesRead: Long = 0
@@ -42,15 +45,49 @@ class FrameReader(
      * @throws ProtocolException for an unknown type, a type [limits] does not accept, or an oversized length.
      */
     suspend fun readFrame(limits: FrameLimits = this.limits): Frame? {
+        val header = readHeader(limits) ?: return null
+        val payload = ByteArray(header.payloadLength)
+        readPayload(payload)
+        return Frame(header.type, payload)
+    }
+
+    /**
+     * Reads and validates the next frame header, or returns `null` at a clean end of stream. The caller must then
+     * read the frame's payload with [readPayload] before asking for the next header.
+     *
+     * @throws TruncatedFrameException if the stream ends inside the header.
+     * @throws ProtocolException for an unknown type, a type [limits] does not accept, or an oversized length.
+     * @throws IllegalStateException if the previous frame's payload has not been read.
+     */
+    suspend fun readHeader(limits: FrameLimits = this.limits): FrameHeader? {
+        check(pending == null) { "the payload of the previous frame has not been read" }
         if (!fill(FrameCodec.HEADER_SIZE)) {
             if (end == start) return null
             throw TruncatedFrameException("stream ended inside a frame header (${end - start} of ${FrameCodec.HEADER_SIZE} bytes)")
         }
         val header = FrameCodec.parseHeader(BigEndian.getU32(buffer, start), buffer[start + 4].toInt() and 0xFF, limits)
         start += FrameCodec.HEADER_SIZE
-        val payload = ByteArray(header.payloadLength)
-        readFully(payload, header)
-        return Frame(header.type, payload)
+        pending = header
+        return header
+    }
+
+    /**
+     * Reads the payload of the header [readHeader] just returned into `destination[offset until offset + length]`,
+     * where `length` is the header's payload length.
+     *
+     * @throws TruncatedFrameException if the stream ends inside the payload.
+     * @throws IllegalStateException if no header is pending.
+     */
+    suspend fun readPayload(
+        destination: ByteArray,
+        offset: Int = 0,
+    ) {
+        val header = checkNotNull(pending) { "no frame header is pending; call readHeader first" }
+        require(offset >= 0 && offset <= destination.size - header.payloadLength) {
+            "destination has no room for ${header.payloadLength} bytes at $offset"
+        }
+        readFully(destination, offset, header)
+        pending = null
     }
 
     /** Ensures at least [count] bytes are buffered; returns false if the stream ended first. */
@@ -71,16 +108,18 @@ class FrameReader(
 
     private suspend fun readFully(
         destination: ByteArray,
+        offset: Int,
         header: FrameHeader,
     ) {
-        var filled = minOf(end - start, destination.size)
-        buffer.copyInto(destination, 0, start, start + filled)
+        val length = header.payloadLength
+        var filled = minOf(end - start, length)
+        buffer.copyInto(destination, offset, start, start + filled)
         start += filled
-        while (filled < destination.size) {
-            val remaining = destination.size - filled
+        while (filled < length) {
+            val remaining = length - filled
             val n =
                 if (remaining >= buffer.size) {
-                    readSome(destination, filled, remaining)
+                    readSome(destination, offset + filled, remaining)
                 } else {
                     // Refill the buffer, then copy what this frame needs; the rest stays buffered for the next frame.
                     start = 0
@@ -89,7 +128,7 @@ class FrameReader(
                     if (got > 0) {
                         end = got
                         val take = minOf(got, remaining)
-                        buffer.copyInto(destination, filled, 0, take)
+                        buffer.copyInto(destination, offset + filled, 0, take)
                         start = take
                         take
                     } else {
@@ -144,7 +183,9 @@ class FrameReader(
  * Writes frames (architecture §7.1) to a [DataChannel].
  *
  * Safe for concurrent use: a [Mutex] keeps frames from interleaving, so control messages, acks and heartbeats may be
- * written from different coroutines. Frames written with `flush = false` are coalesced in an internal buffer of
+ * written from different coroutines. Protected frames are sealed while the mutex is held ([writeProtected] and the
+ * helpers built on it), so they reach the wire in the order the [FrameProtector] took their nonce counters. Frames
+ * written with `flush = false` are coalesced in an internal buffer of
  * [bufferSize] bytes and go out on the next flushing write or [flush]; frames larger than the buffer are written
  * directly. If a write fails or is cancelled mid-frame, the stream is left in an unknown state: the writer refuses
  * further frames and the caller must close the channel.
@@ -181,28 +222,32 @@ class FrameWriter(
         flush: Boolean = true,
     ) {
         require(offset >= 0 && length >= 0 && offset <= payload.size - length) { "payload range out of bounds" }
-        if (length > type.maxPayload) {
-            throw ProtocolException("payload of $length bytes does not fit a $type frame (max ${type.maxPayload})")
+        checkFits(type, length)
+        mutex.withLock {
+            check(!broken) { "an earlier write failed; the stream must be closed" }
+            guarded { put(type, payload, offset, length, flush) }
         }
+    }
+
+    /**
+     * Writes one [type] frame whose [payloadLength]-byte payload [produce] builds while the writer's lock is held, so
+     * payloads are produced in wire order; the protected-frame helpers seal inside [produce]. A failure inside
+     * [produce] breaks the writer like a failed write, because the protector may have spent a nonce counter on a frame
+     * that never reached the wire.
+     */
+    internal suspend fun writeProduced(
+        type: FrameType,
+        payloadLength: Int,
+        flush: Boolean,
+        produce: () -> ByteArray,
+    ) {
+        checkFits(type, payloadLength)
         mutex.withLock {
             check(!broken) { "an earlier write failed; the stream must be closed" }
             guarded {
-                val total = FrameCodec.HEADER_SIZE + length
-                if (used + total > buffer.size) drain()
-                FrameCodec.writeHeader(buffer, used, type, length)
-                used += FrameCodec.HEADER_SIZE
-                if (total <= buffer.size) {
-                    payload.copyInto(buffer, used, offset, offset + length)
-                    used += length
-                } else {
-                    drain()
-                    channel.write(payload, offset, length)
-                    bytesWritten += length
-                }
-                if (flush) {
-                    drain()
-                    channel.flush()
-                }
+                val payload = produce()
+                check(payload.size == payloadLength) { "produced ${payload.size} payload bytes, expected $payloadLength" }
+                put(type, payload, 0, payload.size, flush)
             }
         }
     }
@@ -220,6 +265,41 @@ class FrameWriter(
                 drain()
                 channel.flush()
             }
+        }
+    }
+
+    private fun checkFits(
+        type: FrameType,
+        length: Int,
+    ) {
+        if (length < 0 || length > type.maxPayload) {
+            throw ProtocolException("payload of $length bytes does not fit a $type frame (max ${type.maxPayload})")
+        }
+    }
+
+    /** Appends one frame; the caller holds the mutex. */
+    private suspend fun put(
+        type: FrameType,
+        payload: ByteArray,
+        offset: Int,
+        length: Int,
+        flush: Boolean,
+    ) {
+        val total = FrameCodec.HEADER_SIZE + length
+        if (used + total > buffer.size) drain()
+        FrameCodec.writeHeader(buffer, used, type, length)
+        used += FrameCodec.HEADER_SIZE
+        if (total <= buffer.size) {
+            payload.copyInto(buffer, used, offset, offset + length)
+            used += length
+        } else {
+            drain()
+            channel.write(payload, offset, length)
+            bytesWritten += length
+        }
+        if (flush) {
+            drain()
+            channel.flush()
         }
     }
 

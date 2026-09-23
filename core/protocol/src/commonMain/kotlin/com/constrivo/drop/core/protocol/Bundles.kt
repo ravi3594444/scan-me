@@ -290,7 +290,8 @@ data class TransferUnit(
  * - **Global order** numbers all units 0 until [totalUnits]: bundles first (they are what the UI shows first, §7.5),
  *   then the chunks of each chunked file in file order. The scheduler may use it as the default queue order.
  * - [missingUnits] (receiver) and [expand] (sender) convert between "which units are present" and the
- *   [MissingUnits] carried by `Resume` and `Accept.resume`.
+ *   [MissingUnits] carried by `Resume` and `Accept.resume`; [unitsOf] names the units of one file, for a
+ *   [Retransmit] after a whole-file SHA-256 mismatch.
  */
 class TransferLayout private constructor(
     val chunkSize: Int,
@@ -403,6 +404,21 @@ class TransferLayout private constructor(
         }
     }
 
+    /**
+     * The units that carry file [fileIndex], as a [MissingUnits] to request it again whole: its bundle for a bundled
+     * file (resending the other files of that bundle too), a file range for a chunked file, and [MissingUnits.NONE]
+     * for an empty chunked file, which has no units (its `FileDone` alone completes it).
+     */
+    fun unitsOf(fileIndex: Int): MissingUnits {
+        require(fileIndex in fileSizes.indices) { "file $fileIndex out of range" }
+        val bundle = bundlePlan.bundleOf(fileIndex)
+        return when {
+            bundle != null -> MissingUnits(chunks = listOf(MissingChunks(BUNDLE_FILE_INDEX, listOf(IndexRange(bundle.index, 1)))))
+            unitCount(fileIndex) > 0 -> MissingUnits(files = listOf(IndexRange(fileIndex, 1)))
+            else -> MissingUnits.NONE
+        }
+    }
+
     /** "Everything is missing": the [MissingUnits] of a fresh transfer. */
     fun everything(): MissingUnits = missingUnits { false }
 
@@ -419,7 +435,7 @@ class TransferLayout private constructor(
         presentBytes: (TransferUnit) -> Int = { 0 },
         isPresent: (TransferUnit) -> Boolean,
     ): MissingUnits {
-        var chunks: List<MissingChunks> = ArrayList()
+        val exact = ArrayList<MissingChunks>()
         val wholeFiles = ArrayList<Int>()
         for (key in trackingKeys.sortedBy { it.asU32() }) {
             val count = unitCount(key)
@@ -433,9 +449,10 @@ class TransferLayout private constructor(
             } else {
                 var ranges = IndexRange.coalesce(missing)
                 while (ranges.size > ProtocolConstants.MAX_RANGES_PER_ENTRY) ranges = mergePairs(ranges)
-                chunks = chunks + MissingChunks(key, ranges, offset)
+                exact += MissingChunks(key, ranges, offset)
             }
         }
+        var chunks: List<MissingChunks> = exact
         var files = joinAcrossUnitless(IndexRange.coalesce(wholeFiles))
         while (true) {
             if (withinLimits(chunks, files)) {
@@ -468,8 +485,10 @@ class TransferLayout private constructor(
     }
 
     /**
-     * Expands [missing] into the units the sender re-queues (sender side of §7.6), in global order, each with the
-     * byte offset to start from. Throws [ProtocolException] if [missing] names units that are not in this layout.
+     * Expands [missing] into its units, in global order, each with the byte offset to start from (sender side of
+     * §7.6). For a `Resume` (or `Accept.resume`) the result is the whole queue: the sender replaces what it still had
+     * queued with exactly these units. For a [Retransmit] the sender adds them to its queue and drops nothing. Throws
+     * [ProtocolException] if [missing] names units that are not in this layout.
      */
     fun expand(missing: MissingUnits): List<ResumeUnit> {
         val out = ArrayList<ResumeUnit>()
@@ -557,13 +576,24 @@ class TransferLayout private constructor(
             return TransferLayout(chunkSize, plan, fileSizes.toLongArray(), chunked, counts, first, slots)
         }
 
-        /** The layout for [offer] and its complete file list; checks the bundle count like [FileListAssembler]. */
+        /**
+         * The layout for [offer] and its complete, peer-supplied file list. Checks what [FileListAssembler] checks, so
+         * every problem with the peer's data is a [ProtocolException]: the file count and indices, sizes adding up to
+         * `total_bytes` (without overflow), at most `Int.MAX_VALUE` chunks per file, and the bundle count.
+         */
         fun of(
             offer: Offer,
             files: List<FileEntry>,
         ): TransferLayout {
             if (files.size != offer.fileCount) throw ProtocolException("file list has ${files.size} files, offer says ${offer.fileCount}")
-            if (files.withIndex().any { (i, f) -> f.index != i }) throw ProtocolException("file indices must run 0 until ${files.size}")
+            var total = 0L
+            for ((i, file) in files.withIndex()) {
+                if (file.index != i) throw ProtocolException("file indices must run 0 until ${files.size}")
+                if (file.size > offer.totalBytes - total) throw ProtocolException("file sizes exceed total_bytes ${offer.totalBytes}")
+                checkChunkCount(file.index, file.size, offer.chunkSize)
+                total += file.size
+            }
+            if (total != offer.totalBytes) throw ProtocolException("file sizes add up to $total, offer says ${offer.totalBytes}")
             val layout = of(files.map { it.size }, offer.chunkSize, offer.bundleSmall)
             if (layout.bundleCount != offer.bundleCount) {
                 throw ProtocolException("bundle plan has ${layout.bundleCount} bundles, offer says ${offer.bundleCount}")
@@ -578,6 +608,20 @@ data class ResumeUnit(
     val unit: TransferUnit,
     val fromOffset: Int,
 )
+
+/**
+ * Throws [ProtocolException] when a peer-supplied file [fileIndex] of [size] bytes needs more chunks of [chunkSize]
+ * than a u31 chunk index can name (a [ChunkPlan] would reject it with [IllegalArgumentException]).
+ */
+internal fun checkChunkCount(
+    fileIndex: Int,
+    size: Long,
+    chunkSize: Int,
+) {
+    if (countChunks(size, chunkSize) > Int.MAX_VALUE) {
+        throw ProtocolException("file $fileIndex of $size bytes needs more than ${Int.MAX_VALUE} chunks of $chunkSize bytes")
+    }
+}
 
 /** Chunks needed for [fileSize] bytes, without overflowing near Long.MAX_VALUE. */
 private fun countChunks(

@@ -3,10 +3,12 @@ package com.constrivo.drop.core.protocol
 /**
  * The only exception the protocol decoders throw for bad input (architecture §7.1–7.3).
  *
- * Every decoder in this module ([FrameCodec], [FrameReader], [ControlCodec], [ChunkHeader], [BundleIndex], the
- * `FileList` assembler and the plan validators) turns malformed, truncated, oversized or out-of-range input into a
- * [ProtocolException] (or one of its subclasses), never an `IndexOutOfBoundsException`, a serialization exception
- * or an allocation beyond the limits in [ProtocolConstants]. `tools/fuzz` checks this property.
+ * Every decoder and validator of peer data in this module ([FrameCodec], [FrameReader], [ControlCodec],
+ * [ChunkHeader], [ChunkView], [BundleIndex], [StreamOpenFrame], [FileListAssembler], `TransferLayout.of(offer, files)`
+ * and [TransferLayout.expand]) turns malformed, truncated, oversized or out-of-range input into a
+ * [ProtocolException] (or one of its subclasses), never an `IndexOutOfBoundsException`, an
+ * `IllegalArgumentException`, a serialization exception or an allocation beyond the limits in [ProtocolConstants].
+ * `tools/fuzz` checks this property.
  *
  * The engine answers a [ProtocolException] on an authenticated stream with `Cancel(reason = protocol)`.
  */

@@ -123,6 +123,8 @@ class FileIndexSet private constructor(
  * @property verifiedFiles receiver: files whose SHA-256 matched; [bytesVerified] sums their sizes.
  * @property failedFiles files that failed after [TransferTimeouts.maxMismatches] mismatches (receiver), or that the
  *   receiver's `Complete` reported (sender).
+ * @property pendingComplete receiver: every file was resolved while the link was down, so the transfer waits in
+ *   `Reconnecting` or `Parked` to send this `Complete` on [TransferEvent.Resumed] before it ends.
  */
 data class TransferState(
     val transferId: TransferId,
@@ -148,6 +150,7 @@ data class TransferState(
     val declineReason: DeclineReason? = null,
     val completeStatus: CompleteStatus? = null,
     val failure: String? = null,
+    val pendingComplete: Complete? = null,
 ) {
     init {
         require(fileCount >= 1) { "a transfer has at least one file" }
@@ -214,9 +217,9 @@ sealed interface TransferEvent {
     /** While parked, the peer's beacon was seen again: reconnect actively. */
     data object PeerRediscovered : TransferEvent
 
-    /** Sender: the receiver re-requested units (a `Resume` while connected, after a mismatch). */
+    /** Sender: the receiver's [Retransmit] arrived; the engine adds its units to the queue. */
     data class RetransmitRequested(
-        val resume: Resume,
+        val retransmit: Retransmit,
     ) : TransferEvent
 
     /** Receiver: file [fileIndex] ([bytes] long) matched its `FileDone` SHA-256. */
@@ -226,17 +229,26 @@ sealed interface TransferEvent {
     ) : TransferEvent
 
     /**
-     * Receiver: [unit] failed its per-frame XXH3-128 check. [files] are the files it carries (one file for a chunk,
-     * all its files for a bundle); they fail when the unit reaches the mismatch limit.
+     * Receiver: the frame of [unit] starting at byte [blockOffset] (0 for a whole-unit Wi-Fi frame, the block's
+     * offset for a Bluetooth block, S1) failed its per-frame XXH3-128 check. [files] are the files the unit carries
+     * (one file for a chunk, all its files for a bundle); they fail when the unit reaches the mismatch limit. The
+     * `Retransmit` asks for the unit from [blockOffset], because the blocks before it verified.
      */
     data class ChunkHashMismatch(
         val unit: TransferUnit,
         val files: List<Int>,
-    ) : TransferEvent
+        val blockOffset: Int = 0,
+    ) : TransferEvent {
+        init {
+            require(blockOffset in 0 until ProtocolConstants.CHUNK_SIZE) { "block offset $blockOffset out of range" }
+        }
+    }
 
     /**
-     * Receiver: file [fileIndex]'s SHA-256 did not match its `FileDone`. [suspects] are the units to request again
-     * (from re-hashing the partial against the stored chunk hashes, N5, or the whole file).
+     * Receiver: file [fileIndex]'s SHA-256 did not match its `FileDone`. [suspects] are the units to request again:
+     * those whose stored chunk hashes no longer match the partial (N5), or the whole file from
+     * [TransferLayout.unitsOf] (for a bundled file that is its bundle). Empty suspects mean nothing can be sent again
+     * (an empty file), so the file fails at once.
      */
     data class FileHashMismatch(
         val fileIndex: Int,
@@ -342,11 +354,13 @@ data class Transition(
  * - Streaming → `Verifying` when every unit is acked (the sender then sends `Complete`); the receiver reaches `Done`
  *   when every file is verified or failed, and sends `Complete`; the sender reaches `Done` on the receiver's
  *   `Complete` (`Failed` if it reports failure).
- * - A mismatch re-requests the unit with `Resume` (from `Verifying`, back to streaming); the third mismatch on a unit
- *   or file fails the file; if every file fails the transfer is `Failed`.
+ * - A mismatch re-requests the unit with `Retransmit` (from `Verifying`, back to streaming); the third mismatch on a
+ *   unit or file fails the file; if every file fails the transfer is `Failed`.
  * - Heartbeat lost (6 s) or link lost → `Reconnecting` (2 min of active attempts) → `Parked` (until 24 h after the
  *   interruption, waiting for the beacon) → `Cancelled` (`timeout`, partials cleared). `Resumed` returns to streaming
  *   (or `Verifying` if everything was already acked); a rediscovered beacon turns `Parked` back into `Reconnecting`.
+ *   A receiver that resolves its last file while interrupted keeps waiting and sends its `Complete` on `Resumed`
+ *   (or ends without sending it when the parked window runs out).
  * - Cancel (local, remote, storage) → `Cancelled`; a protocol violation → `Failed`. The receiver clears partials on
  *   every end but `Done`; every end after `Offered` releases the link.
  */
@@ -484,7 +498,7 @@ class TransferStateMachine(
 
             is TransferEvent.RetransmitRequested -> {
                 when {
-                    !sender || event.resume.transferId != state.transferId -> {
+                    !sender || event.retransmit.transferId != state.transferId -> {
                         ignore(state)
                     }
 
@@ -660,8 +674,9 @@ class TransferStateMachine(
         if (state.role != TransferRole.RECEIVER || state.phase == TransferPhase.OFFERED) return ignore(state)
         val strikes = (state.unitStrikes[event.unit] ?: 0) + 1
         if (strikes < timeouts.maxMismatches) {
-            val retry = MissingUnits(chunks = listOf(MissingChunks(event.unit.fileIndex, listOf(IndexRange(event.unit.chunkIndex, 1)))))
-            return retryUnits(state.copy(unitStrikes = state.unitStrikes + (event.unit to strikes)), retry, now)
+            val entry = MissingChunks(event.unit.fileIndex, listOf(IndexRange(event.unit.chunkIndex, 1)), event.blockOffset)
+            val next = state.copy(unitStrikes = state.unitStrikes + (event.unit to strikes))
+            return retryUnits(next, MissingUnits(chunks = listOf(entry)), now)
         }
         return failFiles(state.copy(unitStrikes = state.unitStrikes - event.unit), event.files, now)
     }
@@ -675,20 +690,24 @@ class TransferStateMachine(
         if (state.role != TransferRole.RECEIVER || state.phase == TransferPhase.OFFERED) return ignore(state)
         if (index !in 0 until state.fileCount || index in state.verifiedFiles || index in state.failedFiles) return ignore(state)
         val strikes = (state.fileStrikes[index] ?: 0) + 1
-        if (strikes < timeouts.maxMismatches) {
-            val retry = if (event.suspects.isEmpty) MissingUnits(files = listOf(IndexRange(index, 1))) else event.suspects
-            return retryUnits(state.copy(fileStrikes = state.fileStrikes + (index to strikes)), retry, now)
+        // Without suspects nothing can be sent again, so another verification would fail the same way.
+        if (strikes < timeouts.maxMismatches && !event.suspects.isEmpty) {
+            return retryUnits(state.copy(fileStrikes = state.fileStrikes + (index to strikes)), event.suspects, now)
         }
         return failFiles(state.copy(fileStrikes = state.fileStrikes - index), listOf(index), now)
     }
 
-    /** Re-requests [missing]; from `Verifying` the transfer goes back to streaming. No send while interrupted. */
+    /**
+     * Re-requests [units] with a `Retransmit`; from `Verifying` the transfer goes back to streaming. Nothing is sent
+     * while interrupted: the engine keeps the units out of its manifest, so the `Resume` after the reconnect, which is
+     * the complete missing set, lists them.
+     */
     private fun retryUnits(
         state: TransferState,
-        missing: MissingUnits,
+        units: MissingUnits,
         now: Long,
     ): Transition {
-        val effects = if (state.phase.isInterrupted) emptyList() else listOf(TransferEffect.Send(Resume(state.transferId, missing)))
+        val effects = if (state.phase.isInterrupted) emptyList() else listOf(TransferEffect.Send(Retransmit(state.transferId, units)))
         val next =
             if (state.phase ==
                 TransferPhase.VERIFYING
@@ -716,7 +735,11 @@ class TransferStateMachine(
         return if (next.resolvedFiles == next.fileCount) resolveReceiver(next, now, effects) else move(next, now, effects)
     }
 
-    /** Receiver: every file is verified or failed. Sends `Complete` and ends in `Done`, or `Failed` if none verified. */
+    /**
+     * Receiver: every file is verified or failed. Sends `Complete` and ends in `Done`, or `Failed` if none verified.
+     * While interrupted the `Complete` could not reach the sender (and nothing would re-send it after a terminal
+     * state), so the outcome is kept in [TransferState.pendingComplete] until [TransferEvent.Resumed].
+     */
     private fun resolveReceiver(
         state: TransferState,
         now: Long,
@@ -730,20 +753,25 @@ class TransferStateMachine(
             }
         val failed = state.failedFiles.toList().take(ProtocolConstants.MAX_RESUME_ENTRIES)
         val complete = Complete(state.transferId, status, state.bytesVerified, duration(state, now), failed)
-        val phase = if (status == CompleteStatus.FAILED) TransferPhase.FAILED else TransferPhase.DONE
+        if (state.phase.isInterrupted) return move(state.copy(pendingComplete = complete), now, before)
+        return finishResolved(state, complete, now, before + TransferEffect.Send(complete))
+    }
+
+    /** Receiver: ends in `Done` or `Failed` according to [complete], after the effects in [first]. */
+    private fun finishResolved(
+        state: TransferState,
+        complete: Complete,
+        now: Long,
+        first: List<TransferEffect>,
+    ): Transition {
+        val failed = complete.status == CompleteStatus.FAILED
         val next =
             state.copy(
-                completeStatus = status,
-                cancelReason =
-                    if (phase ==
-                        TransferPhase.FAILED
-                    ) {
-                        CancelReason.VERIFICATION
-                    } else {
-                        null
-                    },
+                completeStatus = complete.status,
+                cancelReason = if (failed) CancelReason.VERIFICATION else null,
+                pendingComplete = null,
             )
-        return finish(next, phase, now, before + TransferEffect.Send(complete))
+        return finish(next, if (failed) TransferPhase.FAILED else TransferPhase.DONE, now, first)
     }
 
     private fun completeReceived(
@@ -798,6 +826,10 @@ class TransferStateMachine(
         event: TransferEvent.Resumed,
         now: Long,
     ): Transition {
+        state.pendingComplete?.let { complete ->
+            val back = state.copy(link = event.kind, freqMhz = event.freqMhz)
+            return finishResolved(back, complete, now, listOf(TransferEffect.Send(complete)))
+        }
         val heartbeat = now + timeouts.heartbeatLostMillis
         val phase = if (state.allUnitsAcked) TransferPhase.VERIFYING else streamingPhase(event.kind)
         val stop = if (state.phase == TransferPhase.RECONNECTING) TransferEffect.StopReconnect else TransferEffect.StopWatchingForPeer
@@ -847,7 +879,7 @@ class TransferStateMachine(
                 if (state.phase != TransferPhase.RECONNECTING) return ignore(state)
                 val parkedUntil = state.parkedDeadlineMillis ?: now
                 if (now >= parkedUntil) {
-                    finish(state.copy(cancelReason = CancelReason.TIMEOUT), TransferPhase.CANCELLED, now, emptyList())
+                    windowExpired(state, now)
                 } else {
                     move(
                         state.copy(phase = TransferPhase.PARKED, timers = state.timers - TransferTimer.RECONNECT_WINDOW),
@@ -858,13 +890,22 @@ class TransferStateMachine(
             }
 
             TransferTimer.PARKED_WINDOW -> {
-                if (state.phase.isInterrupted) {
-                    finish(state.copy(cancelReason = CancelReason.TIMEOUT), TransferPhase.CANCELLED, now, emptyList())
-                } else {
-                    ignore(state)
-                }
+                if (state.phase.isInterrupted) windowExpired(state, now) else ignore(state)
             }
         }
+    }
+
+    /**
+     * The parked window ran out: `Cancelled` with `timeout`, or, for a receiver that already resolved every file, its
+     * resolved outcome without the `Complete` it could not deliver.
+     */
+    private fun windowExpired(
+        state: TransferState,
+        now: Long,
+    ): Transition {
+        val pending = state.pendingComplete
+        if (pending != null) return finishResolved(state, pending, now, emptyList())
+        return finish(state.copy(cancelReason = CancelReason.TIMEOUT), TransferPhase.CANCELLED, now, emptyList())
     }
 
     /** A non-terminal transition: the given [effects], then persist and notify. */
@@ -900,6 +941,7 @@ class TransferStateMachine(
                 timers = emptyMap(),
                 interruptedAtMillis = null,
                 parkedDeadlineMillis = null,
+                pendingComplete = null,
                 updatedAtMillis = now,
             )
         return Transition(next, effects)

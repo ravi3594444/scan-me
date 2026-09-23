@@ -103,6 +103,42 @@ class FileListPagingTest {
         assertProtocolError("after the last page") { complete.add(pages[2]) }
     }
 
+    /** Sizes that wrap a 64-bit sum must not slip past `total_bytes`, the figure the user accepted and storage checked. */
+    @Test
+    fun assemblerRejectsSizesThatOverflowTheTotal() {
+        val offer = Offer(TEST_ID, fileCount = 4, totalBytes = 100, bundleCount = 1)
+        val sizes = listOf(100L, Long.MAX_VALUE, Long.MAX_VALUE, 2L)
+        val page = FileList(TEST_ID, 0, true, sizes.mapIndexed { i, size -> FileEntry(i, "f$i", size) })
+        assertProtocolError("wrapped sum") { FileListAssembler(offer).add(page) }
+        assertProtocolError("wrapped sum, layout") { TransferLayout.of(offer, page.files) }
+        // Split across pages, the running total is checked the same way.
+        val pages = FileListPager.paginate(TEST_ID, page.files, maxEntries = 1)
+        val assembler = FileListAssembler(offer)
+        assertNull(assembler.add(pages[0]))
+        assertProtocolError("wrapped sum over pages") { assembler.add(pages[1]) }
+    }
+
+    /** A file whose chunk count does not fit a u31 chunk index is the peer's fault: ProtocolException, not IllegalArgumentException. */
+    @Test
+    fun filesWithMoreChunksThanAChunkIndexCanNameAreRejected() {
+        val chunk = ProtocolConstants.MIN_CHUNK_SIZE
+        val huge = Offer(TEST_ID, fileCount = 1, totalBytes = Long.MAX_VALUE, chunkSize = chunk, bundleSmall = false, bundleCount = 0)
+        val files = listOf(FileEntry(0, "a", Long.MAX_VALUE))
+        assertProtocolError("assembler") { FileListAssembler(huge).add(FileList(TEST_ID, 0, true, files)) }
+        assertProtocolError("layout") { TransferLayout.of(huge, files) }
+
+        val largest = Int.MAX_VALUE.toLong() * chunk
+        val fits = huge.copy(totalBytes = largest)
+        val ok = listOf(FileEntry(0, "a", largest))
+        assertEquals(ok, FileListAssembler(fits).add(FileList(TEST_ID, 0, true, ok)))
+        assertEquals(Int.MAX_VALUE.toLong(), TransferLayout.of(fits, ok).totalUnits)
+        val oneMore = listOf(FileEntry(0, "a", largest + 1))
+        assertProtocolError("one byte more") {
+            FileListAssembler(fits.copy(totalBytes = largest + 1)).add(FileList(TEST_ID, 0, true, oneMore))
+        }
+        assertProtocolError("one byte more, layout") { TransferLayout.of(fits.copy(totalBytes = largest + 1), oneMore) }
+    }
+
     @Test
     fun assemblerChecksTheBundleCount() {
         val files = List(3) { FileEntry(it, "s$it.txt", 10) }
@@ -133,5 +169,23 @@ class FileListPagingTest {
         assertRejectsArgument { MimeHistogram.of(emptyList(), maxEntries = 0) }
         // Usable directly in an Offer.
         Offer(TEST_ID, fileCount = buckets.size, totalBytes = 0, mimeHistogram = histogram, bundleCount = 1)
+    }
+
+    /** Long or slash-less types from local metadata must still give histogram keys an Offer accepts. */
+    @Test
+    fun mimeBucketsNeverExceedTheKeyLimit() {
+        val max = ProtocolConstants.MAX_MIME_BYTES
+        val types =
+            (0 until 10).map { "x".repeat(max - 1) + ('a' + it) } + // 255 bytes, no slash
+                (0 until 5).map { "y".repeat(max - 2) + "/" + ('a' + it) } + // top-level type of 253 bytes: "…/*" is 255
+                (0 until 5).map { "z".repeat(max - 1) + "/" } + // slash at byte 254: the bucket would be 256 bytes
+                listOf("/leading", "image/png", "image/jpeg")
+        val histogram = MimeHistogram.of(types)
+        assertTrue(histogram.keys.all { it.encodeToByteArray().size <= max }, "${histogram.keys.map { it.length }}")
+        assertEquals(types.size, histogram.values.sum())
+        assertEquals(10 + 5 + 1, histogram[MimeHistogram.ANY], "no slash, an oversized bucket or no top-level type: */*")
+        assertEquals(5, histogram["y".repeat(max - 2) + "/*"])
+        assertEquals(2, histogram["image/*"])
+        Offer(TEST_ID, fileCount = types.size, totalBytes = 0, mimeHistogram = histogram, bundleCount = 1)
     }
 }

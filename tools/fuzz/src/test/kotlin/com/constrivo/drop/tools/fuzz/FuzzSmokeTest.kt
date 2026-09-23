@@ -11,8 +11,10 @@ import kotlin.test.fail
  * The CI fuzz job (testing §5 "Fuzz" row): every protocol decoder under mutated golden encodings and random bytes.
  *
  * - Default: a fixed seed and a fixed number of inputs per target, about ten seconds in total, deterministic.
- * - `-Pdrop.nightly=true`: one minute per target (five minutes in all) with a seed derived from the date, printed so
- *   a failure can be replayed with `-Pdrop.fuzz.seed=<seed>` or `fuzz --seed <seed>`.
+ * - `-Pdrop.nightly=true`: one minute per target with a seed derived from the date, printed so a failure can be
+ *   replayed with `-Pdrop.fuzz.seed=<seed>` or `fuzz --seed <seed>`. `tools/fuzz/build.gradle.kts` computes that seed
+ *   and passes it as the `drop.fuzz.seed` system property, so it is a task input (a new seed is never a build-cache
+ *   hit), and nightly runs are never up to date; the date fallback here only serves runs outside Gradle.
  */
 class FuzzSmokeTest {
     @Test

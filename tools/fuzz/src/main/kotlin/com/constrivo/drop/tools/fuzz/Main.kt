@@ -4,8 +4,8 @@ import kotlin.system.exitProcess
 
 private const val USAGE = """usage: fuzz [--seconds N] [--iterations N] [--seed N] [--target NAME]... [--max-size BYTES]
 
-Fuzzes the core/protocol decoders (frame, control, chunk, bundle, stream-open) and checks that every input either
-decodes or raises ProtocolException, within the allocation limits the decoders declare.
+Fuzzes the core/protocol decoders (frame, control, chunk, bundle, stream-open, layout) and checks that every input
+either decodes or raises ProtocolException, within the allocation limits the decoders declare.
 
   --seconds N      total wall-clock budget, split evenly across targets (default 60)
   --iterations N   inputs per target (overrides --seconds when given alone)

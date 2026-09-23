@@ -36,6 +36,7 @@ import com.constrivo.drop.core.protocol.Preview
 import com.constrivo.drop.core.protocol.ProtocolConstants.BUNDLE_FILE_INDEX
 import com.constrivo.drop.core.protocol.ProtocolConstants.CHUNK_SIZE
 import com.constrivo.drop.core.protocol.Resume
+import com.constrivo.drop.core.protocol.Retransmit
 import com.constrivo.drop.core.protocol.Sha256Digest
 import com.constrivo.drop.core.protocol.StreamDirection
 import com.constrivo.drop.core.protocol.StreamOpen
@@ -252,6 +253,16 @@ object GoldenVectors {
                     generation = 0,
                 ),
                 "820fa5015000112233445566778899aabbccddeeff020203637332720467636f6e74726f6c0500",
+            ),
+            ControlVector(
+                "retransmit",
+                Retransmit(
+                    TRANSFER_ID,
+                    MissingUnits(
+                        chunks = listOf(MissingChunks(fileIndex = 4, ranges = listOf(IndexRange(1, 1)), firstBlockOffset = 49152)),
+                    ),
+                ),
+                "8210a2015000112233445566778899aabbccddeeff02a20181a3010402818201010319c0000280",
             ),
         )
 

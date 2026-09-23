@@ -38,8 +38,16 @@ class ControlCodecTest {
                 LinkReady("lan", freqMhz = 0, generation = 12),
                 Complete(TEST_ID, CompleteStatus.FAILED, 0, 0, failedFiles = listOf(0, 1, 99_999)),
                 StreamOpen(OTHER_ID, Int.MAX_VALUE, StreamDirection.RECEIVER_TO_SENDER, StreamPurpose.DATA, Int.MAX_VALUE),
+                Retransmit(TEST_ID, MissingUnits(files = listOf(IndexRange(3, 2)))),
             )
         for (message in messages) assertEquals(message, ControlCodec.decode(ControlCodec.encode(message)))
+    }
+
+    @Test
+    fun anEmptyRetransmitIsRejectedOnDecode() {
+        val id = RawCbor.bytes(TEST_ID.toByteArray())
+        val empty = RawCbor.map(RawCbor.uint(1) to RawCbor.array(), RawCbor.uint(2) to RawCbor.array())
+        assertProtocolError { ControlCodec.decode(RawCbor.envelope(16, RawCbor.map(RawCbor.uint(1) to id, RawCbor.uint(2) to empty))) }
     }
 
     @Test
@@ -340,6 +348,8 @@ class ControlCodecTest {
         assertRejectsArgument { Complete(TEST_ID, CompleteStatus.PARTIAL, 1, 1, failedFiles = listOf(3, 3)) }
         assertRejectsArgument { ControlMoved(-1, 0) }
         assertRejectsArgument { StreamOpen(TEST_ID, 0, StreamDirection.SENDER_TO_RECEIVER, StreamPurpose.DATA, 0) }
+        assertRejectsArgument { StreamOpen(TEST_ID, 1, StreamDirection.SENDER_TO_RECEIVER, StreamPurpose.DATA, 0) }
+        assertRejectsArgument { Retransmit(TEST_ID, MissingUnits.NONE) }
         assertRejectsArgument { Hint("x".repeat(ProtocolConstants.MAX_WIRE_NAME_BYTES + 1)) }
         assertRejectsArgument { Hint(HintCode.THERMAL, params = (0..ProtocolConstants.MAX_HINT_PARAMS).associate { "k$it" to "v" }) }
         assertRejectsArgument { TransferId(ByteArray(15)) }

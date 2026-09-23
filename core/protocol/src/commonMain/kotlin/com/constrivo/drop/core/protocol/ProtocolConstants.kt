@@ -25,7 +25,11 @@ object ProtocolConstants {
     /** Largest frame payload accepted by the decoder: one chunk plus headers and tags. */
     const val MAX_FRAME_PAYLOAD: Int = CHUNK_SIZE + 64 * KIB
 
-    /** Stream ids for AEAD nonces (spec change S7): 0 control, 1 Bluetooth, 2.. Wi-Fi data streams. */
+    /**
+     * Stream ids for AEAD nonces (spec change S7): 0 control and 1 Bluetooth data, both on the connection the handshake
+     * ran on; 2 and up for data connections, each opened with a `StreamOpen` from the opener's partition (the handshake
+     * initiator even ids, the responder odd ids; see `SessionRole`).
+     */
     const val STREAM_ID_CONTROL: Int = 0
     const val STREAM_ID_BLUETOOTH: Int = 1
     const val STREAM_ID_FIRST_WIFI: Int = 2

@@ -43,6 +43,7 @@ enum class ControlMessageType(
     CONTROL_MOVED(13),
     TRUST_SHARE(14),
     STREAM_OPEN(15),
+    RETRANSMIT(16),
     ;
 
     companion object {
@@ -183,13 +184,36 @@ data class Ack(
     }
 }
 
-/** R→S on every reconnect, and to re-request units after a mismatch: what is still [missing] (§7.6, S1, S4). */
+/**
+ * R→S on every reconnect (§7.6, S1, S4): the **complete** set of units the receiver still needs. Units not listed are
+ * present, so the sender replaces whatever it still had queued with exactly [missing] ([TransferLayout.expand]).
+ * Re-requests while connected use [Retransmit], which adds to the queue instead.
+ */
 @Serializable
 data class Resume(
     @CborLabel(1) val transferId: TransferId,
     @CborLabel(2) val missing: MissingUnits,
 ) : ControlMessage {
     override val type: ControlMessageType get() = ControlMessageType.RESUME
+}
+
+/**
+ * R→S while connected (§7.2, §7.8): send [units] again, after a per-frame hash mismatch (that unit, from the bad
+ * Bluetooth block's offset through [MissingChunks.firstBlockOffset], S1) or a whole-file SHA-256 mismatch (the
+ * suspect units, or [TransferLayout.unitsOf]). **Additive**: the sender queues these units in addition to everything
+ * it still has to send and drops nothing; unlike [Resume], units not listed say nothing about what the receiver has.
+ * Never empty.
+ */
+@Serializable
+data class Retransmit(
+    @CborLabel(1) val transferId: TransferId,
+    @CborLabel(2) val units: MissingUnits,
+) : ControlMessage {
+    override val type: ControlMessageType get() = ControlMessageType.RETRANSMIT
+
+    init {
+        require(!units.isEmpty) { "a retransmit names at least one unit" }
+    }
 }
 
 /**
@@ -366,8 +390,9 @@ data class TrustShare(
 /**
  * The first frame on every new data connection (spec change S7), carried in a [FrameType.STREAM_OPEN] frame (see
  * [StreamOpenFrame]), never in a `Control` frame. Names the [transferId], the [streamId] whose nonce space the
- * stream uses (1 Bluetooth, 2 and up Wi-Fi; never 0), the [direction] chunks flow, the [purpose], and the link
- * [generation] from `LinkReady`.
+ * stream uses (2 and up, from the opener's [SessionRole] partition; the control stream 0 and the Bluetooth stream 1
+ * run on the handshake connection and are never opened this way), the [direction] chunks flow, the [purpose], and
+ * the link [generation] from `LinkReady`.
  */
 @Serializable
 data class StreamOpen(
@@ -380,8 +405,8 @@ data class StreamOpen(
     override val type: ControlMessageType get() = ControlMessageType.STREAM_OPEN
 
     init {
-        require(streamId >= ProtocolConstants.STREAM_ID_BLUETOOTH) {
-            "a data stream id is at least ${ProtocolConstants.STREAM_ID_BLUETOOTH}"
+        require(streamId >= ProtocolConstants.STREAM_ID_FIRST_WIFI) {
+            "a data connection's stream id is at least ${ProtocolConstants.STREAM_ID_FIRST_WIFI}"
         }
         require(generation >= 0) { "generation must be non-negative" }
     }

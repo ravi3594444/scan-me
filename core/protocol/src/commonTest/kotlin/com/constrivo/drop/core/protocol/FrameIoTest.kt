@@ -168,6 +168,30 @@ class FrameIoTest {
         }
 
     @Test
+    fun headersAndPayloadsCanBeReadIntoPooledBuffers() =
+        runTest {
+            val bytes =
+                FrameCodec.encode(FrameType.CHUNK, ByteArray(300) { it.toByte() }) +
+                    FrameCodec.encode(FrameType.CONTROL, "0102".unhex()) +
+                    FrameCodec.encode(FrameType.CONTROL, ByteArray(0))
+            val reader = FrameReader(ArraySource(bytes, maxRead = 7), bufferSize = 64)
+            val pool = ByteArray(400)
+            assertFailsWith<IllegalStateException>("no header yet") { reader.readPayload(pool) }
+            assertEquals(FrameHeader(FrameType.CHUNK, 300), reader.readHeader())
+            assertFailsWith<IllegalStateException>("payload still pending") { reader.readHeader() }
+            assertFailsWith<IllegalArgumentException>("no room at that offset") { reader.readPayload(pool, 101) }
+            reader.readPayload(pool, 100)
+            assertContentEquals(ByteArray(300) { it.toByte() }, pool.copyOfRange(100, 400))
+            assertEquals(FrameHeader(FrameType.CONTROL, 2), reader.readHeader())
+            reader.readPayload(pool, 0)
+            assertEquals("0102", pool.copyOf(2).hex())
+            assertEquals(FrameHeader(FrameType.CONTROL, 0), reader.readHeader())
+            reader.readPayload(ByteArray(0))
+            assertNull(reader.readHeader())
+            assertEquals(bytes.size.toLong(), reader.bytesRead)
+        }
+
+    @Test
     fun concurrentWritersNeverInterleaveFrames() =
         runTest {
             val (a, b) = InMemoryDataChannel.pair(maxSegment = 100, secondChunking = ReadChunking.fixed(37))

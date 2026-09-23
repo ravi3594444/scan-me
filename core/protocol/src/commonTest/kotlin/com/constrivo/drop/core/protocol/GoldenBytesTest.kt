@@ -82,6 +82,7 @@ class GoldenBytesTest {
                 ControlMoved.serializer(),
                 TrustShare.serializer(),
                 StreamOpen.serializer(),
+                Retransmit.serializer(),
                 WifiCredentials.serializer(),
                 LinkOption.serializer(),
                 LinkIntent.serializer(),

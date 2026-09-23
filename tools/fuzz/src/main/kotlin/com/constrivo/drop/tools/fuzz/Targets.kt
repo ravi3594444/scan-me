@@ -1,5 +1,6 @@
 package com.constrivo.drop.tools.fuzz
 
+import com.constrivo.drop.core.protocol.Accept
 import com.constrivo.drop.core.protocol.BundleIndex
 import com.constrivo.drop.core.protocol.BundlePlan
 import com.constrivo.drop.core.protocol.Bytes
@@ -7,19 +8,35 @@ import com.constrivo.drop.core.protocol.ChunkFrame
 import com.constrivo.drop.core.protocol.ChunkHash
 import com.constrivo.drop.core.protocol.ChunkHeader
 import com.constrivo.drop.core.protocol.ControlCodec
+import com.constrivo.drop.core.protocol.ControlMessage
 import com.constrivo.drop.core.protocol.DataChannel
+import com.constrivo.drop.core.protocol.FileEntry
+import com.constrivo.drop.core.protocol.FileList
+import com.constrivo.drop.core.protocol.FileListAssembler
+import com.constrivo.drop.core.protocol.FileListPager
 import com.constrivo.drop.core.protocol.Frame
 import com.constrivo.drop.core.protocol.FrameCodec
 import com.constrivo.drop.core.protocol.FrameLimits
 import com.constrivo.drop.core.protocol.FrameReader
 import com.constrivo.drop.core.protocol.FrameType
+import com.constrivo.drop.core.protocol.IndexRange
 import com.constrivo.drop.core.protocol.LinkKind
+import com.constrivo.drop.core.protocol.MissingChunks
+import com.constrivo.drop.core.protocol.MissingUnits
+import com.constrivo.drop.core.protocol.Offer
 import com.constrivo.drop.core.protocol.PlaintextFrameProtector
 import com.constrivo.drop.core.protocol.ProtocolConstants
+import com.constrivo.drop.core.protocol.ProtocolConstants.BUNDLE_FILE_INDEX
 import com.constrivo.drop.core.protocol.ProtocolConstants.KIB
 import com.constrivo.drop.core.protocol.ProtocolException
+import com.constrivo.drop.core.protocol.Resume
+import com.constrivo.drop.core.protocol.Retransmit
+import com.constrivo.drop.core.protocol.SessionRole
+import com.constrivo.drop.core.protocol.StreamIdRegistry
 import com.constrivo.drop.core.protocol.StreamOpen
 import com.constrivo.drop.core.protocol.StreamOpenFrame
+import com.constrivo.drop.core.protocol.TransferLayout
+import com.constrivo.drop.core.protocol.TransferUnit
 import com.constrivo.drop.core.protocol.golden.GoldenVectors
 import kotlinx.coroutines.runBlocking
 
@@ -64,7 +81,8 @@ private const val BASE_ALLOCATION: Long = 512L * KIB
 
 /** The fuzz targets for `core/protocol` (testing §5 "Fuzz" row). */
 object ProtocolTargets {
-    fun all(): List<FuzzTarget> = listOf(FrameDecoderTarget, ControlMessageTarget, ChunkHeaderTarget, BundleIndexTarget, StreamOpenTarget)
+    fun all(): List<FuzzTarget> =
+        listOf(FrameDecoderTarget, ControlMessageTarget, ChunkHeaderTarget, BundleIndexTarget, StreamOpenTarget, LayoutTarget)
 
     fun byName(name: String): FuzzTarget = all().firstOrNull { it.name == name } ?: throw IllegalArgumentException("unknown target '$name'")
 }
@@ -216,23 +234,143 @@ object BundleIndexTarget : FuzzTarget {
     }
 }
 
-/** [StreamOpenFrame] with a pass-through protector. Property: an accepted frame round-trips. */
+/**
+ * [StreamOpenFrame] with a pass-through protector, listening as the responder (so the initiator's even ids are
+ * valid). Property: an accepted frame round-trips, and the same id cannot be opened twice.
+ */
 object StreamOpenTarget : FuzzTarget {
     override val name = "stream-open"
 
     override val seeds: List<ByteArray> by lazy {
-        GoldenVectors.controlMessages.map {
-            it.message
-        }.filterIsInstance<StreamOpen>().map { StreamOpenFrame.encode(PlaintextFrameProtector(), it) }
+        val golden = GoldenVectors.controlMessages.map { it.message }.filterIsInstance<StreamOpen>()
+        (golden + golden.map { it.copy(streamId = 1_000_000) }).map { StreamOpenFrame.encode(PlaintextFrameProtector(), it) }
     }
 
     override fun allocationLimit(input: ByteArray): Long = BASE_ALLOCATION + 64L * input.size
 
     override fun run(input: ByteArray): Boolean {
         val protector = PlaintextFrameProtector()
-        val open = StreamOpenFrame.open(protector, Frame(FrameType.STREAM_OPEN, input))
+        val open = StreamOpenFrame.open(protector, Frame(FrameType.STREAM_OPEN, input), StreamIdRegistry(SessionRole.RESPONDER))
+        check(SessionRole.INITIATOR.opens(open.streamId)) { "accepted stream id ${open.streamId} from the wrong partition" }
         val again = StreamOpenFrame.encode(protector, open)
-        check(StreamOpenFrame.open(protector, Frame(FrameType.STREAM_OPEN, again)) == open) { "StreamOpen does not survive a round trip" }
+        val registry = StreamIdRegistry(SessionRole.RESPONDER)
+        val reopened = StreamOpenFrame.open(protector, Frame(FrameType.STREAM_OPEN, again), registry)
+        check(reopened == open) { "StreamOpen does not survive a round trip" }
+        val replayed =
+            try {
+                StreamOpenFrame.open(protector, Frame(FrameType.STREAM_OPEN, again), registry)
+                true
+            } catch (e: ProtocolException) {
+                false
+            }
+        check(!replayed) { "stream ${open.streamId} was opened twice" }
+        return true
+    }
+}
+
+/**
+ * Peer data that describes a transfer: the receiver's [FileListAssembler] and [TransferLayout.of] over the sender's
+ * `Offer` and `FileList` pages, and the sender's [TransferLayout.expand] over the receiver's `Resume`, `Retransmit`
+ * or `Accept.resume`. An input is a sequence of `Control` frames holding plaintext envelopes: an `Offer`, its
+ * `FileList` pages, then any number of those three.
+ *
+ * Property: every problem with the peer's data is a [ProtocolException]; an assembled list pages and assembles again
+ * to itself; every expanded unit is in the layout, once, in global order, and asking for "everything but those"
+ * with [TransferLayout.missingUnits] requests each of them again. Expansion allocates per unit, so it runs for
+ * layouts of at most [MAX_EXPANDED_UNITS] units and at most [MAX_EXPANDED_MESSAGES] messages per input.
+ */
+object LayoutTarget : FuzzTarget {
+    override val name = "layout"
+
+    private const val MAX_EXPANDED_UNITS = 1024L
+    private const val MAX_EXPANDED_MESSAGES = 4
+
+    private val CONTROL_ONLY = FrameLimits.of(FrameType.CONTROL)
+
+    override val seeds: List<ByteArray> by lazy {
+        val id = GoldenVectors.TRANSFER_ID
+        // The golden file list: file 0 is one 2.5 MB chunk, file 1 (42 bytes) is bundle 0.
+        val goldenList = GoldenVectors.controlMessages.map { it.message }.filterIsInstance<FileList>().single()
+        val goldenOffer = Offer(id, fileCount = 2, totalBytes = goldenList.files.sumOf { it.size }, bundleCount = 1)
+        val golden =
+            listOf(
+                goldenOffer,
+                goldenList,
+                Resume(
+                    id,
+                    MissingUnits(
+                        chunks =
+                            listOf(
+                                MissingChunks(0, listOf(IndexRange(0, 1)), firstBlockOffset = 16 * KIB),
+                                MissingChunks(BUNDLE_FILE_INDEX, listOf(IndexRange(0, 1))),
+                            ),
+                    ),
+                ),
+                Retransmit(id, MissingUnits(files = listOf(IndexRange(0, 2)))),
+                Accept(id, resume = MissingUnits.NONE, streamCount = 4),
+            )
+        // Thirty files of every kind over 64 KiB chunks, paged seven entries at a time.
+        val chunk = ProtocolConstants.MIN_CHUNK_SIZE
+        val sizes = List(30) { i -> listOf(0L, 10L, 3L * chunk + 5, chunk.toLong(), 7_000L)[i % 5] }
+        val files = sizes.mapIndexed { i, size -> FileEntry(i, "dir/f$i.bin", size) }
+        val plan = BundlePlan.of(sizes, chunk, bundleSmall = true)
+        val offer = Offer(id, fileCount = files.size, totalBytes = sizes.sum(), chunkSize = chunk, bundleCount = plan.bundleCount)
+        val layout = TransferLayout.of(offer, files)
+        val paged =
+            listOf(offer) + FileListPager.paginate(id, files, maxEntries = 7) +
+                listOf(
+                    Resume(id, layout.missingUnits { it.chunkIndex % 2 == 0 }),
+                    Retransmit(id, layout.unitsOf(3)),
+                    Retransmit(id, layout.unitsOf(1)),
+                    Accept(id, resume = layout.everything(), streamCount = 8),
+                )
+        listOf(golden, paged, paged.take(1 + 5)).map { frames(it) }
+    }
+
+    private fun frames(messages: List<ControlMessage>): ByteArray =
+        messages.fold(ByteArray(0)) { acc, m -> acc + FrameCodec.encode(FrameType.CONTROL, ControlCodec.encode(m)) }
+
+    override fun allocationLimit(input: ByteArray): Long =
+        BASE_ALLOCATION + 128L * input.size + MAX_EXPANDED_MESSAGES * MAX_EXPANDED_UNITS * KIB
+
+    override fun run(input: ByteArray): Boolean {
+        val messages = FrameCodec.decodeAll(input, CONTROL_ONLY).map { ControlCodec.decode(it.payload) }
+        val offer = messages.firstOrNull() as? Offer ?: return false
+        val assembler = FileListAssembler(offer)
+        var next = 1
+        var files: List<FileEntry>? = null
+        while (files == null) {
+            val page = messages.getOrNull(next++) as? FileList ?: return false
+            files = assembler.add(page)
+        }
+        val layout = TransferLayout.of(offer, files)
+        val again = FileListAssembler(offer)
+        val repaged = FileListPager.paginate(offer.transferId, files).map { again.add(it) }
+        check(repaged.last() == files) { "the file list does not page and assemble to itself" }
+
+        val requests = messages.drop(next)
+        for ((i, message) in requests.withIndex()) {
+            val missing =
+                when (message) {
+                    is Resume -> message.missing
+                    is Retransmit -> message.units
+                    is Accept -> message.resume ?: continue
+                    else -> return false
+                }
+            if (i >= MAX_EXPANDED_MESSAGES || layout.totalUnits > MAX_EXPANDED_UNITS) continue
+            val units = layout.expand(missing)
+            var previous = -1L
+            for (unit in units) {
+                check(layout.contains(unit.unit)) { "expanded ${unit.unit}, which is not in the layout" }
+                val global = layout.globalIndex(unit.unit)
+                check(global > previous) { "expanded units are not in strictly increasing global order" }
+                check(unit.fromOffset in 0 until layout.unitLength(unit.unit)) { "offset ${unit.fromOffset} outside ${unit.unit}" }
+                previous = global
+            }
+            val requested: Set<TransferUnit> = units.mapTo(HashSet()) { it.unit }
+            val reRequested = layout.expand(layout.missingUnits { it !in requested }).mapTo(HashSet()) { it.unit }
+            check(reRequested.containsAll(requested)) { "missingUnits dropped a unit that was not present" }
+        }
         return true
     }
 }

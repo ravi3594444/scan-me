@@ -126,14 +126,51 @@ class ChunkFrame(
     override fun toString(): String = "ChunkFrame($header)"
 
     companion object {
-        /** Decodes a chunk plaintext; the payload length must match the rest of [bytes] exactly. */
-        fun decode(bytes: ByteArray): ChunkFrame {
-            val header = ChunkHeader.decode(bytes, 0)
-            val available = bytes.size - ChunkHeader.SIZE
+        /** Decodes a chunk plaintext; the payload length must match the rest of [bytes] exactly. Copies the payload. */
+        fun decode(bytes: ByteArray): ChunkFrame = ChunkView.decode(bytes).toFrame()
+    }
+}
+
+/**
+ * A chunk plaintext decoded without copying its payload: [header], and the payload at
+ * `buffer[payloadOffset until payloadOffset + header.payloadLength]`. The view borrows [buffer]: it stays valid only
+ * while the caller leaves that range unchanged (for example until a pooled receive buffer is reused).
+ */
+class ChunkView(
+    val header: ChunkHeader,
+    val buffer: ByteArray,
+    val payloadOffset: Int,
+) {
+    init {
+        require(payloadOffset >= 0 && payloadOffset <= buffer.size - header.payloadLength) { "payload range outside the buffer" }
+    }
+
+    val payloadLength: Int get() = header.payloadLength
+
+    fun copyPayload(): ByteArray = buffer.copyOfRange(payloadOffset, payloadOffset + payloadLength)
+
+    fun toFrame(): ChunkFrame = ChunkFrame(header, copyPayload())
+
+    override fun toString(): String = "ChunkView($header)"
+
+    companion object {
+        /**
+         * Decodes the chunk plaintext `bytes[offset until offset + length]`: a valid header whose `payload_len` equals
+         * the rest of the range exactly. Throws [ProtocolException] otherwise.
+         */
+        fun decode(
+            bytes: ByteArray,
+            offset: Int = 0,
+            length: Int = bytes.size - offset,
+        ): ChunkView {
+            checkRange(bytes.size, offset, length, "chunk frame")
+            if (length < ChunkHeader.SIZE) throw ProtocolException("chunk frame of $length bytes is shorter than its header")
+            val header = ChunkHeader.decode(bytes, offset)
+            val available = length - ChunkHeader.SIZE
             if (available != header.payloadLength) {
                 throw ProtocolException("chunk payload_len ${header.payloadLength} but $available payload bytes present")
             }
-            return ChunkFrame(header, bytes.copyOfRange(ChunkHeader.SIZE, bytes.size))
+            return ChunkView(header, bytes, offset + ChunkHeader.SIZE)
         }
     }
 }

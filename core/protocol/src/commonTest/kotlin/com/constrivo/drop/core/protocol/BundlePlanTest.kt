@@ -335,5 +335,18 @@ class TransferLayoutTest {
         assertProtocolError { TransferLayout.of(offer.copy(bundleCount = 2), files) }
         assertProtocolError { TransferLayout.of(offer, files.dropLast(1)) }
         assertProtocolError { TransferLayout.of(offer, files.reversed()) }
+        assertProtocolError("sizes short of total_bytes") { TransferLayout.of(offer.copy(totalBytes = offer.totalBytes + 1), files) }
+        assertProtocolError("sizes above total_bytes") { TransferLayout.of(offer.copy(totalBytes = offer.totalBytes - 1), files) }
+    }
+
+    @Test
+    fun unitsOfAFileNameWhatCarriesIt() {
+        val bundle = MissingUnits(chunks = listOf(MissingChunks(BUNDLE_FILE_INDEX, listOf(IndexRange(0, 1)))))
+        for (small in listOf(0, 2, 3, 5)) assertEquals(bundle, layout.unitsOf(small), "file $small")
+        assertEquals(MissingUnits(files = listOf(IndexRange(1, 1))), layout.unitsOf(1))
+        assertEquals(listOf(TransferUnit(1, 0), TransferUnit(1, 1), TransferUnit(1, 2)), layout.expand(layout.unitsOf(1)).map { it.unit })
+        assertEquals(listOf(TransferUnit(BUNDLE_FILE_INDEX, 0)), layout.expand(layout.unitsOf(3)).map { it.unit })
+        assertTrue(TransferLayout.of(listOf(0L), bundleSmall = false).unitsOf(0).isEmpty, "an empty chunked file has no units")
+        assertRejectsArgument { layout.unitsOf(6) }
     }
 }

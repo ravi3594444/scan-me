@@ -52,8 +52,9 @@ object FileListPager {
  *
  * [add] accepts pages in order and returns the complete list when the last page arrives. It throws
  * [ProtocolException] for another transfer's page, a page out of order, non-contiguous file indices, more files than
- * `file_count`, a last page that leaves files missing, sizes that do not add up to `total_bytes`, a bundle plan whose
- * bundle count differs from `bundle_count`, or a page after the last one.
+ * `file_count`, a file with more chunks than a u31 chunk index can name, a last page that leaves files missing, sizes
+ * that do not add up to `total_bytes` (checked without overflow, so the sizes the user accepted are the sizes that
+ * arrive), a bundle plan whose bundle count differs from `bundle_count`, or a page after the last one.
  */
 class FileListAssembler(
     private val offer: Offer,
@@ -75,8 +76,10 @@ class FileListAssembler(
         for (entry in page.files) {
             if (entry.index != files.size) throw ProtocolException("FileList skips from file ${files.size} to ${entry.index}")
             if (files.size >= offer.fileCount) throw ProtocolException("FileList lists more than ${offer.fileCount} files")
+            // total <= totalBytes holds before each entry, so the subtraction cannot overflow and the sum never wraps.
+            if (entry.size > offer.totalBytes - total) throw ProtocolException("FileList sizes exceed total_bytes ${offer.totalBytes}")
+            checkChunkCount(entry.index, entry.size, offer.chunkSize)
             total += entry.size
-            if (total > offer.totalBytes) throw ProtocolException("FileList sizes exceed total_bytes ${offer.totalBytes}")
             files += entry
         }
         nextPage++
@@ -95,8 +98,9 @@ class FileListAssembler(
 /**
  * Builds the `Offer.mime_histogram` (N12) deterministically: counts per lower-cased MIME type (a missing or blank
  * type counts as [UNKNOWN_MIME]). Above `maxEntries` distinct types, each type collapses to its top-level wildcard
- * bucket (`image/` followed by an asterisk); if that is still too many, the largest buckets are kept and the rest
- * merge into [ANY]. The result is in canonical key order and sums to the number of inputs.
+ * bucket (`image/` followed by an asterisk), or to [ANY] when it has no top-level type or the bucket would exceed
+ * [ProtocolConstants.MAX_MIME_BYTES]; if that is still too many, the largest buckets are kept and the rest merge into
+ * [ANY]. The result is in canonical key order and sums to the number of inputs.
  */
 object MimeHistogram {
     const val UNKNOWN_MIME: String = "application/octet-stream"
@@ -118,7 +122,7 @@ object MimeHistogram {
         if (result.size > maxEntries) {
             val buckets = HashMap<String, Int>()
             for ((mime, count) in result) {
-                val bucket = mime.substringBefore('/') + "/*"
+                val bucket = bucketOf(mime)
                 buckets[bucket] = (buckets[bucket] ?: 0) + count
             }
             result = buckets
@@ -134,5 +138,13 @@ object MimeHistogram {
             result = kept
         }
         return canonicalOrder(result)
+    }
+
+    /** `type/` plus an asterisk for `type/subtype`; [ANY] for a value without a top-level type or one too long to bucket. */
+    private fun bucketOf(mime: String): String {
+        val slash = mime.indexOf('/')
+        if (slash <= 0) return ANY
+        val bucket = mime.substring(0, slash) + "/*"
+        return if (utf8Length(bucket) in 1..ProtocolConstants.MAX_MIME_BYTES) bucket else ANY
     }
 }
