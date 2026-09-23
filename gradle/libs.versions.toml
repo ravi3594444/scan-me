@@ -1,0 +1,66 @@
+[versions]
+# Pinned 23 Sep 2026 to the latest stable releases (see docs/implementation-plan.md §1).
+kotlin = "2.4.20"
+agp = "9.4.1"
+compose-multiplatform = "1.12.1"
+coroutines = "1.11.0"
+serialization = "1.11.0"
+kotlinx-io = "0.9.1"
+ktor = "3.6.0"
+sqldelight = "2.4.0"
+konsist = "0.17.3"
+ktlint-gradle = "14.2.0"
+ktlint = "1.8.0"
+zero-allocation-hashing = "2026.0"
+jmdns = "3.6.3"
+zxing = "3.5.4"
+androidx-activity = "1.13.0"
+compileSdk = "37"
+targetSdk = "37"
+minSdk = "31"
+jvmTarget = "17"
+
+[libraries]
+kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
+kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
+kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "coroutines" }
+kotlinx-coroutines-swing = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-swing", version.ref = "coroutines" }
+kotlinx-serialization-cbor = { module = "org.jetbrains.kotlinx:kotlinx-serialization-cbor", version.ref = "serialization" }
+kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "serialization" }
+kotlinx-io-core = { module = "org.jetbrains.kotlinx:kotlinx-io-core", version.ref = "kotlinx-io" }
+ktor-server-core = { module = "io.ktor:ktor-server-core", version.ref = "ktor" }
+ktor-server-cio = { module = "io.ktor:ktor-server-cio", version.ref = "ktor" }
+ktor-server-test-host = { module = "io.ktor:ktor-server-test-host", version.ref = "ktor" }
+ktor-client-cio = { module = "io.ktor:ktor-client-cio", version.ref = "ktor" }
+sqldelight-runtime = { module = "app.cash.sqldelight:runtime", version.ref = "sqldelight" }
+sqldelight-coroutines = { module = "app.cash.sqldelight:coroutines-extensions", version.ref = "sqldelight" }
+sqldelight-sqlite-driver = { module = "app.cash.sqldelight:sqlite-driver", version.ref = "sqldelight" }
+sqldelight-android-driver = { module = "app.cash.sqldelight:android-driver", version.ref = "sqldelight" }
+konsist = { module = "com.lemonappdev:konsist", version.ref = "konsist" }
+zero-allocation-hashing = { module = "net.openhft:zero-allocation-hashing", version.ref = "zero-allocation-hashing" }
+jmdns = { module = "org.jmdns:jmdns", version.ref = "jmdns" }
+zxing-core = { module = "com.google.zxing:core", version.ref = "zxing" }
+androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "androidx-activity" }
+
+# Build-logic only
+android-gradlePlugin = { module = "com.android.tools.build:gradle", version.ref = "agp" }
+kotlin-gradlePlugin = { module = "org.jetbrains.kotlin:kotlin-gradle-plugin", version.ref = "kotlin" }
+ktlint-gradlePlugin = { module = "org.jlleitschuh.gradle:ktlint-gradle", version.ref = "ktlint-gradle" }
+
+[plugins]
+kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+compose-multiplatform = { id = "org.jetbrains.compose", version.ref = "compose-multiplatform" }
+android-application = { id = "com.android.application", version.ref = "agp" }
+android-library = { id = "com.android.library", version.ref = "agp" }
+android-kmp-library = { id = "com.android.kotlin.multiplatform.library", version.ref = "agp" }
+sqldelight = { id = "app.cash.sqldelight", version.ref = "sqldelight" }
+ktlint = { id = "org.jlleitschuh.gradle.ktlint", version.ref = "ktlint-gradle" }
+
+# Convention plugins from build-logic/
+drop-kmp-core = { id = "drop.kmp.core" }
+drop-jvm-library = { id = "drop.jvm.library" }
+drop-android-library = { id = "drop.android.library" }
+drop-ktlint = { id = "drop.ktlint" }

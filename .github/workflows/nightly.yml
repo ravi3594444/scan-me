@@ -1,0 +1,39 @@
+name: Nightly
+
+# Long fuzz runs and soak tests (handoff §7, testing §5). The two-phone benchmark cell needs a
+# self-hosted runner attached to the device rig; it is added in WP11.
+on:
+  schedule:
+    - cron: "30 20 * * *" # 02:00 IST
+  workflow_dispatch:
+
+jobs:
+  long-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: "platforms;android-37.0 build-tools;37.0.0 platform-tools"
+
+      - uses: gradle/actions/setup-gradle@v5
+
+      - name: Build with long-running suites enabled
+        run: ./gradlew build -Pdrop.nightly=true --stacktrace --continue
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-reports
+          path: |
+            **/build/reports/tests/
+            **/build/test-results/
+          retention-days: 14

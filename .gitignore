@@ -1,0 +1,23 @@
+# Gradle / build
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+.kotlin/
+local.properties
+
+# IDEs
+.idea/
+*.iml
+.vscode/
+.fleet/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Outputs
+*.apk
+*.aab
+*.log
+/tools/bench/results/
+captures/

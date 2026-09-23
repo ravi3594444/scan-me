@@ -1,0 +1,43 @@
+pluginManagement {
+    includeBuild("build-logic")
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = "drop"
+
+// Shared core: no Android or JVM-desktop imports (enforced by :tools:arch-test).
+include(":core:crypto", ":core:protocol", ":core:discovery", ":core:transfer", ":core:ladder", ":core:data")
+
+// Desktop platform layers and the shared desktop/browser pieces.
+include(":platform:desktop-win", ":platform:desktop-mac", ":platform:desktop-linux")
+include(":web-receive")
+include(":ui:shared", ":ui:desktop")
+
+// Tools.
+include(":tools:bench", ":tools:fuzz", ":tools:arch-test")
+
+// Android modules need an SDK. Set ANDROID_HOME or sdk.dir in local.properties;
+// without one they are skipped so desktop-only contributors can still build.
+val localSdkDir =
+    file("local.properties").takeIf { it.exists() }?.readLines()
+        ?.firstOrNull { it.startsWith("sdk.dir=") }?.substringAfter("=")
+val androidSdk =
+    listOf(System.getenv("ANDROID_HOME"), System.getenv("ANDROID_SDK_ROOT"), localSdkDir)
+        .firstOrNull { !it.isNullOrBlank() }
+if (androidSdk != null && file(androidSdk).isDirectory) {
+    include(":platform:android", ":ui:android")
+} else {
+    logger.warn("drop: no Android SDK found; skipping :platform:android and :ui:android")
+}
