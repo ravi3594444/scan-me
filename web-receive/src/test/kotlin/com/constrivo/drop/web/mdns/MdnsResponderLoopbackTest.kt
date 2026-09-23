@@ -1,5 +1,6 @@
 package com.constrivo.drop.web.mdns
 
+import com.constrivo.drop.web.FakeMonotonicClock
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import java.io.IOException
 import java.net.Inet4Address
@@ -29,7 +30,8 @@ class MdnsResponderLoopbackTest {
     fun answersLegacyAndMulticastQueries() {
         val (iface, address) = multicastInterface() ?: return assumeTrue(false, "no multicast-capable IPv4 interface")
         assumeTrue(multicastLoops(iface), "multicast does not loop back on ${iface.name}")
-        MdnsResponder(address, iface, "drop.local", port = port, announce = true).use { responder ->
+        val clock = FakeMonotonicClock()
+        MdnsResponder(address, iface, "drop.local", port = port, announce = true, clock = clock).use { responder ->
             responder.start()
 
             // Legacy unicast query from an ephemeral port: the reply comes back to this socket with our id.
@@ -45,7 +47,9 @@ class MdnsResponderLoopbackTest {
                 assertEquals(10L, reply.answers.single().ttl)
             }
 
-            // Standard query from the mDNS port: the reply is multicast to the group.
+            // Standard query from the mDNS port: the reply is multicast to the group (a second after the announcement,
+            // which multicast the same records).
+            clock.advance(1_000)
             DatagramChannel.open(StandardProtocolFamily.INET).use { member ->
                 member.setOption(StandardSocketOptions.SO_REUSEADDR, true)
                 member.bind(InetSocketAddress(port))

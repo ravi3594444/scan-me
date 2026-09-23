@@ -62,8 +62,42 @@ class ReceivePageTest {
     }
 
     @Test
+    fun textMeetsWcagAaContrastInBothThemes() {
+        val light = tokens(html.substringAfter(":root{").substringBefore("}"))
+        val dark = tokens(html.substringAfter("@media (prefers-color-scheme:dark){:root{").substringBefore("}"))
+        for ((theme, t) in listOf("light" to light, "dark" to dark)) {
+            fun check(
+                foreground: String,
+                background: String,
+                minimum: Double,
+            ) {
+                val ratio = contrast(t.getValue(foreground), t.getValue(background))
+                assertTrue(ratio >= minimum, "$theme: $foreground on $background is ${"%.3f".format(ratio)}:1, needs $minimum:1")
+            }
+            // Text (1.4.3): body, secondary, accent-coloured links and buttons, and the primary button's label.
+            for (text in listOf("text", "muted", "accent-text")) {
+                for (background in listOf("bg", "surface", "accent-soft")) check(text, background, 4.5)
+            }
+            check("on-accent", "primary", 4.5)
+            // Non-text (1.4.11): the progress fill on its track, focus rings and glyphs.
+            for (background in listOf("bg", "surface", "accent-soft")) check("accent", background, 3.0)
+        }
+        // Accent-coloured text never uses the fill token, which is 4.50:1 on white in light mode, just under AA.
+        assertFalse(Regex("[^-]color:var\\(--accent\\)[;}]").findAll(html).any { !isNonTextRule(html, it.range.first) })
+    }
+
+    @Test
+    fun buffersAtMost256MibInThePage() {
+        // Larger downloads go to the browser's download manager, with the bar fed by the server (`progress`).
+        assertTrue(html.contains("const BUFFER_LIMIT = 256 * 1024 * 1024;"))
+        assertTrue(html.contains("'progress?dl='"))
+        assertTrue(html.contains("'?dl='"))
+    }
+
+    @Test
     fun usesRelativeEndpointPaths() {
         assertTrue(html.contains("fetch('files'"))
+        assertTrue(html.contains("fetch('progress?dl="))
         assertFalse(html.contains("'/files'"))
         assertFalse(html.contains("\"/t/"))
     }
@@ -81,6 +115,33 @@ class ReceivePageTest {
         assertTrue(csp.contains("connect-src 'self'"))
         assertTrue(csp.contains("frame-ancestors 'none'"))
         assertFalse(csp.contains("unsafe"))
+    }
+
+    private fun tokens(block: String): Map<String, String> =
+        Regex("--([a-z-]+):(#[0-9A-Fa-f]{6})").findAll(block).associate { it.groupValues[1] to it.groupValues[2] }
+
+    /** Whether the CSS rule around [index] styles an icon, not text (`svg` or `.glyph`). */
+    private fun isNonTextRule(
+        css: String,
+        index: Int,
+    ): Boolean {
+        val selector = css.substring(css.lastIndexOf('}', index) + 1, css.lastIndexOf('{', index))
+        return selector.contains("svg") || selector.contains(".glyph")
+    }
+
+    /** WCAG 2 contrast ratio of two `#RRGGBB` colours. */
+    private fun contrast(
+        a: String,
+        b: String,
+    ): Double {
+        fun channel(hex: String) = (hex.toInt(16) / 255.0).let { c -> if (c <= 0.04045) c / 12.92 else Math.pow((c + 0.055) / 1.055, 2.4) }
+
+        fun luminance(color: String): Double {
+            val h = color.removePrefix("#")
+            return 0.2126 * channel(h.substring(0, 2)) + 0.7152 * channel(h.substring(2, 4)) + 0.0722 * channel(h.substring(4, 6))
+        }
+        val (hi, lo) = listOf(luminance(a), luminance(b)).sortedDescending()
+        return (hi + 0.05) / (lo + 0.05)
     }
 
     @Test

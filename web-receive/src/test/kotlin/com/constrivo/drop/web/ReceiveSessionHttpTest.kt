@@ -19,6 +19,12 @@ import io.ktor.server.testing.ApplicationTestBuilder
 import io.ktor.server.testing.testApplication
 import io.ktor.utils.io.ByteWriteChannel
 import io.ktor.utils.io.writeFully
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -29,6 +35,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
 import java.io.ByteArrayOutputStream
 import java.nio.file.Files
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.zip.ZipFile
 import kotlin.random.Random
 import kotlin.test.Test
@@ -38,6 +45,8 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.seconds
+import kotlin.time.TimeSource
 
 class ReceiveSessionHttpTest {
     private val photo = BytesFile("Fotó 日本.jpg", randomBytes(200_000, 11), "image/jpeg")
@@ -78,6 +87,16 @@ class ReceiveSessionHttpTest {
         }
 
     private suspend fun HttpResponse.json(): JsonObject = Json.parseToJsonElement(bodyAsText()).jsonObject
+
+    /** Waits, in real time, until [condition] holds. */
+    private suspend fun eventually(condition: () -> Boolean) =
+        withContext(Dispatchers.Default) {
+            val start = TimeSource.Monotonic.markNow()
+            while (!condition()) {
+                check(start.elapsedNow() < 5.seconds) { "condition not met within 5 s" }
+                delay(5)
+            }
+        }
 
     /** Opens the page, waits for the approval, and returns the client with its session cookie. */
     private suspend fun ApplicationTestBuilder.approvedBrowser(): HttpClient {
@@ -125,6 +144,7 @@ class ReceiveSessionHttpTest {
                 "files/",
                 "upload",
                 "all.zip/x",
+                "progress/x",
                 "file/99999999999",
             )) {
                 assertEquals(HttpStatusCode.NotFound, client.get(prefix + path).status, path)
@@ -142,10 +162,59 @@ class ReceiveSessionHttpTest {
         }
 
     @Test
-    fun tokenIsCaseInsensitive() =
-        receiveTest(session()) {
-            assertEquals(HttpStatusCode.OK, browser().get("/t/${TEST_TOKEN.value.uppercase()}/").status)
+    fun aTokenInAnotherCaseRedirectsToTheCanonicalPrefixWithoutASession() {
+        val approver = ScriptedApprover { true }
+        receiveTest(session(approver)) {
+            val upper = "/t/${TEST_TOKEN.value.uppercase()}/"
+            val client = browser()
+            for ((path, location) in listOf(
+                upper to prefix,
+                upper.removeSuffix("/") to prefix,
+                upper + "files" to prefix + "files",
+                upper + "file/1?dl=abcdefgh" to prefix + "file/1?dl=abcdefgh",
+                upper + "all.zip" to prefix + "all.zip",
+            )) {
+                val response = client.get(path)
+                assertEquals(HttpStatusCode.Found, response.status, path)
+                assertEquals(location, response.headers[HttpHeaders.Location], path)
+                assertNull(response.headers[HttpHeaders.SetCookie], "no session under a non-canonical prefix ($path)")
+            }
+            val post = client.post(upper + "files")
+            assertEquals(HttpStatusCode.TemporaryRedirect, post.status, "a redirected POST keeps its method")
+            assertEquals(prefix + "files", post.headers[HttpHeaders.Location])
+            assertEquals(HttpStatusCode.NotFound, client.get(upper + "nothing").status)
+            assertEquals(HttpStatusCode.NotFound, client.get(upper + "file/9").status)
+            assertTrue(approver.requests.isEmpty(), "the phone is not asked for a redirect")
         }
+    }
+
+    @Test
+    fun aLinkTypedInUpperCaseWorksWithOneApproval() {
+        // Cookie paths are case-sensitive: a cookie set under /t/ABC.../ would never come back from the page's relative
+        // URLs, and every request would claim a new browser (and ask the phone again).
+        val approver = ScriptedApprover { true }
+        val s = session(approver)
+        receiveTest(s) {
+            val upper = "/t/${TEST_TOKEN.value.uppercase()}/"
+            val client =
+                createClient {
+                    install(HttpCookies)
+                    followRedirects = true
+                }
+            val page = client.get(upper)
+            assertEquals(HttpStatusCode.OK, page.status)
+            assertEquals(prefix, page.call.request.url.encodedPath, "the page lands on the canonical prefix")
+            assertTrue(page.headers[HttpHeaders.SetCookie]!!.contains("Path=$prefix"))
+            // What the page then fetches with relative URLs.
+            assertEquals(HttpStatusCode.OK, client.get(prefix + "files").status)
+            assertContentEquals(photo.bytes, client.get(prefix + "file/0").bodyAsBytes())
+            assertEquals(HttpStatusCode.OK, client.get(prefix + "all.zip").status)
+            // The upper-case link again, as typed a second time.
+            assertEquals(HttpStatusCode.OK, client.get(upper + "files").status)
+            assertEquals(1, approver.requests.size, "one browser, asked for once")
+            assertEquals(listOf(BrowserState.APPROVED), s.browserStates())
+        }
+    }
 
     @Test
     fun pageIsServedWithSecurityHeadersAndASessionCookie() =
@@ -375,12 +444,50 @@ class ReceiveSessionHttpTest {
     @Test
     fun aHeldFilesRequestAnswersAsSoonAsThePhoneSaysYes() {
         val approver = ScriptedApprover()
-        receiveTest(session(approver, settings = ReceiveSettings(approvalWaitMillis = 30_000))) {
+        val s = session(approver, settings = ReceiveSettings(approvalWaitMillis = 30_000))
+        receiveTest(s) {
             val client = browser()
             client.get(prefix)
-            approver.answer(1, true)
-            val response = withTimeout(10_000) { client.get(prefix + "files") }
-            assertEquals(HttpStatusCode.OK, response.status)
+            coroutineScope {
+                val files = async { client.get(prefix + "files") }
+                // The request is on the server, waiting for the phone, before the phone answers.
+                eventually { s.heldFilesRequests == 1 }
+                assertEquals(listOf(BrowserState.PENDING), s.browserStates())
+                val answeredAt = TimeSource.Monotonic.markNow()
+                approver.answer(1, true)
+                val response = withTimeout(10_000) { files.await() }
+                assertEquals(HttpStatusCode.OK, response.status)
+                assertTrue(answeredAt.elapsedNow() < 5.seconds, "woken by the answer, not by the 30 s hold running out")
+                assertEquals(0, s.heldFilesRequests)
+            }
+        }
+    }
+
+    @Test
+    fun anUnansweredBrowserIsAskedAgainWhenThePageReloads() {
+        val requests = CopyOnWriteArrayList<BrowserApprovalRequest>()
+        val approver =
+            BrowserApprover { request ->
+                requests += request
+                if (requests.size == 1) awaitCancellation() else true
+            }
+        val s = session(approver, settings = ReceiveSettings(approvalTimeoutMillis = 200, approvalWaitMillis = 10_000))
+        receiveTest(s) {
+            val client = browser()
+            client.get(prefix)
+            val files = client.get(prefix + "files")
+            assertEquals(HttpStatusCode.Forbidden, files.status, "the held request ends when the phone's time runs out")
+            assertEquals("expired", files.json()["status"]!!.jsonPrimitive.content)
+            assertEquals(listOf(BrowserState.EXPIRED), s.browserStates())
+            val download = client.get(prefix + "file/0")
+            assertEquals(HttpStatusCode.Forbidden, download.status)
+            assertEquals("expired", download.json()["status"]!!.jsonPrimitive.content)
+            assertEquals(1, requests.size, "only a page load asks again")
+            // Reloading the page asks the phone again, for the same browser and without using another slot.
+            assertEquals(HttpStatusCode.OK, client.get(prefix).status)
+            assertEquals(HttpStatusCode.OK, client.get(prefix + "files").status)
+            assertEquals(listOf(1, 1), requests.map { it.browserNumber })
+            assertEquals(listOf(BrowserState.APPROVED), s.browserStates())
         }
     }
 
@@ -398,6 +505,10 @@ class ReceiveSessionHttpTest {
             assertEquals("denied", download.json()["status"]!!.jsonPrimitive.content)
             assertEquals(HttpStatusCode.Forbidden, client.get(prefix + "all.zip").status)
             assertEquals(0, photo.opens.get())
+            // A "no" is final: reloading does not ask the phone again.
+            client.get(prefix)
+            assertEquals("denied", client.get(prefix + "files").json()["status"]!!.jsonPrimitive.content)
+            assertEquals(1, approver.requests.size)
         }
     }
 
@@ -475,6 +586,60 @@ class ReceiveSessionHttpTest {
             )) {
                 assertEquals(HttpStatusCode.NotFound, client.get(prefix + path).status, path)
             }
+        }
+    }
+
+    // --- Progress of downloads the browser saves itself ---------------------------------------------------------
+
+    private suspend fun HttpClient.progress(id: String): JsonObject = get(prefix + "progress?dl=$id").json()
+
+    @Test
+    fun aTaggedDownloadReportsItsProgress() {
+        val s = session()
+        receiveTest(s) {
+            val client = approvedBrowser()
+            assertEquals("waiting", client.progress("file0aaaa")["state"]!!.jsonPrimitive.content, "not started yet")
+
+            assertContentEquals(photo.bytes, client.get(prefix + "file/0?dl=file0aaaa").bodyAsBytes())
+            val file = client.progress("file0aaaa")
+            assertEquals("done", file["state"]!!.jsonPrimitive.content)
+            assertEquals(photo.size, file["sent"]!!.jsonPrimitive.long)
+            assertEquals(photo.size, file["total"]!!.jsonPrimitive.long)
+
+            client.get(prefix + "all.zip?dl=zip-all_1").bodyAsBytes()
+            val zip = client.progress("zip-all_1")
+            assertEquals("done", zip["state"]!!.jsonPrimitive.content)
+            assertEquals(s.archiveSize, zip["sent"]!!.jsonPrimitive.long, "every byte of the archive, headers included")
+            assertEquals(s.archiveSize, zip["total"]!!.jsonPrimitive.long)
+
+            // A resumed download counts from where its range starts.
+            val resumed = client.get(prefix + "file/0?dl=resume01") { header(HttpHeaders.Range, "bytes=150000-") }
+            assertEquals(HttpStatusCode.PartialContent, resumed.status)
+            resumed.bodyAsBytes()
+            val range = client.progress("resume01")
+            assertEquals("done", range["state"]!!.jsonPrimitive.content)
+            assertEquals(photo.size, range["sent"]!!.jsonPrimitive.long)
+
+            // Untagged downloads and odd ids are served as usual but not tracked.
+            assertEquals(HttpStatusCode.OK, client.get(prefix + "file/1?dl=short").status)
+            assertEquals(HttpStatusCode.BadRequest, client.get(prefix + "progress?dl=short").status)
+            assertEquals(HttpStatusCode.BadRequest, client.get(prefix + "progress").status)
+            assertEquals(HttpStatusCode.BadRequest, client.get(prefix + "progress?dl=" + "x".repeat(65)).status)
+        }
+    }
+
+    @Test
+    fun progressBelongsToTheBrowserThatDownloads() {
+        val approver = ScriptedApprover { it.browserNumber != 3 }
+        receiveTest(session(approver)) {
+            val first = approvedBrowser()
+            first.get(prefix + "file/1?dl=mine0001").bodyAsBytes()
+            val second = approvedBrowser()
+            assertEquals("waiting", second.progress("mine0001")["state"]!!.jsonPrimitive.content, "another browser sees nothing")
+            val denied = browser()
+            denied.get(prefix)
+            assertEquals(HttpStatusCode.Forbidden, denied.get(prefix + "progress?dl=mine0001").status)
+            assertEquals("done", first.progress("mine0001")["state"]!!.jsonPrimitive.content)
         }
     }
 

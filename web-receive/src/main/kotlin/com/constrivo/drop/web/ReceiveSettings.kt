@@ -8,7 +8,8 @@ package com.constrivo.drop.web
  * @property idleCheckIntervalMillis how often the idle watchdog looks at the clock.
  * @property maxBrowsers how many browsers may present the token; each needs the phone's approval. Set 1 to make the
  *   token strictly single-browser.
- * @property approvalTimeoutMillis a browser the phone has not answered for within this time is denied.
+ * @property approvalTimeoutMillis the phone's prompt for a browser is withdrawn after this long without an answer; the
+ *   browser is then [BrowserState.EXPIRED] and reloading the page asks again.
  * @property approvalWaitMillis how long `GET files` holds a pending browser before answering 202 (the page asks
  *   again at once), so the list appears as soon as the phone says yes.
  * @property bufferSize copy buffer for downloads, the zip and uploads.

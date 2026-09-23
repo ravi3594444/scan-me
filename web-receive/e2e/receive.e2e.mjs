@@ -1,9 +1,10 @@
 // Browser end-to-end test of the receive page (WP9; testing T-21 in Chromium only).
 //
 // Starts the server with sample files (./gradlew :web-receive:e2eServer), then drives headless Chromium through the
-// page: approval wait, file list, a download through fetch + ReadableStream with the progress bar, a plain-link
-// download, the streamed zip (checked entry by entry, CRC-32 included), dark mode, "Send files back", a second
-// browser being refused, and no console or CSP errors. See web-receive/README.md for how to run it.
+// page: the link typed in upper case, approval wait, file list, a download through fetch + ReadableStream with the
+// progress bar, downloads handed to the browser with the bar fed by the server's byte count, the streamed zip (checked
+// entry by entry, CRC-32 included), dark mode, "Send files back", a second browser being refused, and no console or
+// CSP errors. See web-receive/README.md for how to run it.
 //
 //   NODE_PATH="$(npm root -g)" PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers node web-receive/e2e/receive.e2e.mjs
 
@@ -147,8 +148,11 @@ async function run() {
     page.on('pageerror', (error) => problems.push(String(error)));
 
     console.log('approval gate (N15)');
-    const response = await page.goto(ready.url);
+    // Typed from the phone screen in capitals: lands on the canonical link, so the session cookie comes back.
+    const upperUrl = ready.url.replace(/\/t\/([^/]+)\//, (m, token) => `/t/${token.toUpperCase()}/`);
+    const response = await page.goto(upperUrl);
     check(response.status() === 200, 'page loads with the token');
+    check(page.url() === ready.url, `a token typed in upper case lands on ${new URL(page.url()).pathname}`);
     await page.waitForSelector('text=tap Allow', { timeout: 5_000 });
     check(await page.isVisible('#waiting'), 'shows "tap Allow" while the phone decides');
     await page.waitForSelector('#offer:not([hidden])', { timeout: 15_000 });
@@ -163,8 +167,13 @@ async function run() {
     const sizes = await page.$$eval('#files li .size', (els) => els.map((e) => e.textContent));
     check(sizes[0] === '22 B' && sizes[2] === '0 B' && sizes[3] === '12 MB', `sizes shown (${sizes.join(', ')})`);
     check((await page.textContent('#all')).startsWith('Download all (zip)'), 'primary button "Download all (zip)"');
-    const light = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
-    check(light === 'rgb(247, 248, 250)', `light background token bg (${light})`);
+    const light = await page.evaluate(() => {
+      const button = getComputedStyle(document.getElementById('all'));
+      const link = getComputedStyle(document.querySelector('#files li a'));
+      return { bg: getComputedStyle(document.body).backgroundColor, button: button.backgroundColor, link: link.color };
+    });
+    check(light.bg === 'rgb(247, 248, 250)', `light background token bg (${light.bg})`);
+    check(light.button === 'rgb(40, 94, 232)' && light.link === 'rgb(40, 94, 232)', 'light accent text and button pass AA (#285EE8)');
     await page.screenshot({ path: path.join(outDir, 'light.png'), fullPage: true });
 
     console.log('keyboard and labels');
@@ -183,10 +192,7 @@ async function run() {
     const empty = await saveDownload(page, () => page.click('#files li:nth-child(3) a'));
     check(empty.bytes.length === 0, 'empty file downloads');
 
-    // Throttle the network so the progress bar and MB/s readout are visible for the 12 MB file.
-    const cdp = await context.newCDPSession(page);
-    await cdp.send('Network.enable');
-    await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: 3_000_000, uploadThroughput: -1 });
+    // The server sends the 12 MB file at about 3 MB/s, so the progress bar and MB/s readout stay up for a while.
     const bigDownload = saveDownload(page, () => page.click('#files li:nth-child(4) a'));
     await page.waitForFunction(() => /^[1-9]\d*\.\d MB\/s/.test(document.getElementById('speed').textContent), null, { timeout: 15_000 });
     const speed = await page.textContent('#speed');
@@ -195,8 +201,8 @@ async function run() {
     check(/MB\/s( · .+ left)?$/.test(speed), `speed readout "${speed}"`);
     check(Number(bar) > 0 && Number(bar) < 100, `progress ${bar}%`);
     await page.screenshot({ path: path.join(outDir, 'progress.png') });
+    check(await page.isVisible('#cancel'), 'Cancel offered for an in-page download');
     const big = await bigDownload;
-    await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
     check(sha256(big.bytes) === ready.files[3].sha256, '12 MB file bytes match after the progress run');
     check((await page.textContent('#status')).includes('Received'), 'done message shown');
 
@@ -214,14 +220,31 @@ async function run() {
         `entry "${entry.name}" bytes and CRC-32 match`);
     });
 
-    console.log('plain-link fallback (no ReadableStream)');
+    console.log('downloads the browser saves itself (no ReadableStream; also every file over 256 MiB)');
     const plain = await context.newPage();
+    plain.on('console', (msg) => { if (msg.type() === 'error') problems.push(msg.text()); });
+    plain.on('pageerror', (error) => problems.push(String(error)));
     await plain.addInitScript(() => { window.ReadableStream = undefined; });
     await plain.goto(ready.url);
     await plain.waitForSelector('#offer:not([hidden])', { timeout: 15_000 });
     const viaLink = await saveDownload(plain, () => plain.click('#files li:nth-child(5) a'));
     check(viaLink.name === ready.files[4].name && sha256(viaLink.bytes) === ready.files[4].sha256,
       `link download "${viaLink.name}" bytes match`);
+    await plain.waitForFunction(() => document.getElementById('status').textContent.startsWith('Received'), null, { timeout: 15_000 });
+    check(true, 'done message from the server\'s count');
+    const handedOff = saveDownload(plain, () => plain.click('#files li:nth-child(4) a'));
+    await plain.waitForFunction(() => /^[1-9]\d*\.\d MB\/s/.test(document.getElementById('speed').textContent), null, { timeout: 15_000 });
+    const serverSpeed = await plain.textContent('#speed');
+    const serverBar = await plain.getAttribute('#bar', 'aria-valuenow');
+    check(await plain.isVisible('#progress'), 'progress bar shown while the browser saves the file');
+    check(/MB\/s( · .+ left)?$/.test(serverSpeed), `speed readout from the server "${serverSpeed}"`);
+    check(Number(serverBar) > 0 && Number(serverBar) < 100, `progress ${serverBar}%`);
+    check(!(await plain.isVisible('#cancel')), 'no Cancel: the browser\'s download list owns it');
+    await plain.screenshot({ path: path.join(outDir, 'progress-link.png') });
+    const handed = await handedOff;
+    check(sha256(handed.bytes) === ready.files[3].sha256, '12 MB file saved by the browser matches');
+    await plain.waitForFunction(() => document.getElementById('status').textContent.startsWith('Received'), null, { timeout: 15_000 });
+    check((await plain.textContent('#status')).includes('12 MB'), 'done message after the server sent every byte');
     await plain.close();
 
     console.log('dark mode');

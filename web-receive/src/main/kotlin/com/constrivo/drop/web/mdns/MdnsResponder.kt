@@ -1,11 +1,14 @@
 package com.constrivo.drop.web.mdns
 
 import com.constrivo.drop.core.discovery.AppIdentity
+import com.constrivo.drop.core.discovery.MonotonicClock
+import com.constrivo.drop.core.discovery.SystemMonotonicClock
 import java.io.IOException
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.NetworkInterface
+import java.net.SocketOption
 import java.net.StandardProtocolFamily
 import java.net.StandardSocketOptions
 import java.nio.ByteBuffer
@@ -23,7 +26,9 @@ import java.nio.channels.MembershipKey
  * It listens on 224.0.0.251:[port] on [networkInterface] only: the socket joins the group on that interface, sends
  * with that interface as the multicast interface and TTL 255 (RFC 6762 §11), and drops packets whose source is not in
  * one of the interface's IPv4 subnets (a wildcard-bound socket can see multicast that arrived on other interfaces).
- * The port is shared with any other responder on the host (`SO_REUSEADDR`, and `SO_REUSEPORT` where available).
+ * The port is shared with any other responder on the host (`SO_REUSEADDR`, and `SO_REUSEPORT` where available; that
+ * option is looked up by name because `StandardSocketOptions.SO_REUSEPORT` only exists from Android 13, API 33).
+ * A multicast answer repeats a record at most once per second (RFC 6762 §6, [MdnsHostAnswerer]).
  *
  * On [start] it announces the record once (RFC 6762 §8.3); on [close] it sends a goodbye with TTL 0 (§10.1). It does
  * not probe for conflicts: the name lives on the phone's own hotspot or group, where it is the only responder.
@@ -31,6 +36,7 @@ import java.nio.channels.MembershipKey
  * @param hostName the name to answer, [AppIdentity.MDNS_HOST] by default.
  * @param address the IPv4 address of [networkInterface] that the page is served on.
  * @param port 5353 in production; tests pass another port.
+ * @param clock measures the once-per-second multicast limit; on Android pass `SystemClock.elapsedRealtime()`.
  */
 class MdnsResponder(
     private val address: Inet4Address,
@@ -39,8 +45,9 @@ class MdnsResponder(
     private val port: Int = MDNS_PORT,
     ttlSeconds: Long = MdnsHostAnswerer.DEFAULT_TTL_SECONDS,
     private val announce: Boolean = true,
+    clock: MonotonicClock = SystemMonotonicClock,
 ) : AutoCloseable {
-    private val answerer = MdnsHostAnswerer(DnsName.of(hostName), address, ttlSeconds, port)
+    private val answerer = MdnsHostAnswerer(DnsName.of(hostName), address, ttlSeconds, port, clock)
     private val group = InetSocketAddress(MDNS_GROUP, port)
     private val subnets: List<Pair<ByteArray, Int>> =
         networkInterface.interfaceAddresses
@@ -72,21 +79,21 @@ class MdnsResponder(
         val ch = DatagramChannel.open(StandardProtocolFamily.INET)
         try {
             ch.setOption(StandardSocketOptions.SO_REUSEADDR, true)
-            if (StandardSocketOptions.SO_REUSEPORT in ch.supportedOptions()) {
-                runCatching { ch.setOption(StandardSocketOptions.SO_REUSEPORT, true) }
-            }
+            reusePortOption(ch.supportedOptions())?.let { option -> runCatching { ch.setOption(option, true) } }
             // Multicast is only delivered to a socket bound to the wildcard address (or the group) on most systems.
             ch.bind(InetSocketAddress(port))
             ch.setOption(StandardSocketOptions.IP_MULTICAST_IF, networkInterface)
             ch.setOption(StandardSocketOptions.IP_MULTICAST_TTL, MULTICAST_TTL)
             ch.setOption(StandardSocketOptions.IP_MULTICAST_LOOP, true)
             membership = ch.join(MDNS_GROUP, networkInterface)
-        } catch (e: IOException) {
-            ch.close()
-            throw e
-        } catch (e: UnsupportedOperationException) {
-            ch.close()
-            throw IOException("multicast is not supported here", e)
+        } catch (e: Throwable) {
+            // Whatever went wrong (including a platform that lacks an API), the socket does not leak.
+            runCatching { ch.close() }
+            throw when (e) {
+                is IOException -> e
+                is UnsupportedOperationException -> IOException("multicast is not supported here", e)
+                else -> e
+            }
         }
         channel = ch
         thread =
@@ -162,6 +169,17 @@ class MdnsResponder(
         private const val MULTICAST_TTL = 255
         private const val MAX_PACKET = 9000
         private const val JOIN_TIMEOUT_MILLIS = 2000L
+        private const val SO_REUSEPORT = "SO_REUSEPORT"
+
+        /**
+         * `SO_REUSEPORT` among [supported], found by name: referencing `StandardSocketOptions.SO_REUSEPORT` would throw
+         * `NoSuchFieldError` on Android 12 and 12L (the field arrived in API 33; minSdk is 31).
+         */
+        internal fun reusePortOption(supported: Set<SocketOption<*>>): SocketOption<Boolean>? {
+            val option = supported.firstOrNull { it.name() == SO_REUSEPORT && it.type() == Boolean::class.javaObjectType }
+            @Suppress("UNCHECKED_CAST")
+            return option as SocketOption<Boolean>?
+        }
 
         internal fun samePrefix(
             a: ByteArray,

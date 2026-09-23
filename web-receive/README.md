@@ -2,7 +2,8 @@
 
 The browser receive page (F‑D6, F‑H4 browser path; design §10) and the embedded Ktor CIO server that the phone, or a
 desktop for the no-Bluetooth PC path, runs on the link interface (architecture §10.3 as changed by spec change N15).
-WP9. Plain JVM library; it depends only on `core:discovery` (for `AppIdentity` and the clock interfaces).
+WP9. Plain JVM library; it depends only on `core:discovery` (for `AppIdentity` and the clock interfaces), as an `api`
+dependency because the clocks appear in public constructors.
 
 ## Pieces
 
@@ -12,7 +13,7 @@ WP9. Plain JVM library; it depends only on `core:discovery` (for `AppIdentity` a
 | `ReceiveOffer` | Sender name, files, the header summary ("12 photos · 48 MB"); sanitised, unique display names. |
 | `ReceiveToken` | The secret in `/t/<token>/`: 12 characters of Crockford base32, typeable. |
 | `BrowserApprover` | The phone's "Allow this computer?" (N15), asked once per new browser. |
-| `ReceiveSession` | The HTTP contract (routes, approval gate, downloads, zip, upload, idle tracking). Install with `Application.receiveModule(session)`. |
+| `ReceiveSession` | The HTTP contract (routes, approval gate, downloads, zip, download progress, upload, idle tracking). Install with `Application.receiveModule(session)`. |
 | `ReceiveServer` | CIO engine bound to one address; stops 60 s after the last transfer (`awaitStopped()` says why). |
 | `UploadSink` / `UploadSettings` | "Send files back" (P1) with a session-wide byte cap. `DirectoryUploadSink` for desktops. |
 | `zip.StoredZipLayout` / `StoredZipWriter` | The streamed STORED zip with data descriptors and ZIP64 when needed. |
@@ -33,11 +34,14 @@ mdns.close()
 
 ## Tests
 
-`./gradlew :web-receive:test` runs the unit and Ktor test-host suites: every route, token refusal, the approval gate
-(approved, denied, pending, second browser, single-use token, forged cookie), range requests, the zip read back with
+`./gradlew :web-receive:test` runs the unit and Ktor test-host suites: every route, token refusal, the upper-case link
+redirect, the approval gate (approved, denied, pending, expired and asked again, second browser, single-use token,
+forged cookie), range requests, download progress, the zip read back with
 `java.util.zip` (multiple files, an empty file, Unicode names, forced ZIP64 and 65,540 entries), upload cap, idle
-shutdown on a fake clock against the real CIO server, the page size gate, the DNS codec on real packet bytes plus a
-fuzz run, and a responder test over real multicast sockets (skipped when multicast does not loop back).
+shutdown on a fake clock against the real CIO server, the page size gate and AA contrast of every text token, the
+DNS codec on real packet bytes plus a fuzz run, the once-per-second multicast limit, a scan of the compiled classes
+for fields Android 12 lacks, and a responder test over real multicast sockets (skipped when multicast does not loop
+back).
 
 The ZIP64 test with a real 4 GiB entry writes about 4.3 GB and only runs in the nightly job:
 `./gradlew :web-receive:test -Pdrop.nightly=true`.
@@ -45,11 +49,12 @@ The ZIP64 test with a real 4 GiB entry writes about 4.3 GB and only runs in the 
 ## Browser end-to-end test (Playwright, not in CI)
 
 `e2e/receive.e2e.mjs` starts the server with sample files (`./gradlew :web-receive:e2eServer`, a `JavaExec` task on the
-test classpath running `src/test/kotlin/.../web/e2e/E2eServer.kt`; stop it by writing `stop` to its stdin), then
-drives headless Chromium: waiting for approval, the file list and
-glyphs, a download through `fetch` + `ReadableStream` with the progress bar under a throttled network, a plain-link
-download, the zip checked entry by entry (bytes and CRC-32), dark mode, "Send files back", a second browser being
-refused, a wrong token, and no console or CSP errors. Screenshots go to `web-receive/build/e2e/`.
+test classpath running `src/test/kotlin/.../web/e2e/E2eServer.kt`, which serves the 12 MB sample at about 3 MB/s;
+stop it by writing `stop` to its stdin), then drives headless Chromium: the link typed in upper case, waiting for
+approval, the file list and glyphs, a download through `fetch` + `ReadableStream` with the progress bar, downloads the
+browser saves itself with the bar fed by the server's `progress` count, the zip checked entry by entry (bytes and
+CRC-32), light and dark colours, "Send files back", a second browser being refused, a wrong token, and no console or
+CSP errors. Screenshots go to `web-receive/build/e2e/`.
 
 Needs Node 18+ and Playwright with Chromium installed globally. From the repository root:
 

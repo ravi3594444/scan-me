@@ -7,6 +7,7 @@ import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.random.Random
 import kotlin.test.AfterTest
 import kotlin.test.Test
@@ -80,17 +81,35 @@ class BrowserSessionsTest {
         runBlocking<Unit> {
             val s = sessions({ error("UI crashed") })
             val browser = assertNotNull(s.claim("10.0.0.1", null))
-            assertFalse(withTimeout(5_000) { browser.decision.await() })
+            assertEquals(BrowserState.DENIED, withTimeout(5_000) { browser.decision.await() })
             assertEquals(BrowserState.DENIED, browser.state)
+            assertFalse(s.retry(browser), "a no is final")
         }
 
     @Test
-    fun anUnansweredRequestTimesOutAsDenied() =
+    fun anUnansweredRequestExpiresAndCanBeAskedAgain() =
         runBlocking<Unit> {
-            val s = sessions({ awaitCancellation() }, timeout = 50)
-            val browser = assertNotNull(s.claim("10.0.0.1", null))
+            val asked = AtomicInteger()
+            val s =
+                sessions(
+                    {
+                        if (asked.incrementAndGet() == 1) awaitCancellation()
+                        it.browserNumber == 1
+                    },
+                    timeout = 50,
+                )
+            val browser = assertNotNull(s.claim("10.0.0.1", "UA"))
             assertEquals(BrowserState.PENDING, browser.state)
-            assertFalse(withTimeout(5_000) { browser.decision.await() })
+            assertFalse(s.retry(browser), "nothing to retry while the phone is being asked")
+            assertEquals(BrowserState.EXPIRED, withTimeout(5_000) { browser.decision.await() })
+            assertEquals(BrowserState.EXPIRED, browser.state, "no answer is not a no")
+
+            assertTrue(s.retry(browser))
+            assertEquals(BrowserState.PENDING, browser.state)
+            assertEquals(BrowserState.APPROVED, withTimeout(5_000) { browser.decision.await() })
+            assertEquals(2, asked.get())
+            assertEquals(listOf(BrowserState.APPROVED), s.states(), "the same session, no new slot")
+            assertFalse(s.retry(browser))
         }
 
     @Test
@@ -113,6 +132,7 @@ class BrowserSessionsTest {
             val approver = ScriptedApprover { true }
             val s = sessions(approver)
             val browser = assertNotNull(s.claim("10.0.0.1", "x".repeat(10_000)))
+            assertEquals(256, browser.userAgent!!.length)
             withTimeout(5_000) { browser.decision.await() }
             assertEquals(256, approver.requests.single().userAgent!!.length)
         }

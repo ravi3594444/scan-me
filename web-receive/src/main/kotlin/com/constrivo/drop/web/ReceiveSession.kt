@@ -19,11 +19,11 @@ import io.ktor.server.application.ApplicationCall
 import io.ktor.server.request.contentLength
 import io.ktor.server.request.httpMethod
 import io.ktor.server.request.path
+import io.ktor.server.request.queryString
 import io.ktor.server.request.receiveChannel
 import io.ktor.server.response.header
 import io.ktor.server.response.respondBytes
 import io.ktor.server.response.respondOutputStream
-import io.ktor.server.response.respondRedirect
 import io.ktor.server.response.respondText
 import io.ktor.server.routing.route
 import io.ktor.server.routing.routing
@@ -48,6 +48,7 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.security.SecureRandom
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.random.Random
 import kotlin.random.asKotlinRandom
 
@@ -58,18 +59,26 @@ import kotlin.random.asKotlinRandom
  * Install it into a Ktor application with [receiveModule]; [ReceiveServer] does that on a CIO engine bound to the link
  * interface. The HTTP contract:
  *
- * - Every path outside `/t/<token>/` ([ReceiveRoutes]) is 404, as is everything once the session is [close]d.
+ * - Every path outside `/t/<token>/` ([ReceiveRoutes]) is 404, as is everything once the session is [close]d. The
+ *   token typed in another case, or without the trailing slash, redirects to the same endpoint under the canonical
+ *   lower-case prefix ([pathPrefix]) without creating a session: cookie paths are case-sensitive, so a cookie issued
+ *   under `/t/ABC…/` would never come back from the page's relative URLs.
  * - The first request with the token and no valid session cookie creates a browser session: an `HttpOnly`,
  *   `SameSite=Strict` cookie scoped to the prefix, bound to the browser's IP address, and an approval request to the
  *   phone ([BrowserApprover]). Up to [ReceiveSettings.maxBrowsers] browsers are asked for; later ones get 403
  *   `{"status":"refused"}`.
- * - `GET /` serves the page to any browser with a session. `GET files` answers 200 with the list once the phone
+ * - `GET /` serves the page to any browser with a session, and asks the phone again for a browser whose earlier
+ *   request expired unanswered ([BrowserState.EXPIRED]). `GET files` answers 200 with the list once the phone
  *   approved, holds a pending browser for up to [ReceiveSettings.approvalWaitMillis] and then answers 202
- *   `{"status":"pending"}`, and answers 403 `{"status":"denied"}` after a "no". Downloads and uploads need an approved
- *   browser (403 `pending` or `denied` otherwise).
+ *   `{"status":"pending"}`, and answers 403 `{"status":"denied"}` after a "no" or 403 `{"status":"expired"}` after
+ *   [ReceiveSettings.approvalTimeoutMillis] without an answer. Downloads, progress and uploads need an approved
+ *   browser (403 with the same statuses otherwise).
  * - `GET file/{i}` streams one file with `Content-Length`, an RFC 6266 `Content-Disposition`, a strong `ETag` and
  *   single-range support (206, 416, `If-Range`).
  * - `GET all.zip` streams every file as a STORED zip ([StoredZipLayout]) with an exact `Content-Length`.
+ * - Either download tagged `?dl=<id>` is counted under that id for its browser, and `GET progress?dl=<id>` answers
+ *   `{"status":"ok","state":"waiting"}` until the download starts, then `state` `running`, `done` or `failed` with
+ *   `sent` (bytes into the file) and `total`.
  * - `POST upload?name=…` (P1, only with [upload]) takes one file as the raw body with `Content-Length` (411 without,
  *   413 past the cap, 400 when the body ends early) into the [UploadSink].
  * - Every response carries `Cache-Control: no-store`, `X-Content-Type-Options: nosniff` and
@@ -98,6 +107,7 @@ class ReceiveSession(
         StoredZipLayout(offer.displayNames.mapIndexed { i, name -> ZipEntrySpec(name, offer.files[i].size) }, settings.forceZip64)
     private val dosDateTime = StoredZipWriter.dosDateTime(wallClock.nowMillis())
     private val etagNonce = random.nextBytes(ETAG_NONCE_BYTES).joinToString("") { "%02x".format(it) }
+    private val held = AtomicInteger()
 
     /** `/t/<token>/`, the path the QR code points at. */
     val pathPrefix: String = ReceiveRoutes.prefix(token)
@@ -111,6 +121,9 @@ class ReceiveSession(
 
     /** Each browser's approval state, in arrival order. */
     fun browserStates(): List<BrowserState> = browsers.states()
+
+    /** `GET files` requests waiting for the phone's answer right now. */
+    internal val heldFilesRequests: Int get() = held.get()
 
     /** Suspends until the session is idle ([TransferActivity.isIdle]) or closed. */
     suspend fun awaitIdle() {
@@ -131,7 +144,7 @@ class ReceiveSession(
         call.response.header("Referrer-Policy", "no-referrer")
         val route = if (isClosed) null else Route.match(call.request.path(), token, offer.files.size)
         if (route == null || (route == Route.Upload && upload == null)) return notFound(call)
-        if (route == Route.Redirect) return call.respondRedirect(pathPrefix, permanent = false)
+        if (route is Route.Redirect) return redirect(call, pathPrefix + route.rest)
         val method = if (route == Route.Upload) HttpMethod.Post else HttpMethod.Get
         if (call.request.httpMethod != method) {
             call.response.header(HttpHeaders.Allow, method.value)
@@ -156,6 +169,8 @@ class ReceiveSession(
 
         when (route) {
             Route.Page -> {
+                // A reload after the phone's prompt timed out asks again (same browser, same slot).
+                browsers.retry(browser)
                 servePage(call)
             }
 
@@ -166,11 +181,27 @@ class ReceiveSession(
             else -> {
                 if (!approved(call, browser)) return
                 when (route) {
-                    is Route.File -> serveFile(call, route.index)
-                    Route.Zip -> serveZip(call)
+                    is Route.File -> serveFile(call, browser, route.index)
+                    Route.Zip -> serveZip(call, browser)
+                    Route.Progress -> serveProgress(call, browser)
                     Route.Upload -> receiveUpload(call, upload ?: return notFound(call))
                 }
             }
+        }
+    }
+
+    private suspend fun redirect(
+        call: ApplicationCall,
+        path: String,
+    ) {
+        val query = call.request.queryString()
+        call.response.header(HttpHeaders.Location, if (query.isEmpty()) path else "$path?$query")
+        if (call.request.httpMethod == HttpMethod.Get) {
+            call.respondText("", ContentType.Text.Plain, HttpStatusCode.Found)
+        } else {
+            // 307 keeps the method; the unread body is dropped with the connection.
+            call.response.header(HttpHeaders.Connection, "close")
+            call.respondText("", ContentType.Text.Plain, HttpStatusCode.TemporaryRedirect)
         }
     }
 
@@ -185,13 +216,19 @@ class ReceiveSession(
         browser: BrowserSession,
     ) {
         if (browser.state == BrowserState.PENDING) {
-            withTimeoutOrNull(settings.approvalWaitMillis) { browser.decision.await() }
+            val decision = browser.decision
+            held.incrementAndGet()
+            try {
+                withTimeoutOrNull(settings.approvalWaitMillis) { decision.await() }
+            } finally {
+                held.decrementAndGet()
+            }
         }
         if (isClosed) return notFound(call)
-        when (browser.state) {
+        when (val state = browser.state) {
             BrowserState.APPROVED -> json(call, HttpStatusCode.OK, filesJson())
             BrowserState.PENDING -> json(call, HttpStatusCode.Accepted, status("pending"))
-            BrowserState.DENIED -> json(call, HttpStatusCode.Forbidden, status("denied"))
+            BrowserState.DENIED, BrowserState.EXPIRED -> json(call, HttpStatusCode.Forbidden, status(state.wire))
         }
     }
 
@@ -199,11 +236,9 @@ class ReceiveSession(
         call: ApplicationCall,
         browser: BrowserSession,
     ): Boolean {
-        when (browser.state) {
-            BrowserState.APPROVED -> return true
-            BrowserState.PENDING -> json(call, HttpStatusCode.Forbidden, status("pending"))
-            BrowserState.DENIED -> json(call, HttpStatusCode.Forbidden, status("denied"))
-        }
+        val state = browser.state
+        if (state == BrowserState.APPROVED) return true
+        json(call, HttpStatusCode.Forbidden, status(state.wire))
         return false
     }
 
@@ -243,6 +278,7 @@ class ReceiveSession(
 
     private suspend fun serveFile(
         call: ApplicationCall,
+        browser: BrowserSession,
         index: Int,
     ) {
         val file = offer.files[index]
@@ -281,23 +317,98 @@ class ReceiveSession(
             } catch (_: IOException) {
                 return json(call, HttpStatusCode.Gone, status("unavailable"))
             }
+        val progress = tagged(call, browser, size, start, start + length)
         input.use {
             activity.track {
-                call.respondOutputStream(contentType(offer.mimeTypes[index]), status, length) {
-                    copyExactly(input, this, length)
+                failOnError(progress) {
+                    call.respondOutputStream(contentType(offer.mimeTypes[index]), status, length) {
+                        reporting(progress) { copyExactly(input, counted(this, progress), length) }
+                    }
                 }
             }
         }
     }
 
-    private suspend fun serveZip(call: ApplicationCall) {
+    private suspend fun serveZip(
+        call: ApplicationCall,
+        browser: BrowserSession,
+    ) {
         call.response.header(HttpHeaders.ContentDisposition, FileNames.contentDisposition(offer.archiveName))
         call.response.header(HttpHeaders.AcceptRanges, "none")
         val writer = StoredZipWriter(zipLayout, dosDateTime, settings.bufferSize)
+        val size = zipLayout.totalSize
+        val progress = tagged(call, browser, size, 0, size)
         activity.track {
-            call.respondOutputStream(ContentType.Application.Zip, HttpStatusCode.OK, zipLayout.totalSize) {
-                writer.write(this, { i -> offer.files[i].open(0) }, activity::addSent)
+            failOnError(progress) {
+                call.respondOutputStream(ContentType.Application.Zip, HttpStatusCode.OK, size) {
+                    reporting(progress) { writer.write(counted(this, progress), { i -> offer.files[i].open(0) }, activity::addSent) }
+                }
             }
+        }
+    }
+
+    private suspend fun serveProgress(
+        call: ApplicationCall,
+        browser: BrowserSession,
+    ) {
+        val id = call.request.queryParameters[ReceiveRoutes.DOWNLOAD_ID_PARAMETER]
+        if (id == null || !DownloadProgressTable.isValidId(id)) return json(call, HttpStatusCode.BadRequest, status("bad_request"))
+        val progress = browser.downloads[id]
+        val body =
+            buildJsonObject {
+                put("status", "ok")
+                if (progress == null) {
+                    put("state", "waiting")
+                } else {
+                    put("state", progress.state.wire)
+                    put("sent", progress.position)
+                    put("total", progress.total)
+                }
+            }
+        json(call, HttpStatusCode.OK, body)
+    }
+
+    /** The progress entry for a download tagged `?dl=<id>`, or null for an untagged one. */
+    private fun tagged(
+        call: ApplicationCall,
+        browser: BrowserSession,
+        total: Long,
+        offset: Long,
+        end: Long,
+    ): DownloadProgress? {
+        val id = call.request.queryParameters[ReceiveRoutes.DOWNLOAD_ID_PARAMETER] ?: return null
+        return if (DownloadProgressTable.isValidId(id)) browser.downloads.start(id, total, offset, end) else null
+    }
+
+    private fun counted(
+        out: OutputStream,
+        progress: DownloadProgress?,
+    ): OutputStream = if (progress == null) out else ProgressOutputStream(out, progress)
+
+    /** Runs the body writer and settles [progress] with its outcome (the writer may run apart from the respond call). */
+    private inline fun reporting(
+        progress: DownloadProgress?,
+        block: () -> Unit,
+    ) {
+        var ok = false
+        try {
+            block()
+            ok = true
+        } finally {
+            progress?.finish(ok)
+        }
+    }
+
+    /** Marks [progress] failed when the response itself fails before its writer settled it. */
+    private inline fun failOnError(
+        progress: DownloadProgress?,
+        block: () -> Unit,
+    ) {
+        try {
+            block()
+        } catch (e: Throwable) {
+            progress?.finish(false)
+            throw e
         }
     }
 
@@ -411,6 +522,8 @@ class ReceiveSession(
 
     private fun status(value: String): JsonObject = buildJsonObject { put("status", value) }
 
+    private val BrowserState.wire: String get() = name.lowercase()
+
     private fun contentType(mime: String): ContentType =
         try {
             ContentType.parse(mime)
@@ -420,7 +533,10 @@ class ReceiveSession(
 
     /** The endpoints of [ReceiveRoutes], matched against a raw request path. */
     internal sealed interface Route {
-        data object Redirect : Route
+        /** The same endpoint under the canonical prefix: [rest] is the path after it. */
+        data class Redirect(
+            val rest: String,
+        ) : Route
 
         data object Page : Route
 
@@ -429,6 +545,8 @@ class ReceiveSession(
         data object Zip : Route
 
         data object Upload : Route
+
+        data object Progress : Route
 
         data class File(
             val index: Int,
@@ -450,15 +568,19 @@ class ReceiveSession(
                 val slash = afterPrefix.indexOf('/')
                 val candidate = if (slash < 0) afterPrefix else afterPrefix.substring(0, slash)
                 if (!token.matches(candidate)) return null
-                if (slash < 0) return Redirect
+                if (slash < 0) return Redirect(ReceiveRoutes.PAGE)
                 val rest = afterPrefix.substring(slash + 1)
-                return when (rest) {
-                    ReceiveRoutes.PAGE -> Page
-                    ReceiveRoutes.FILES -> Files
-                    ReceiveRoutes.ALL_ZIP -> Zip
-                    ReceiveRoutes.UPLOAD -> Upload
-                    else -> fileRoute(rest, fileCount)
-                }
+                val endpoint =
+                    when (rest) {
+                        ReceiveRoutes.PAGE -> Page
+                        ReceiveRoutes.FILES -> Files
+                        ReceiveRoutes.ALL_ZIP -> Zip
+                        ReceiveRoutes.UPLOAD -> Upload
+                        ReceiveRoutes.PROGRESS -> Progress
+                        else -> fileRoute(rest, fileCount)
+                    } ?: return null
+                // Sessions only ever start under the canonical prefix: the cookie path must match what the page uses.
+                return if (candidate == token.value) endpoint else Redirect(rest)
             }
 
             private fun fileRoute(

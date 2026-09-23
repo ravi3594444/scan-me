@@ -8,6 +8,7 @@ import com.constrivo.drop.web.ReceiveServer
 import com.constrivo.drop.web.ReceiveSession
 import com.constrivo.drop.web.ReceiveSettings
 import com.constrivo.drop.web.ReceiveToken
+import com.constrivo.drop.web.SharedFile
 import com.constrivo.drop.web.UploadSettings
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -16,6 +17,8 @@ import kotlinx.serialization.json.addJsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
+import java.io.FilterInputStream
+import java.io.InputStream
 import java.net.InetAddress
 import java.nio.file.Files
 import java.nio.file.Path
@@ -29,7 +32,8 @@ import kotlin.random.Random
  * every sample's served name, size and SHA-256, then serves until stdin says `stop` or closes, or 10 minutes pass.
  *
  * The approver lets the first browser in after 1.5 s (so the page shows the waiting state first) and denies every
- * later browser, so the script can check both sides of the N15 gate.
+ * later browser, so the script can check both sides of the N15 gate. The 12 MB sample is served at about 3 MB/s, so
+ * the progress bar and MB/s readout are on screen long enough to check, whichever way the page downloads.
  */
 fun main() {
     val dir = Files.createTempDirectory("drop-e2e")
@@ -46,7 +50,8 @@ fun main() {
         samples.mapIndexed { i, sample ->
             val path = dir.resolve("sample-$i")
             Files.write(path, sample.bytes)
-            PathSharedFile(path, sample.name, sample.mime)
+            val file = PathSharedFile(path, sample.name, sample.mime)
+            if (sample.bytes.size >= THROTTLE_FROM) Throttled(file, THROTTLE_BYTES_PER_SECOND) else file
         }
     val uploads = dir.resolve("uploads")
     val approver =
@@ -102,6 +107,39 @@ fun main() {
     if (reason == null) runBlocking { server.stop() }
     println("E2E_STOPPED ${reason ?: "timeout"}")
     deleteRecursively(dir)
+}
+
+private const val THROTTLE_FROM = 10_000_000
+private const val THROTTLE_BYTES_PER_SECOND = 3_000_000L
+
+/** [file] read at no more than [bytesPerSecond]. */
+private class Throttled(
+    private val file: SharedFile,
+    private val bytesPerSecond: Long,
+) : SharedFile by file {
+    override fun open(offset: Long): InputStream =
+        object : FilterInputStream(file.open(offset)) {
+            private val start = System.nanoTime()
+            private var read = 0L
+
+            override fun read(
+                b: ByteArray,
+                off: Int,
+                len: Int,
+            ): Int {
+                val n = super.read(b, off, minOf(len, CHUNK))
+                if (n > 0) {
+                    read += n
+                    val wait = start + read * 1_000_000_000L / bytesPerSecond - System.nanoTime()
+                    if (wait > 0) Thread.sleep(wait / 1_000_000, (wait % 1_000_000).toInt())
+                }
+                return n
+            }
+        }
+
+    private companion object {
+        const val CHUNK = 32 * 1024
+    }
 }
 
 private class Sample(

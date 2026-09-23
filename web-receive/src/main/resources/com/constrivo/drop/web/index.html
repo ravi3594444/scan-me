@@ -8,14 +8,14 @@
 <link rel="icon" href="data:,">
 <title>Drop</title>
 <style>
-:root{--bg:#F7F8FA;--surface:#FFFFFF;--text:#14171C;--muted:#5F6773;--accent:#2F6BFF;--accent-soft:#E6EDFF;--on-accent:#FFFFFF;--success:#1FA971;--warning:#E0A400;--danger:#D9433B;--line:rgba(20,23,28,.1)}
-@media (prefers-color-scheme:dark){:root{--bg:#0E1116;--surface:#171B22;--text:#ECEFF3;--muted:#9AA3AF;--accent:#4C82FF;--accent-soft:#1B2540;--on-accent:#0E1116;--success:#2ECC8A;--warning:#F2B824;--danger:#FF6B61;--line:rgba(236,239,243,.12)}}
+:root{--bg:#F7F8FA;--surface:#FFFFFF;--text:#14171C;--muted:#5F6773;--accent:#2F6BFF;--accent-soft:#E6EDFF;--accent-text:#285EE8;--primary:#285EE8;--on-accent:#FFFFFF;--success:#1FA971;--warning:#E0A400;--danger:#D9433B;--line:rgba(20,23,28,.1)}
+@media (prefers-color-scheme:dark){:root{--bg:#0E1116;--surface:#171B22;--text:#ECEFF3;--muted:#9AA3AF;--accent:#4C82FF;--accent-soft:#1B2540;--accent-text:#5689FF;--primary:#4C82FF;--on-accent:#0E1116;--success:#2ECC8A;--warning:#F2B824;--danger:#FF6B61;--line:rgba(236,239,243,.12)}}
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,Inter,"Helvetica Neue",Arial,sans-serif}
 main{max-width:560px;margin:0 auto;padding:24px 16px 32px}
 header{display:flex;gap:16px;align-items:center;margin:8px 0 20px}
-.avatar{flex:none;width:48px;height:48px;border-radius:50%;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center;font-weight:600;font-size:20px}
+.avatar{flex:none;width:48px;height:48px;border-radius:50%;background:var(--accent-soft);color:var(--accent-text);display:grid;place-items:center;font-weight:600;font-size:20px}
 h1{font-size:22px;line-height:1.3;margin:0;font-weight:600;overflow-wrap:anywhere}
 h2{font-size:16px;margin:0 0 12px;font-weight:600}
 p{margin:0}
@@ -27,11 +27,11 @@ p{margin:0}
 .notice.bad svg{color:var(--danger)}
 .notice.wait svg{color:var(--accent)}
 button,.button{font:inherit;font-weight:600;border:0;border-radius:12px;min-height:48px;padding:12px 20px;cursor:pointer}
-.primary{width:100%;background:var(--accent);color:var(--on-accent)}
+.primary{width:100%;background:var(--primary);color:var(--on-accent)}
 .primary:disabled{opacity:.6;cursor:default}
-.ghost{background:transparent;color:var(--accent);padding:12px 8px}
+.ghost{background:transparent;color:var(--accent-text);padding:12px 8px}
 :focus-visible{outline:3px solid var(--accent);outline-offset:2px}
-a{color:var(--accent)}
+a{color:var(--accent-text)}
 ul{list-style:none;margin:0;padding:0}
 .files li{display:flex;gap:12px;align-items:center;min-height:56px;padding:4px 0;border-top:1px solid var(--line)}
 .files li:first-child{border-top:0}
@@ -49,7 +49,7 @@ ul{list-style:none;margin:0;padding:0}
 .done{color:var(--text)}
 .done svg{color:var(--success);vertical-align:-5px;margin-right:6px}
 .drop{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;min-height:120px;border:2px dashed var(--line);border-radius:16px;padding:16px;text-align:center;cursor:pointer;color:var(--muted)}
-.drop strong{color:var(--accent)}
+.drop strong{color:var(--accent-text)}
 .drop.over{border-color:var(--accent);background:var(--accent-soft)}
 input:focus-visible+.drop{outline:3px solid var(--accent);outline-offset:2px}
 .uploads li{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-top:1px solid var(--line);font-size:15px}
@@ -117,8 +117,10 @@ footer{margin-top:24px;font-size:13px;color:var(--muted);text-align:center}
 (() => {
   'use strict';
   const $ = (id) => document.getElementById(id);
-  // Larger downloads go to the browser's own download manager: holding them in memory is not worth the risk.
-  const BUFFER_LIMIT = 1024 * 1024 * 1024;
+  // Up to this size a download runs through fetch + ReadableStream: the page holds the bytes until it saves them, so
+  // the bar is exact and Cancel works. Larger ones (and all of them without streams) go to the browser's own download
+  // manager, which writes to disk as it goes; the bar then follows the server's count of bytes sent.
+  const BUFFER_LIMIT = 256 * 1024 * 1024;
   const canStream = typeof ReadableStream === 'function' && typeof AbortController === 'function' &&
     typeof Response === 'function' && 'body' in Response.prototype && typeof Blob === 'function';
   const GLYPHS = {
@@ -191,6 +193,7 @@ footer{margin-top:24px;font-size:13px;color:var(--muted);text-align:center}
 
   const PROBLEMS = {
     denied: 'The phone did not allow this computer.',
+    expired: 'The phone did not answer. Reload this page to ask again.',
     refused: 'This link is already open on another computer. Ask for a new code on the phone.',
     gone: 'This link has expired. Ask for a new code on the phone.',
     offline: 'Can’t reach the phone. Check that this computer is still on the phone’s Wi‑Fi.'
@@ -217,7 +220,7 @@ footer{margin-top:24px;font-size:13px;color:var(--muted);text-align:center}
       let status = 'denied';
       try { status = (await response.json()).status; } catch (e) { /* keep the default */ }
       showProblem(PROBLEMS[status] || PROBLEMS.denied);
-      $('title').textContent = 'Not allowed';
+      $('title').textContent = status === 'expired' ? 'No answer from the phone' : 'Not allowed';
       $('subtitle').textContent = '';
     } else {
       showProblem(PROBLEMS.gone);
@@ -254,7 +257,7 @@ footer{margin-top:24px;font-size:13px;color:var(--muted);text-align:center}
       link.textContent = file.name;
       link.setAttribute('aria-label', 'Download ' + file.name + ', ' + formatBytes(file.size));
       link.addEventListener('click', (event) => {
-        if (!state.busy && canStream && file.size <= BUFFER_LIMIT) {
+        if (!state.busy) {
           event.preventDefault();
           download(file.path, file.name, file.size, file.name);
         }
@@ -309,24 +312,63 @@ footer{margin-top:24px;font-size:13px;color:var(--muted);text-align:center}
     state.controller = null;
   }
 
-  async function download(path, name, size, label) {
-    if (state.busy) return;
-    if (!canStream || size > BUFFER_LIMIT) {
-      plainDownload(path);
-      finish('Your browser is downloading ' + label + '. Its download list shows the progress.', true);
-      return;
-    }
+  function begin(label, cancellable) {
     state.busy = true;
     state.announced = 0;
-    state.controller = new AbortController();
     $('all').disabled = true;
     $('status').hidden = true;
     $('progress').hidden = false;
+    $('cancel').hidden = !cancellable;
     $('progress-label').textContent = 'Downloading ' + label;
     $('speed').textContent = '0.0 MB/s';
     $('detail').textContent = '';
     setProgress(0);
-    let received = 0;
+  }
+
+  // Returns update(bytes): moves the bar and, about twice a second, the smoothed MB/s and time left.
+  function meter(total) {
+    let speed = 0;
+    let lastTime = 0;
+    let lastBytes = -1;
+    return (received) => {
+      const now = performance.now();
+      if (lastBytes < 0) {
+        lastTime = now;
+        lastBytes = received;
+      } else if (now - lastTime >= 450) {
+        const sample = (received - lastBytes) / ((now - lastTime) / 1000);
+        speed = speed ? speed * 0.7 + sample * 0.3 : sample;
+        lastTime = now;
+        lastBytes = received;
+        const eta = speed > 0 ? formatEta((total - received) / speed) : '';
+        $('speed').textContent = (speed / 1e6).toFixed(1) + ' MB/s' + (eta ? ' · ' + eta + ' left' : '');
+      }
+      $('detail').textContent = formatBytes(received) + ' of ' + formatBytes(total);
+      setProgress(total > 0 ? received / total : 1);
+    };
+  }
+
+  function stopped(status) {
+    if (state.controller && state.controller.signal.aborted) {
+      finish('Download cancelled.', false);
+    } else if (status === 404) {
+      finish(PROBLEMS.gone, false);
+    } else if (status === 0) {
+      finish(PROBLEMS.offline, false);
+    } else {
+      finish('The download stopped. Use the file links to try again.', false);
+    }
+  }
+
+  function download(path, name, size, label) {
+    if (state.busy) return;
+    if (canStream && size <= BUFFER_LIMIT) streamDownload(path, name, size, label);
+    else linkDownload(path, size, label);
+  }
+
+  async function streamDownload(path, name, size, label) {
+    begin(label, true);
+    state.controller = new AbortController();
     let status = 0;
     try {
       const response = await fetch(path, { cache: 'no-store', credentials: 'same-origin', signal: state.controller.signal });
@@ -334,12 +376,11 @@ footer{margin-top:24px;font-size:13px;color:var(--muted);text-align:center}
       if (!response.ok || !response.body) throw new Error('status ' + status);
       const total = Number(response.headers.get('Content-Length')) || size;
       const reader = response.body.getReader();
+      const update = meter(total);
       const parts = [];
       let pending = [];
       let pendingBytes = 0;
-      let speed = 0;
-      let lastTime = performance.now();
-      let lastBytes = 0;
+      let received = 0;
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -352,17 +393,7 @@ footer{margin-top:24px;font-size:13px;color:var(--muted);text-align:center}
           pending = [];
           pendingBytes = 0;
         }
-        const now = performance.now();
-        if (now - lastTime >= 500) {
-          const sample = (received - lastBytes) / ((now - lastTime) / 1000);
-          speed = speed ? speed * 0.7 + sample * 0.3 : sample;
-          lastTime = now;
-          lastBytes = received;
-          const eta = formatEta((total - received) / speed);
-          $('speed').textContent = (speed / 1e6).toFixed(1) + ' MB/s' + (eta ? ' · ' + eta + ' left' : '');
-        }
-        $('detail').textContent = formatBytes(received) + ' of ' + formatBytes(total);
-        setProgress(received / total);
+        update(received);
       }
       if (received !== total) throw new Error('incomplete');
       parts.push(new Blob(pending));
@@ -378,15 +409,51 @@ footer{margin-top:24px;font-size:13px;color:var(--muted);text-align:center}
       setProgress(1);
       finish('Received ' + label + ' · ' + formatBytes(total), true);
     } catch (e) {
-      if (state.controller && state.controller.signal.aborted) {
-        finish('Download cancelled.', false);
-      } else if (status === 404) {
-        finish(PROBLEMS.gone, false);
-      } else if (status === 0) {
-        finish(PROBLEMS.offline, false);
-      } else {
-        finish('The download stopped. Use the file links to try again.', false);
+      stopped(status);
+    }
+  }
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  function downloadId() {
+    const bytes = new Uint8Array(12);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  // The browser saves the file itself; the page polls the server's byte count for this download (tagged ?dl=id).
+  async function linkDownload(path, size, label) {
+    begin(label, false);
+    const id = downloadId();
+    plainDownload(path + '?dl=' + id);
+    const update = meter(size);
+    let waited = 0;
+    let errors = 0;
+    for (;;) {
+      await sleep(500);
+      let progress;
+      try {
+        const response = await fetch('progress?dl=' + id, { cache: 'no-store', credentials: 'same-origin' });
+        if (response.status === 404) return finish(PROBLEMS.gone, false);
+        if (!response.ok) throw new Error('status ' + response.status);
+        progress = await response.json();
+        errors = 0;
+      } catch (e) {
+        if (++errors >= 6) return finish(PROBLEMS.offline, false);
+        continue;
       }
+      if (progress.state === 'waiting') {
+        // The browser may still be asking where to save, or whether to allow downloads.
+        waited += 500;
+        if (waited >= 30000) return finish('Your browser is downloading ' + label + '. Its download list shows the progress.', true);
+        continue;
+      }
+      update(progress.sent);
+      if (progress.state === 'done') {
+        setProgress(1);
+        return finish('Received ' + label + ' · ' + formatBytes(progress.total), true);
+      }
+      if (progress.state === 'failed') return stopped(-1);
     }
   }
 

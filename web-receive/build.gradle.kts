@@ -3,8 +3,9 @@ plugins {
 }
 
 dependencies {
-    // AppIdentity (mDNS host name, display name) and the clock interfaces live in core:discovery.
-    implementation(project(":core:discovery"))
+    // AppIdentity (mDNS host name, display name) and the clock interfaces live in core:discovery. `api`, because the
+    // clocks appear in public constructors (ReceiveSession, TransferActivity, MdnsResponder, MdnsHostAnswerer).
+    api(project(":core:discovery"))
     api(libs.ktor.server.core)
     implementation(libs.ktor.server.cio)
     implementation(libs.kotlinx.coroutines.core)

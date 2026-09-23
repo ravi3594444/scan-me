@@ -1,5 +1,6 @@
 package com.constrivo.drop.web.mdns
 
+import com.constrivo.drop.web.FakeMonotonicClock
 import java.net.Inet4Address
 import java.net.InetAddress
 import kotlin.test.Test
@@ -12,7 +13,24 @@ import kotlin.test.assertTrue
 class MdnsHostAnswererTest {
     private val drop = DnsName.of("drop.local")
     private val address = InetAddress.getByName("192.168.49.1") as Inet4Address
-    private val answerer = MdnsHostAnswerer(drop, address)
+    private val clock = FakeMonotonicClock()
+    private val limited = MdnsHostAnswerer(drop, address, clock = clock)
+
+    /**
+     * The answerer, as most tests use it: each call a second after the last, so the once-per-second multicast limit
+     * never hides an answer ([aRecordIsMulticastAtMostOncePerSecond] tests the limit).
+     */
+    private val answerer =
+        object {
+            fun answer(
+                query: DnsMessage,
+                sourcePort: Int,
+            ) = limited.answer(query, sourcePort).also { clock.advance(1_000) }
+
+            fun announcement() = limited.announcement()
+
+            fun goodbye() = limited.goodbye()
+        }
 
     private fun query(
         vararg questions: DnsQuestion,
@@ -127,6 +145,37 @@ class MdnsHostAnswererTest {
                 answerer.answer(query(DnsQuestion(drop, DnsType.A, unicastResponse = true), DnsQuestion(drop, DnsType.AAAA)), 5353),
             )
         assertFalse(reply.unicast)
+    }
+
+    @Test
+    fun aRecordIsMulticastAtMostOncePerSecond() {
+        val qm = query(DnsQuestion(drop, DnsType.A))
+        assertNotNull(limited.answer(qm, 5353))
+        clock.advance(999)
+        assertNull(limited.answer(qm, 5353), "RFC 6762 §6: not again within a second")
+        assertNull(limited.answer(query(DnsQuestion(drop, DnsType.AAAA)), 5353), "the NSEC went out as additional data")
+        // Unicast replies are not limited: QU and legacy queries are answered at once.
+        assertTrue(assertNotNull(limited.answer(query(DnsQuestion(drop, DnsType.A, unicastResponse = true)), 5353)).unicast)
+        assertTrue(assertNotNull(limited.answer(query(DnsQuestion(drop, DnsType.A), id = 9), 40_000)).unicast)
+        clock.advance(1)
+        val again = assertNotNull(limited.answer(qm, 5353))
+        assertFalse(again.unicast)
+        assertEquals(listOf(DnsType.A), again.message.answers.map { it.type })
+        // A querier in a tight loop gets one multicast per second.
+        var sent = 0
+        repeat(100) {
+            clock.advance(50)
+            if (limited.answer(qm, 5353) != null) sent++
+        }
+        assertEquals(5, sent)
+    }
+
+    @Test
+    fun theAnnouncementCountsAsAMulticast() {
+        limited.announcement()
+        assertNull(limited.answer(query(DnsQuestion(drop, DnsType.A)), 5353))
+        clock.advance(1_000)
+        assertNotNull(limited.answer(query(DnsQuestion(drop, DnsType.A)), 5353))
     }
 
     @Test

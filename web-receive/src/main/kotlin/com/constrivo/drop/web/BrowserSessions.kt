@@ -24,15 +24,28 @@ data class BrowserApprovalRequest(
 
 /**
  * Asks the phone user whether a browser may see the files (N15). Called once per new browser, on a background
- * coroutine; returning true serves `/files` and the downloads to that browser. Throwing, or not answering within
- * [ReceiveSettings.approvalTimeoutMillis], counts as "no".
+ * coroutine; returning true serves `/files` and the downloads to that browser, false or throwing counts as "no". A
+ * call that does not return within [ReceiveSettings.approvalTimeoutMillis] is cancelled (dismiss the prompt then)
+ * and leaves the browser [BrowserState.EXPIRED]: reloading the page asks again, for the same browser.
  */
 fun interface BrowserApprover {
     suspend fun approve(request: BrowserApprovalRequest): Boolean
 }
 
 /** Where one browser stands with the phone. */
-enum class BrowserState { PENDING, APPROVED, DENIED }
+enum class BrowserState {
+    /** The phone is being asked. */
+    PENDING,
+
+    /** The phone said yes: files, downloads and uploads are served. */
+    APPROVED,
+
+    /** The phone said no, or the session closed; final. */
+    DENIED,
+
+    /** Nobody answered within the approval timeout; the next page load asks again ([BrowserSessions.retry]). */
+    EXPIRED,
+}
 
 /**
  * One browser, identified by the session cookie and bound to the address it first came from, so a copied cookie is
@@ -42,33 +55,48 @@ internal class BrowserSession(
     val id: String,
     val number: Int,
     val remoteAddress: String,
+    val userAgent: String?,
 ) {
-    /** Completes with the phone's answer; [state] already reflects it when it completes. */
-    val decision = CompletableDeferred<Boolean>()
+    /** Download progress this browser asked the server to report ([ReceiveRoutes.PROGRESS]). */
+    val downloads = DownloadProgressTable()
 
-    @Volatile private var allowed: Boolean? = null
+    @Volatile
+    var state: BrowserState = BrowserState.PENDING
+        private set
 
-    val state: BrowserState
-        get() =
-            when (allowed) {
-                null -> BrowserState.PENDING
-                true -> BrowserState.APPROVED
-                false -> BrowserState.DENIED
-            }
+    /** Completes with the state that ends the current [BrowserState.PENDING] period; replaced by [reopen]. */
+    @Volatile
+    var decision: CompletableDeferred<BrowserState> = CompletableDeferred()
+        private set
 
-    /** Records the first answer; later ones are ignored. */
+    /** Records the phone's answer to the pending request; ignored when nothing is pending. */
     @Synchronized
-    fun decide(allowed: Boolean) {
-        if (this.allowed != null) return
-        this.allowed = allowed
-        decision.complete(allowed)
+    fun decide(allowed: Boolean) = settle(if (allowed) BrowserState.APPROVED else BrowserState.DENIED)
+
+    /** The pending request ran out of time without an answer. */
+    @Synchronized
+    fun expire() = settle(BrowserState.EXPIRED)
+
+    /** Moves an [BrowserState.EXPIRED] browser back to pending; false in any other state. */
+    @Synchronized
+    fun reopen(): Boolean {
+        if (state != BrowserState.EXPIRED) return false
+        decision = CompletableDeferred()
+        state = BrowserState.PENDING
+        return true
+    }
+
+    private fun settle(outcome: BrowserState) {
+        if (state != BrowserState.PENDING) return
+        state = outcome
+        decision.complete(outcome)
     }
 }
 
 /**
  * The browsers that presented the token (N15). The first request with the right token and no valid cookie creates a
  * session, sets its cookie and asks the phone through the [BrowserApprover]; later browsers each need their own
- * approval, and after [maxBrowsers] sessions (pending, approved or denied) new browsers are refused without asking,
+ * approval, and after [maxBrowsers] sessions (in any state) new browsers are refused without asking,
  * so a leaked QR code cannot flood the phone with prompts.
  */
 internal class BrowserSessions(
@@ -97,23 +125,36 @@ internal class BrowserSessions(
         userAgent: String?,
     ): BrowserSession? {
         if (sessions.size >= maxBrowsers) return null
-        val id = newId()
-        val session = BrowserSession(id, sessions.size + 1, remoteAddress)
-        sessions[id] = session
-        val request = BrowserApprovalRequest(session.number, remoteAddress, userAgent?.take(MAX_USER_AGENT))
+        val session = BrowserSession(newId(), sessions.size + 1, remoteAddress, userAgent?.take(MAX_USER_AGENT))
+        sessions[session.id] = session
+        ask(session)
+        return session
+    }
+
+    /**
+     * Asks the phone again for a browser whose request expired unanswered, keeping its session (and its slot among
+     * [maxBrowsers]). Returns false, asking nothing, when [session] is not [BrowserState.EXPIRED].
+     */
+    fun retry(session: BrowserSession): Boolean {
+        if (!session.reopen()) return false
+        ask(session)
+        return true
+    }
+
+    private fun ask(session: BrowserSession) {
+        val request = BrowserApprovalRequest(session.number, session.remoteAddress, session.userAgent)
         scope.launch {
             val allowed =
                 try {
-                    withTimeoutOrNull(approvalTimeoutMillis) { approver.approve(request) } ?: false
+                    withTimeoutOrNull(approvalTimeoutMillis) { approver.approve(request) }
                 } catch (e: CancellationException) {
                     session.decide(false)
                     throw e
                 } catch (_: Exception) {
                     false
                 }
-            session.decide(allowed)
+            if (allowed == null) session.expire() else session.decide(allowed)
         }
-        return session
     }
 
     /** Snapshot of every session's state, in the order browsers arrived. */

@@ -5,7 +5,9 @@ package com.constrivo.drop.web
  *
  * Every endpoint sits under the per-session token prefix `/t/<token>/` from the QR code ([prefix]); the paths below
  * are relative to it, so the page links to them with relative URLs. A request whose path does not start with the
- * right prefix gets 404, whatever follows it. `/t/<token>` without the trailing slash redirects to the prefix.
+ * right prefix gets 404, whatever follows it. `/t/<token>` without the trailing slash, and the token typed in another
+ * case, redirect to the same endpoint under the canonical (lower-case) prefix before any session is created: the
+ * session cookie is scoped to that prefix, and browsers match cookie paths case-sensitively.
  *
  * | Method | Path | Serves |
  * | --- | --- | --- |
@@ -13,6 +15,7 @@ package com.constrivo.drop.web
  * | GET | [FILES] | the file list as JSON, once the phone allowed this browser |
  * | GET | [FILE] | one file, with `Content-Length`, RFC 6266 `Content-Disposition` and single-range support |
  * | GET | [ALL_ZIP] | every file as one streamed STORED zip |
+ * | GET | [PROGRESS] | bytes sent so far for a download tagged with [DOWNLOAD_ID_PARAMETER] |
  * | POST | [UPLOAD] | one file sent back to the phone (P1), only when the server has an upload sink |
  *
  * The server stops [IDLE_SHUTDOWN_SECONDS] after the last transfer finished with nothing in progress.
@@ -25,6 +28,13 @@ object ReceiveRoutes {
     const val FILE = "file/{index}"
     const val ALL_ZIP = "all.zip"
     const val UPLOAD = "upload"
+    const val PROGRESS = "progress"
+
+    /**
+     * Optional query parameter of [FILE] and [ALL_ZIP] (and required by [PROGRESS]): an id the page picks, 8 to 64
+     * characters of `[A-Za-z0-9_-]`, under which the server counts the bytes it sends for that download.
+     */
+    const val DOWNLOAD_ID_PARAMETER = "dl"
 
     /** Query parameter of [UPLOAD] carrying the file name (percent-encoded UTF-8). */
     const val UPLOAD_NAME_PARAMETER = "name"

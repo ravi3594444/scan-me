@@ -175,11 +175,16 @@ class ReceiveServerTest {
                 val client = browser()
                 client.approve(server)
                 assertFailsWith<IOException>("the browser sees a broken download, not a short file") {
-                    client.get(server.ipUrl() + "file/0")
+                    client.get(server.ipUrl() + "file/0?dl=shrunk-file")
                 }
-                assertFailsWith<IOException> { client.get(server.ipUrl() + "all.zip") }
+                assertFailsWith<IOException> { client.get(server.ipUrl() + "all.zip?dl=shrunk-zip") }
                 withTimeout(5_000) { while (server.session.activity.snapshot().finished < 2) delay(10) }
                 assertEquals(0, server.session.activity.snapshot().inProgress)
+                // The page following these downloads through `progress` is told they failed.
+                for (id in listOf("shrunk-file", "shrunk-zip")) {
+                    val progress = client.get(server.ipUrl() + "progress?dl=$id").body().toString(Charsets.UTF_8)
+                    assertTrue(progress.contains("\"state\":\"failed\""), progress)
+                }
             } finally {
                 server.stop()
             }
