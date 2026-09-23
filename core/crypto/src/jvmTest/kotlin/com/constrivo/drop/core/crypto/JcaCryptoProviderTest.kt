@@ -77,6 +77,30 @@ class JcaCryptoProviderTest {
     }
 
     @Test
+    fun aeadSelectionIsSymmetricAndPrefersAesOnlyWhenBothHaveIt() {
+        val aes = AeadAlgorithm.AES_256_GCM
+        val chacha = AeadAlgorithm.CHACHA20_POLY1305
+        assertEquals(aes, AeadAlgorithm.negotiate(aes, aes))
+        assertEquals(chacha, AeadAlgorithm.negotiate(aes, chacha))
+        assertEquals(chacha, AeadAlgorithm.negotiate(chacha, aes))
+        assertEquals(chacha, AeadAlgorithm.negotiate(chacha, chacha))
+        assertEquals(aes, AeadAlgorithm.preferred(hasAesHardware = true))
+        assertEquals(chacha, AeadAlgorithm.preferred(hasAesHardware = false))
+        for (algorithm in AeadAlgorithm.entries) assertEquals(algorithm, AeadAlgorithm.fromWireId(algorithm.wireId))
+        assertEquals(null, AeadAlgorithm.fromWireId(0))
+        assertEquals(null, AeadAlgorithm.fromWireId(3))
+    }
+
+    @Test
+    fun malformedKeysRaiseCryptoException() {
+        assertFailsWith<CryptoException> { crypto.ed25519Sign(ByteArray(31), ByteArray(0)) }
+        assertFailsWith<CryptoException> { crypto.x25519(ByteArray(32), ByteArray(31)) }
+        assertFailsWith<CryptoException> { crypto.x25519(ByteArray(32) { 1 }, ByteArray(32)) }
+        assertFalse(crypto.ed25519Verify(ByteArray(31), ByteArray(0), ByteArray(64)))
+        assertFalse(crypto.ed25519Verify(ByteArray(32), ByteArray(0), ByteArray(63)))
+    }
+
+    @Test
     fun deviceIdIsFirst16BytesOfSha256() {
         val pk = crypto.generateEd25519().publicKey
         assertContentEquals(crypto.sha256(pk).copyOf(16), crypto.deviceId(pk))

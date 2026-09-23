@@ -95,11 +95,15 @@ class JcaCryptoProvider(
         message: ByteArray,
     ): ByteArray {
         requireSize(privateKey, 32, "Ed25519 private key")
-        val key = KeyFactory.getInstance("Ed25519").generatePrivate(PKCS8EncodedKeySpec(ED25519_PRIVATE_PREFIX + privateKey))
-        return Signature.getInstance("Ed25519").run {
-            initSign(key)
-            update(message)
-            sign()
+        try {
+            val key = KeyFactory.getInstance("Ed25519").generatePrivate(PKCS8EncodedKeySpec(ED25519_PRIVATE_PREFIX + privateKey))
+            return Signature.getInstance("Ed25519").run {
+                initSign(key)
+                update(message)
+                sign()
+            }
+        } catch (e: GeneralSecurityException) {
+            throw CryptoException("Ed25519 signing failed", e)
         }
     }
 

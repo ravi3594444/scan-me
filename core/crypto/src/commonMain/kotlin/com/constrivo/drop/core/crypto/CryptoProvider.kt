@@ -62,13 +62,36 @@ class RawKeyPair(
     val privateKey: ByteArray,
 )
 
+/**
+ * The two frame AEADs (architecture §7.1). [wireId] is the value carried as the AEAD preference in the handshake
+ * (`Hello` / `HelloAck`, architecture §6.2); it is part of the signed transcript, so it cannot be downgraded.
+ */
 enum class AeadAlgorithm(
     val keySize: Int,
     val nonceSize: Int,
     val tagSize: Int,
+    val wireId: Int,
 ) {
-    AES_256_GCM(32, 12, 16),
-    CHACHA20_POLY1305(32, 12, 16),
+    AES_256_GCM(32, 12, 16, 1),
+    CHACHA20_POLY1305(32, 12, 16, 2),
+    ;
+
+    companion object {
+        /** The algorithm with [wireId], or null for an unknown id. */
+        fun fromWireId(wireId: Int): AeadAlgorithm? = entries.firstOrNull { it.wireId == wireId }
+
+        /**
+         * The algorithm both sides use (architecture §7.1): AES-256-GCM unless either side lacks AES hardware
+         * (prefers ChaCha20-Poly1305). The rule is symmetric, so both peers derive the same choice.
+         */
+        fun negotiate(
+            local: AeadAlgorithm,
+            peer: AeadAlgorithm,
+        ): AeadAlgorithm = if (local == AES_256_GCM && peer == AES_256_GCM) AES_256_GCM else CHACHA20_POLY1305
+
+        /** The preference a device advertises: AES-256-GCM when [hasAesHardware], else ChaCha20-Poly1305. */
+        fun preferred(hasAesHardware: Boolean): AeadAlgorithm = if (hasAesHardware) AES_256_GCM else CHACHA20_POLY1305
+    }
 }
 
 /** Authenticated encryption with associated data. Nonces must never repeat for one key. */
@@ -94,7 +117,13 @@ interface Aead {
     }
 }
 
-class CryptoException(
+/**
+ * A cryptographic check failed or input could not be processed. Subclasses name the layer that failed:
+ * [com.constrivo.drop.core.crypto.handshake.HandshakeException], [com.constrivo.drop.core.crypto.qr.QrPayloadException]
+ * and [com.constrivo.drop.core.crypto.frame.FrameLimitException]. Every decoder in this module reports malformed input
+ * with one of these types, never with an index or arithmetic exception.
+ */
+open class CryptoException(
     message: String,
     cause: Throwable? = null,
 ) : Exception(message, cause)
