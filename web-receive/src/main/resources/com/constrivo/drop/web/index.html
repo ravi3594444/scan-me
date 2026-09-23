@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<link rel="icon" href="data:,">
+<title>Drop</title>
+<style>
+:root{--bg:#F7F8FA;--surface:#FFFFFF;--text:#14171C;--muted:#5F6773;--accent:#2F6BFF;--accent-soft:#E6EDFF;--on-accent:#FFFFFF;--success:#1FA971;--warning:#E0A400;--danger:#D9433B;--line:rgba(20,23,28,.1)}
+@media (prefers-color-scheme:dark){:root{--bg:#0E1116;--surface:#171B22;--text:#ECEFF3;--muted:#9AA3AF;--accent:#4C82FF;--accent-soft:#1B2540;--on-accent:#0E1116;--success:#2ECC8A;--warning:#F2B824;--danger:#FF6B61;--line:rgba(236,239,243,.12)}}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,Inter,"Helvetica Neue",Arial,sans-serif}
+main{max-width:560px;margin:0 auto;padding:24px 16px 32px}
+header{display:flex;gap:16px;align-items:center;margin:8px 0 20px}
+.avatar{flex:none;width:48px;height:48px;border-radius:50%;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center;font-weight:600;font-size:20px}
+h1{font-size:22px;line-height:1.3;margin:0;font-weight:600;overflow-wrap:anywhere}
+h2{font-size:16px;margin:0 0 12px;font-weight:600}
+p{margin:0}
+.muted{color:var(--muted)}
+.card{background:var(--surface);border-radius:16px;padding:16px;margin:0 0 16px;border:1px solid var(--line)}
+.notice{display:flex;gap:12px;align-items:flex-start}
+.notice svg{flex:none;margin-top:1px}
+.notice.warn svg{color:var(--warning)}
+.notice.bad svg{color:var(--danger)}
+.notice.wait svg{color:var(--accent)}
+button,.button{font:inherit;font-weight:600;border:0;border-radius:12px;min-height:48px;padding:12px 20px;cursor:pointer}
+.primary{width:100%;background:var(--accent);color:var(--on-accent)}
+.primary:disabled{opacity:.6;cursor:default}
+.ghost{background:transparent;color:var(--accent);padding:12px 8px}
+:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+a{color:var(--accent)}
+ul{list-style:none;margin:0;padding:0}
+.files li{display:flex;gap:12px;align-items:center;min-height:56px;padding:4px 0;border-top:1px solid var(--line)}
+.files li:first-child{border-top:0}
+.glyph{flex:none;width:40px;height:40px;border-radius:10px;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center}
+.files .name{flex:1;min-width:0}
+.files a{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-decoration:none;font-weight:500;padding:4px 0}
+.files a:hover{text-decoration:underline}
+.size{font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums}
+.actions{margin:0 0 16px}
+.actions .card{margin:12px 0 0}
+.bar{height:8px;border-radius:4px;background:var(--accent-soft);overflow:hidden}
+.fill{height:100%;width:0;background:var(--accent);transition:width .2s linear}
+.speed{font-size:28px;font-weight:600;font-variant-numeric:tabular-nums;margin:12px 0 0;line-height:1.2}
+.row{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:4px}
+.done{color:var(--text)}
+.done svg{color:var(--success);vertical-align:-5px;margin-right:6px}
+.drop{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;min-height:120px;border:2px dashed var(--line);border-radius:16px;padding:16px;text-align:center;cursor:pointer;color:var(--muted)}
+.drop strong{color:var(--accent)}
+.drop.over{border-color:var(--accent);background:var(--accent-soft)}
+input:focus-visible+.drop{outline:3px solid var(--accent);outline-offset:2px}
+.uploads li{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-top:1px solid var(--line);font-size:15px}
+.uploads li span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sr{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+footer{margin-top:24px;font-size:13px;color:var(--muted);text-align:center}
+[hidden]{display:none!important}
+@media (prefers-reduced-motion:reduce){.fill{transition:none}}
+</style>
+</head>
+<body>
+<main>
+<header>
+<div class="avatar" id="avatar" aria-hidden="true">
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2" width="10" height="20" rx="2"/><path d="M11 18h2"/></svg>
+</div>
+<div>
+<h1 id="title">Waiting for the phone</h1>
+<p class="muted" id="subtitle">Connecting…</p>
+</div>
+</header>
+
+<section class="card notice wait" id="waiting" aria-live="polite">
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+<p>On the phone, tap <strong>Allow</strong> to let this computer see the files.</p>
+</section>
+
+<section class="card notice bad" id="problem" hidden role="alert">
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v6M12 16.5v.5"/></svg>
+<p id="problem-text"></p>
+</section>
+
+<section id="offer" hidden aria-labelledby="title">
+<div class="actions">
+<button type="button" class="primary" id="all">Download all (zip)</button>
+<div class="card progress" id="progress" hidden>
+<div class="row"><span id="progress-label">Downloading</span><button type="button" class="ghost" id="cancel">Cancel</button></div>
+<div class="bar" role="progressbar" aria-labelledby="progress-label" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="bar"><div class="fill" id="fill"></div></div>
+<p class="speed" id="speed">0.0 MB/s</p>
+<p class="size" id="detail"></p>
+</div>
+<p class="card done" id="status" hidden aria-live="polite"></p>
+<p class="sr" id="announce" aria-live="polite"></p>
+</div>
+<div class="card">
+<h2 id="files-title">Files</h2>
+<ul class="files" id="files" aria-labelledby="files-title"></ul>
+</div>
+</section>
+
+<section class="card" id="upload" hidden aria-labelledby="upload-title">
+<h2 id="upload-title">Send files back</h2>
+<input type="file" id="upload-input" class="sr" multiple>
+<label for="upload-input" class="drop" id="drop">
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4M7 9l5-5 5 5M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
+<span>Drop files here or <strong>choose files</strong></span>
+<span class="size" id="upload-limit"></span>
+</label>
+<ul class="uploads" id="uploads" aria-live="polite"></ul>
+</section>
+
+<footer><p>No account, no cloud, no tracking. Nothing leaves your phone except the file you chose to send.</p></footer>
+</main>
+<script>
+(() => {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  // Larger downloads go to the browser's own download manager: holding them in memory is not worth the risk.
+  const BUFFER_LIMIT = 1024 * 1024 * 1024;
+  const canStream = typeof ReadableStream === 'function' && typeof AbortController === 'function' &&
+    typeof Response === 'function' && 'body' in Response.prototype && typeof Blob === 'function';
+  const GLYPHS = {
+    image: 'M4 5h16v14H4zM4 16l5-5 4 4 2-2 5 5M15.5 9.5h.01',
+    video: 'M4 6h12v12H4zM16 10l4-2v8l-4-2',
+    audio: 'M9 18V6l10-2v12M9 18a3 3 0 1 1-3-3 3 3 0 0 1 3 3zM19 16a3 3 0 1 1-3-3 3 3 0 0 1 3 3z',
+    archive: 'M6 3h9l4 4v14H6zM11 5h2M11 8h2M11 11h2M10 14h4v3h-4z',
+    doc: 'M6 3h9l4 4v14H6zM15 3v4h4M9 12h7M9 15h7M9 18h4',
+    app: 'M7 3h10v18H7zM11 18h2',
+    file: 'M6 3h9l4 4v14H6zM15 3v4h4'
+  };
+  const state = { data: null, busy: false, controller: null, announced: 0, uploadLeft: 0, uploading: false, queue: [] };
+
+  function formatBytes(n) {
+    if (n < 1000) return n + ' B';
+    const units = ['KB', 'MB', 'GB', 'TB'];
+    let v = n;
+    for (let i = 0; i < units.length; i++) {
+      v /= 1000;
+      if (v < 9.95) return (Math.round(v * 10) / 10).toString() + ' ' + units[i];
+      if (v < 999.5 || i === units.length - 1) return Math.round(v) + ' ' + units[i];
+    }
+    return n + ' B';
+  }
+
+  function formatEta(seconds) {
+    if (!isFinite(seconds) || seconds < 0) return '';
+    if (seconds < 60) return Math.max(1, Math.round(seconds)) + ' s';
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 60) return minutes + ' min';
+    return Math.floor(minutes / 60) + ' h ' + (minutes % 60) + ' min';
+  }
+
+  function kindOf(mime, name) {
+    const ext = (name.split('.').pop() || '').toLowerCase();
+    if (mime.startsWith('image/')) return 'image';
+    if (mime.startsWith('video/')) return 'video';
+    if (mime.startsWith('audio/')) return 'audio';
+    if (/zip|rar|7z|tar|gzip|compressed/.test(mime) || ['zip', 'rar', '7z', 'tar', 'gz'].includes(ext)) return 'archive';
+    if (mime === 'application/vnd.android.package-archive' || ext === 'apk') return 'app';
+    if (mime.startsWith('text/') || /pdf|document|sheet|presentation|msword|excel|powerpoint/.test(mime)) return 'doc';
+    return 'file';
+  }
+
+  function glyph(kind) {
+    const ns = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('width', '24');
+    svg.setAttribute('height', '24');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('fill', 'none');
+    svg.setAttribute('stroke', 'currentColor');
+    svg.setAttribute('stroke-width', '1.8');
+    svg.setAttribute('stroke-linecap', 'round');
+    svg.setAttribute('stroke-linejoin', 'round');
+    svg.setAttribute('aria-hidden', 'true');
+    const path = document.createElementNS(ns, 'path');
+    path.setAttribute('d', GLYPHS[kind] || GLYPHS.file);
+    svg.appendChild(path);
+    return svg;
+  }
+
+  function showProblem(text) {
+    $('waiting').hidden = true;
+    $('offer').hidden = true;
+    $('upload').hidden = true;
+    $('problem').hidden = false;
+    $('problem-text').textContent = text;
+  }
+
+  const PROBLEMS = {
+    denied: 'The phone did not allow this computer.',
+    refused: 'This link is already open on another computer. Ask for a new code on the phone.',
+    gone: 'This link has expired. Ask for a new code on the phone.',
+    offline: 'Can’t reach the phone. Check that this computer is still on the phone’s Wi‑Fi.'
+  };
+
+  let failures = 0;
+  async function load() {
+    let response;
+    try {
+      response = await fetch('files', { cache: 'no-store', credentials: 'same-origin' });
+    } catch (e) {
+      failures++;
+      if (failures >= 3) showProblem(PROBLEMS.offline);
+      setTimeout(load, 2000);
+      return;
+    }
+    failures = 0;
+    if (response.status === 200) {
+      render(await response.json());
+    } else if (response.status === 202) {
+      $('subtitle').textContent = 'Waiting for approval';
+      setTimeout(load, 250);
+    } else if (response.status === 403) {
+      let status = 'denied';
+      try { status = (await response.json()).status; } catch (e) { /* keep the default */ }
+      showProblem(PROBLEMS[status] || PROBLEMS.denied);
+      $('title').textContent = 'Not allowed';
+      $('subtitle').textContent = '';
+    } else {
+      showProblem(PROBLEMS.gone);
+      $('title').textContent = 'Link expired';
+      $('subtitle').textContent = '';
+    }
+  }
+
+  function render(data) {
+    state.data = data;
+    $('waiting').hidden = true;
+    $('problem').hidden = true;
+    $('offer').hidden = false;
+    const title = data.sender + ' wants to send you ' + data.summary;
+    $('title').textContent = title;
+    document.title = title;
+    $('subtitle').hidden = true;
+    const avatar = $('avatar');
+    avatar.textContent = (Array.from(data.sender.trim())[0] || '?').toUpperCase();
+    $('all').textContent = 'Download all (zip) · ' + formatBytes(data.archive.size);
+    $('files-title').textContent = data.count === 1 ? '1 file' : data.count + ' files';
+    const list = $('files');
+    list.textContent = '';
+    for (const file of data.files) {
+      const li = document.createElement('li');
+      const icon = document.createElement('span');
+      icon.className = 'glyph';
+      icon.appendChild(glyph(kindOf(file.mime, file.name)));
+      const name = document.createElement('div');
+      name.className = 'name';
+      const link = document.createElement('a');
+      link.href = file.path;
+      link.download = file.name;
+      link.textContent = file.name;
+      link.setAttribute('aria-label', 'Download ' + file.name + ', ' + formatBytes(file.size));
+      link.addEventListener('click', (event) => {
+        if (!state.busy && canStream && file.size <= BUFFER_LIMIT) {
+          event.preventDefault();
+          download(file.path, file.name, file.size, file.name);
+        }
+      });
+      const size = document.createElement('div');
+      size.className = 'size';
+      size.textContent = formatBytes(file.size);
+      name.append(link, size);
+      li.append(icon, name);
+      list.appendChild(li);
+    }
+    if (data.upload) {
+      state.uploadLeft = data.upload.maxBytes;
+      $('upload').hidden = false;
+      $('upload-limit').textContent = 'Up to ' + formatBytes(state.uploadLeft);
+    }
+  }
+
+  function plainDownload(path) {
+    const a = document.createElement('a');
+    a.href = path;
+    a.download = '';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
+
+  function setProgress(fraction) {
+    const pct = Math.max(0, Math.min(100, Math.floor(fraction * 100)));
+    $('fill').style.width = pct + '%';
+    $('bar').setAttribute('aria-valuenow', String(pct));
+    const step = Math.floor(pct / 25) * 25;
+    if (step > state.announced) {
+      state.announced = step;
+      $('announce').textContent = step + ' percent downloaded';
+    }
+  }
+
+  function finish(text, ok) {
+    $('progress').hidden = true;
+    const status = $('status');
+    status.hidden = false;
+    status.textContent = '';
+    if (ok) {
+      const tick = glyph('file');
+      tick.firstChild.setAttribute('d', 'M5 12l5 5 9-10');
+      status.appendChild(tick);
+    }
+    status.appendChild(document.createTextNode(text));
+    $('all').disabled = false;
+    state.busy = false;
+    state.controller = null;
+  }
+
+  async function download(path, name, size, label) {
+    if (state.busy) return;
+    if (!canStream || size > BUFFER_LIMIT) {
+      plainDownload(path);
+      finish('Your browser is downloading ' + label + '. Its download list shows the progress.', true);
+      return;
+    }
+    state.busy = true;
+    state.announced = 0;
+    state.controller = new AbortController();
+    $('all').disabled = true;
+    $('status').hidden = true;
+    $('progress').hidden = false;
+    $('progress-label').textContent = 'Downloading ' + label;
+    $('speed').textContent = '0.0 MB/s';
+    $('detail').textContent = '';
+    setProgress(0);
+    let received = 0;
+    let status = 0;
+    try {
+      const response = await fetch(path, { cache: 'no-store', credentials: 'same-origin', signal: state.controller.signal });
+      status = response.status;
+      if (!response.ok || !response.body) throw new Error('status ' + status);
+      const total = Number(response.headers.get('Content-Length')) || size;
+      const reader = response.body.getReader();
+      const parts = [];
+      let pending = [];
+      let pendingBytes = 0;
+      let speed = 0;
+      let lastTime = performance.now();
+      let lastBytes = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        pending.push(value);
+        pendingBytes += value.length;
+        received += value.length;
+        // Fold chunks into Blobs as they arrive so the browser can keep them out of the JavaScript heap.
+        if (pendingBytes >= 16 * 1024 * 1024) {
+          parts.push(new Blob(pending));
+          pending = [];
+          pendingBytes = 0;
+        }
+        const now = performance.now();
+        if (now - lastTime >= 500) {
+          const sample = (received - lastBytes) / ((now - lastTime) / 1000);
+          speed = speed ? speed * 0.7 + sample * 0.3 : sample;
+          lastTime = now;
+          lastBytes = received;
+          const eta = formatEta((total - received) / speed);
+          $('speed').textContent = (speed / 1e6).toFixed(1) + ' MB/s' + (eta ? ' · ' + eta + ' left' : '');
+        }
+        $('detail').textContent = formatBytes(received) + ' of ' + formatBytes(total);
+        setProgress(received / total);
+      }
+      if (received !== total) throw new Error('incomplete');
+      parts.push(new Blob(pending));
+      const blob = new Blob(parts, { type: response.headers.get('Content-Type') || 'application/octet-stream' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      setProgress(1);
+      finish('Received ' + label + ' · ' + formatBytes(total), true);
+    } catch (e) {
+      if (state.controller && state.controller.signal.aborted) {
+        finish('Download cancelled.', false);
+      } else if (status === 404) {
+        finish(PROBLEMS.gone, false);
+      } else if (status === 0) {
+        finish(PROBLEMS.offline, false);
+      } else {
+        finish('The download stopped. Use the file links to try again.', false);
+      }
+    }
+  }
+
+  $('all').addEventListener('click', () => {
+    const data = state.data;
+    if (data) download(data.archive.path, data.archive.name, data.archive.size, 'all files');
+  });
+  $('cancel').addEventListener('click', () => {
+    if (state.controller) state.controller.abort();
+  });
+
+  function addUploadRow(name) {
+    const li = document.createElement('li');
+    const label = document.createElement('span');
+    label.textContent = name;
+    const status = document.createElement('span');
+    status.className = 'size';
+    status.textContent = 'Waiting';
+    li.append(label, status);
+    $('uploads').appendChild(li);
+    return status;
+  }
+
+  function queueUploads(files) {
+    for (const file of files) state.queue.push({ file, status: addUploadRow(file.name) });
+    if (!state.uploading) nextUpload();
+  }
+
+  function nextUpload() {
+    const item = state.queue.shift();
+    if (!item) {
+      state.uploading = false;
+      return;
+    }
+    state.uploading = true;
+    const { file, status } = item;
+    if (file.size > state.uploadLeft) {
+      status.textContent = 'Too large';
+      nextUpload();
+      return;
+    }
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', state.data.upload.path + '?name=' + encodeURIComponent(file.name));
+    xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable && event.total > 0) status.textContent = Math.floor(event.loaded * 100 / event.total) + '%';
+    };
+    xhr.onload = () => {
+      let body = {};
+      try { body = JSON.parse(xhr.responseText); } catch (e) { /* not JSON */ }
+      if (typeof body.maxBytes === 'number') {
+        state.uploadLeft = body.maxBytes;
+        $('upload-limit').textContent = 'Up to ' + formatBytes(state.uploadLeft);
+      }
+      status.textContent = xhr.status === 200 ? 'Sent' : xhr.status === 413 ? 'Too large' : 'Failed';
+      nextUpload();
+    };
+    xhr.onerror = () => {
+      status.textContent = 'Failed';
+      nextUpload();
+    };
+    status.textContent = '0%';
+    xhr.send(file);
+  }
+
+  const drop = $('drop');
+  const input = $('upload-input');
+  input.addEventListener('change', () => {
+    if (input.files && input.files.length) queueUploads(Array.from(input.files));
+    input.value = '';
+  });
+  drop.addEventListener('dragover', (event) => {
+    event.preventDefault();
+    drop.classList.add('over');
+  });
+  drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+  drop.addEventListener('drop', (event) => {
+    event.preventDefault();
+    drop.classList.remove('over');
+    if (event.dataTransfer && event.dataTransfer.files.length) queueUploads(Array.from(event.dataTransfer.files));
+  });
+
+  load();
+})();
+</script>
+</body>
+</html>
