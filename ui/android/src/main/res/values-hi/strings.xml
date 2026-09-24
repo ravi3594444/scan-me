@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Hindi. NEEDS NATIVE-SPEAKER REVIEW (decision 9), like ui/shared's values-hi. -->
+<resources>
+    <string name="app_name">Drop</string>
+    <string name="error_cannot_open">इस फ़ोन पर कोई ऐप इसे नहीं खोल सकता</string>
+    <string name="file_untitled">बिना नाम</string>
+</resources>

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- design.md §1 `bg` (light) and `accent`: the window behind Compose and the launcher icon. -->
+    <color name="drop_bg">#F7F8FA</color>
+    <color name="drop_accent">#2F6BFF</color>
+</resources>

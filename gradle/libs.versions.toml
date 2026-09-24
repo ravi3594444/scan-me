@@ -3,6 +3,8 @@
 kotlin = "2.4.20"
 agp = "9.4.1"
 compose-multiplatform = "1.12.1"
+# Compose Multiplatform Material 3 is versioned separately; 1.9.0 is the one Compose Multiplatform 1.12.1 ships with.
+compose-material3 = "1.9.0"
 coroutines = "1.11.0"
 serialization = "1.11.0"
 kotlinx-io = "0.9.1"
@@ -15,6 +17,7 @@ zero-allocation-hashing = "2026.0"
 jmdns = "3.6.3"
 zxing = "3.5.4"
 androidx-activity = "1.13.0"
+androidx-core = "1.18.0"
 compileSdk = "37"
 targetSdk = "37"
 minSdk = "31"
@@ -22,9 +25,13 @@ jvmTarget = "17"
 
 [libraries]
 kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
+kotlin-test-junit5 = { module = "org.jetbrains.kotlin:kotlin-test-junit5", version.ref = "kotlin" }
+# Versioned by the JUnit BOM that kotlin-test-junit5 brings in (Gradle 9 needs the launcher declared).
+junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher" }
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
 kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "coroutines" }
 kotlinx-coroutines-swing = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-swing", version.ref = "coroutines" }
+kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
 kotlinx-serialization-cbor = { module = "org.jetbrains.kotlinx:kotlinx-serialization-cbor", version.ref = "serialization" }
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "serialization" }
 kotlinx-io-core = { module = "org.jetbrains.kotlinx:kotlinx-io-core", version.ref = "kotlinx-io" }
@@ -41,6 +48,14 @@ zero-allocation-hashing = { module = "net.openhft:zero-allocation-hashing", vers
 jmdns = { module = "org.jmdns:jmdns", version.ref = "jmdns" }
 zxing-core = { module = "com.google.zxing:core", version.ref = "zxing" }
 androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "androidx-activity" }
+androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "androidx-core" }
+compose-runtime = { module = "org.jetbrains.compose.runtime:runtime", version.ref = "compose-multiplatform" }
+compose-foundation = { module = "org.jetbrains.compose.foundation:foundation", version.ref = "compose-multiplatform" }
+compose-animation = { module = "org.jetbrains.compose.animation:animation", version.ref = "compose-multiplatform" }
+compose-ui = { module = "org.jetbrains.compose.ui:ui", version.ref = "compose-multiplatform" }
+compose-ui-test = { module = "org.jetbrains.compose.ui:ui-test", version.ref = "compose-multiplatform" }
+compose-components-resources = { module = "org.jetbrains.compose.components:components-resources", version.ref = "compose-multiplatform" }
+compose-material3 = { module = "org.jetbrains.compose.material3:material3", version.ref = "compose-material3" }
 
 # Build-logic only
 android-gradlePlugin = { module = "com.android.tools.build:gradle", version.ref = "agp" }

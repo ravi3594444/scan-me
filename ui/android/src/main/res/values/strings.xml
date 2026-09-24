@@ -1,4 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+    Strings of the Android shell. Everything the shared UI shows lives in ui/shared/src/commonMain/composeResources
+    (decision 9); these are only the ones Android itself displays. The app name is a placeholder until decision 1.
+-->
 <resources>
     <string name="app_name">Drop</string>
+    <!-- A toast when no installed app can open or share a received file. -->
+    <string name="error_cannot_open">No app on this phone can open this</string>
+    <!-- The name of a shared file whose app gave it none. -->
+    <string name="file_untitled">Untitled</string>
 </resources>

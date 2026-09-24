@@ -1,0 +1,411 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Every user-facing string of the shared UI (design §8.1–8.3 and the screens of design §3–7).
+  Keys follow design §8.3 with "." written as "_" (radar.title → radar_title).
+  "Wi‑Fi" uses the non-breaking hyphen U+2011 and "·" the middle dot U+00B7, exactly as design.md.
+  Strings marked NEW are copy added by WP8 that the design does not list; they need design sign-off.
+  Hindi translations live in values-hi/strings.xml; every key here must exist there (checked by StringResourcesTest).
+-->
+<resources>
+    <!-- Decision 1: the app name is still open; the code name is shown until it is decided. -->
+    <string name="app_name">Drop</string>
+
+    <!-- Radar (design §3, §8.3) -->
+    <string name="radar_title">Nearby</string>
+    <string name="action_scan">Scan to send</string>
+    <string name="action_show_qr">Show my code</string>
+    <string name="action_dashboard">Dashboard</string>
+    <!-- Ring meanings (design §3.2) -->
+    <string name="ring_inner">Right here</string>
+    <string name="ring_middle">Nearby</string>
+    <string name="ring_outer">Far</string>
+    <string name="ring_network">Same network</string>
+    <!-- "+N more" bubble and its list (design §3.2); the title is NEW -->
+    <string name="more_devices">+%1$d more</string>
+    <string name="more_devices_title">Everyone nearby</string>
+
+    <!-- Empty and error states (design §8.1) -->
+    <string name="empty_no_devices">No one nearby yet. Ask them to open the app, or scan their code.</string>
+    <string name="empty_bluetooth_off">Turn on Bluetooth to find people nearby.</string>
+    <string name="empty_wifi_off">Turn on Wi‑Fi for fast transfers. No network needed.</string>
+    <string name="empty_permission">Allow Nearby devices so the app can find phones around you.</string>
+    <string name="empty_hidden">You're hidden. Others can't see you until you change visibility.</string>
+    <string name="action_turn_on">Turn on</string>
+    <string name="action_allow">Allow</string>
+    <!-- NEW: button of the hidden-mode notice -->
+    <string name="action_change">Change</string>
+
+    <!-- Visibility (design §2, §8.3) -->
+    <string name="visibility_everyone">Everyone</string>
+    <string name="visibility_ten_min">Everyone for 10 min</string>
+    <string name="visibility_trusted">Trusted only</string>
+    <string name="visibility_hidden">Hidden</string>
+    <string name="visibility_chip_ten_min">Everyone · %1$d min</string>
+    <!-- NEW: visibility sheet title and one-line explanations -->
+    <string name="visibility_title">Who can see you</string>
+    <string name="visibility_everyone_desc">Anyone nearby with the app.</string>
+    <string name="visibility_ten_min_desc">Anyone nearby, then back to Trusted only.</string>
+    <string name="visibility_trusted_desc">Only devices you have confirmed with a code.</string>
+    <string name="visibility_hidden_desc">Nobody can see you. You can still send.</string>
+
+    <!-- Share-sheet entry (design §4.3) -->
+    <string name="share_banner">Sending %1$s · %2$s — tap a device</string>
+
+    <!-- Summaries (design §5.1 line 2 "12 photos · 48 MB") -->
+    <plurals name="summary_photos">
+        <item quantity="one">%1$d photo</item>
+        <item quantity="other">%1$d photos</item>
+    </plurals>
+    <plurals name="summary_videos">
+        <item quantity="one">%1$d video</item>
+        <item quantity="other">%1$d videos</item>
+    </plurals>
+    <plurals name="summary_media">
+        <item quantity="one">%1$d photo or video</item>
+        <item quantity="other">%1$d photos and videos</item>
+    </plurals>
+    <plurals name="summary_files">
+        <item quantity="one">%1$d file</item>
+        <item quantity="other">%1$d files</item>
+    </plurals>
+    <string name="summary_with_size">%1$s · %2$s</string>
+
+    <!-- Sizes (decimal, spec change S6) -->
+    <string name="size_b">%1$s B</string>
+    <string name="size_kb">%1$s KB</string>
+    <string name="size_mb">%1$s MB</string>
+    <string name="size_gb">%1$s GB</string>
+    <string name="size_tb">%1$s TB</string>
+
+    <!-- Durations and time left -->
+    <string name="duration_seconds">%1$d s</string>
+    <string name="duration_minutes">%1$d min</string>
+    <string name="duration_hours_minutes">%1$d h %2$d min</string>
+
+    <!-- File picker (design §4.1, §8.3) -->
+    <plurals name="send_button">
+        <item quantity="one">Send %1$d item · %2$s</item>
+        <item quantity="other">Send %1$d items · %2$s</item>
+    </plurals>
+    <!-- NEW: disabled send button at zero selection -->
+    <string name="send_button_empty">Select something to send</string>
+    <!-- NEW: picker header -->
+    <string name="picker_title">Send to %1$s</string>
+    <string name="picker_title_unnamed">Send</string>
+    <string name="picker_tab_photos">Photos</string>
+    <string name="picker_tab_files">Files</string>
+    <string name="picker_tab_apps">Apps</string>
+    <!-- NEW: picker tab contents -->
+    <string name="picker_photos_empty">No photos or videos on this device yet.</string>
+    <string name="picker_photos_access">Allow photo access to pick from your gallery.</string>
+    <string name="picker_files_browse">Browse files</string>
+    <string name="picker_files_hint">Documents, music and anything else on this device.</string>
+    <string name="picker_apps_hint">Installed apps are sent as APK files.</string>
+    <string name="picker_apps_empty">No apps to share.</string>
+
+    <!-- Sending and receiving state (design §4.2, §5.2, §8.3) -->
+    <string name="transfer_speed">%1$s MB/s · %2$s left</string>
+    <string name="transfer_speed_only">%1$s MB/s</string>
+    <string name="transfer_done_sent">Sent</string>
+    <string name="transfer_done_received">Received</string>
+    <string name="transfer_resumed">Resumed</string>
+    <!-- NEW: stages the design does not word -->
+    <string name="transfer_connecting">Connecting…</string>
+    <string name="transfer_waiting_accept">Waiting for them to accept</string>
+    <string name="transfer_reconnecting">Reconnecting…</string>
+    <string name="transfer_waiting_peer">Waiting for %1$s</string>
+    <string name="transfer_verifying">Checking files…</string>
+    <string name="transfer_paused">Paused</string>
+    <string name="transfer_failed">Didn't finish</string>
+    <string name="transfer_cancelled">Cancelled</string>
+    <string name="transfer_declined">Declined</string>
+    <!-- design §5.1: the sender sees "No answer" when the card times out -->
+    <string name="transfer_no_answer">No answer</string>
+
+    <!-- Cancel confirmation past 100 MB (design §4.2); NEW copy -->
+    <string name="cancel_send_title">Stop sending to %1$s?</string>
+    <string name="cancel_receive_title">Stop receiving from %1$s?</string>
+    <string name="cancel_body">%1$s of %2$s has already moved.</string>
+    <string name="cancel_confirm">Stop</string>
+    <string name="cancel_keep">Keep going</string>
+
+    <!-- Transport badge (design §8.3). badge_p2p_6, badge_p2p and badge_hotspot_plain are WP5 keys that need design sign-off. -->
+    <string name="badge_p2p_5">Wi‑Fi Direct · 5 GHz</string>
+    <string name="badge_p2p_24">Wi‑Fi Direct · 2.4 GHz</string>
+    <string name="badge_p2p_6">Wi‑Fi Direct · 6 GHz</string>
+    <string name="badge_p2p">Wi‑Fi Direct</string>
+    <string name="badge_lan">Same network</string>
+    <string name="badge_hotspot">Hotspot · %1$s</string>
+    <string name="badge_hotspot_plain">Hotspot</string>
+    <string name="badge_bt">Bluetooth</string>
+    <string name="band_24">2.4 GHz</string>
+    <string name="band_5">5 GHz</string>
+    <string name="band_6">6 GHz</string>
+
+    <!-- Speed hints (design §8.2). The unnamed forms and the sta_band24 forms (N9) are WP5 copy that needs design sign-off. -->
+    <string name="hint_band24">Move closer for full speed</string>
+    <string name="hint_peer_band24_only">%1$s's device supports 2.4 GHz only</string>
+    <string name="hint_peer_band24_only_unnamed">The other device supports 2.4 GHz only</string>
+    <string name="hint_sdcard">Saving to SD card is limiting speed</string>
+    <string name="hint_thermal">Phone is warm and slowing down</string>
+    <plurals name="hint_bundling">
+        <item quantity="one">Bundling %1$d small file</item>
+        <item quantity="other">Bundling %1$d small files</item>
+    </plurals>
+    <string name="hint_bundling_many">Bundling many small files</string>
+    <string name="hint_bt_fallback">Slow mode: Wi‑Fi is off on one device</string>
+    <string name="hint_lan_slow">Switching to a direct link…</string>
+    <string name="hint_sta_band24">Your Wi‑Fi network is on 2.4 GHz</string>
+    <string name="hint_sta_band24_peer">%1$s's Wi‑Fi network is on 2.4 GHz</string>
+    <string name="hint_sta_band24_peer_unnamed">The other device's Wi‑Fi network is on 2.4 GHz</string>
+
+    <!-- Show my code (design §4.4 with N15) -->
+    <string name="qr_title">Scan to send to %1$s</string>
+    <string name="qr_fallback">Or type this code: %1$s</string>
+    <!-- N15: the real network name, password and address, not the design's placeholder -->
+    <string name="qr_computer_hint">Open on a computer without the app: join Wi‑Fi %1$s, password %2$s, then visit %3$s</string>
+    <!-- NEW: starts the browser path when it is not running -->
+    <string name="qr_computer_start">Send to a computer without the app</string>
+    <string name="qr_computer_starting">Starting the network…</string>
+
+    <!-- Scan to send (design §4.4) -->
+    <string name="scan_prompt">Scan the receiver's code</string>
+    <!-- NEW: scanner outcomes -->
+    <string name="scan_success">Found it</string>
+    <string name="scan_expired">This code has expired. Ask them to refresh it.</string>
+    <string name="scan_invalid">This isn't a code from this app.</string>
+    <string name="scan_camera_permission">Allow the camera to scan codes.</string>
+
+    <!-- Incoming card (design §5.1, §8.3) -->
+    <string name="incoming_title">%1$s wants to send</string>
+    <string name="incoming_accept">Accept</string>
+    <string name="incoming_decline">Decline</string>
+    <string name="incoming_always">Always accept from %1$s</string>
+    <string name="incoming_new_device">New device — first time</string>
+    <!-- NEW: caption of the verified badge -->
+    <string name="incoming_verified">Verified device</string>
+    <string name="incoming_more">+%1$d</string>
+    <string name="pair_code">Same code on both screens?</string>
+    <string name="pair_confirm">Yes, it matches</string>
+    <!-- NEW: after the code was confirmed; the sender's pairing sheet -->
+    <string name="pair_confirmed">Code confirmed</string>
+    <string name="pair_sender_title">Check the code on %1$s</string>
+
+    <!-- Tray (design §5.2) -->
+    <string name="tray_open_folder">Open folder</string>
+
+    <!-- "Allow this computer?" for the browser receive page (N15); NEW copy -->
+    <string name="browser_title">Allow this computer?</string>
+    <string name="browser_title_again">Another computer wants to connect</string>
+    <string name="browser_body">A browser at %1$s wants to see the files you are sharing.</string>
+    <string name="browser_agent">%1$s on %2$s</string>
+    <string name="browser_allow">Allow</string>
+    <string name="browser_deny">Don't allow</string>
+
+    <!-- Dashboard (design §6) -->
+    <string name="dashboard_title">Dashboard</string>
+    <string name="tab_live">Live</string>
+    <string name="tab_history">History</string>
+    <string name="tab_devices">Devices</string>
+    <string name="tab_stats">Stats</string>
+    <string name="tab_settings">Settings</string>
+    <!-- NEW: Live tab -->
+    <string name="live_empty">Nothing is moving right now.</string>
+    <string name="live_pause">Pause</string>
+    <string name="live_resume">Resume</string>
+    <string name="live_cancel">Cancel</string>
+    <string name="live_add">Add files</string>
+    <string name="live_progress">%1$s of %2$s</string>
+    <!-- NEW: History tab -->
+    <string name="history_empty">Transfers you send or receive show up here.</string>
+    <string name="history_today">Today</string>
+    <string name="history_yesterday">Yesterday</string>
+    <string name="history_date">%1$d %2$s %3$d</string>
+    <string name="history_to">To %1$s</string>
+    <string name="history_from">From %1$s</string>
+    <string name="history_time">%1$s:%2$s</string>
+    <string name="history_details">%1$s · %2$s · %3$s</string>
+    <string name="history_details_short">%1$s · %2$s</string>
+    <string name="history_clear">Clear history</string>
+    <string name="history_clear_title">Clear history?</string>
+    <string name="history_clear_body">This clears the list only. Received files stay where they are.</string>
+    <string name="history_clear_confirm">Clear</string>
+    <string name="history_detail_when">%1$s, %2$s</string>
+    <string name="history_via">Via %1$s</string>
+    <string name="history_resend">Send again</string>
+    <string name="history_files_loading">Loading files…</string>
+    <string name="history_file_missing">No longer available</string>
+    <string name="status_done">Done</string>
+    <string name="status_partial">Partly done</string>
+    <string name="status_failed">Failed</string>
+    <string name="status_cancelled">Cancelled</string>
+    <string name="status_interrupted">Waiting</string>
+    <string name="month_1">Jan</string>
+    <string name="month_2">Feb</string>
+    <string name="month_3">Mar</string>
+    <string name="month_4">Apr</string>
+    <string name="month_5">May</string>
+    <string name="month_6">Jun</string>
+    <string name="month_7">Jul</string>
+    <string name="month_8">Aug</string>
+    <string name="month_9">Sep</string>
+    <string name="month_10">Oct</string>
+    <string name="month_11">Nov</string>
+    <string name="month_12">Dec</string>
+    <!-- NEW: Devices tab -->
+    <string name="devices_empty">Devices you confirm with the 6-digit code appear here.</string>
+    <string name="devices_seen_now">Seen just now</string>
+    <plurals name="devices_seen_minutes">
+        <item quantity="one">Seen %1$d min ago</item>
+        <item quantity="other">Seen %1$d min ago</item>
+    </plurals>
+    <plurals name="devices_seen_hours">
+        <item quantity="one">Seen %1$d hour ago</item>
+        <item quantity="other">Seen %1$d hours ago</item>
+    </plurals>
+    <plurals name="devices_seen_days">
+        <item quantity="one">Seen %1$d day ago</item>
+        <item quantity="other">Seen %1$d days ago</item>
+    </plurals>
+    <string name="devices_auto_accept">Accept automatically</string>
+    <string name="devices_rename">Rename</string>
+    <string name="devices_forget">Forget</string>
+    <string name="devices_rename_title">Rename device</string>
+    <string name="devices_forget_title">Forget %1$s?</string>
+    <string name="devices_forget_body">It will show up as a new device next time, and you will compare codes again.</string>
+    <string name="platform_phone">Phone</string>
+    <string name="platform_laptop">Laptop</string>
+    <string name="platform_desktop">Computer</string>
+    <string name="platform_browser">Browser</string>
+    <string name="platform_unknown">Device</string>
+    <!-- Stats tab (design §6, §8.3) -->
+    <string name="stats_total">Total moved</string>
+    <string name="stats_average">Average speed</string>
+    <string name="stats_week">Transfers this week</string>
+    <string name="stats_saved_label">Hours saved vs Bluetooth</string>
+    <string name="stats_saved">%1$s h saved vs Bluetooth</string>
+    <string name="stats_hours">%1$s h</string>
+    <string name="stats_speed">%1$s MB/s</string>
+    <string name="stats_none">—</string>
+    <string name="stats_chart_title">Transfers per week</string>
+    <string name="stats_axis_this_week">This week</string>
+    <plurals name="stats_axis_weeks_ago">
+        <item quantity="one">%1$d week ago</item>
+        <item quantity="other">%1$d weeks ago</item>
+    </plurals>
+    <string name="stats_share">Share stats card</string>
+    <!-- Settings tab (design §6, F‑G5) -->
+    <string name="settings_visibility">Visibility</string>
+    <string name="settings_speed">Speed</string>
+    <string name="settings_prefer_5ghz">Prefer 5 GHz</string>
+    <string name="settings_prefer_5ghz_desc">Asks for the faster band when both devices support it.</string>
+    <string name="settings_keep_awake">Keep screen awake</string>
+    <string name="settings_keep_awake_desc">While a transfer is running.</string>
+    <string name="settings_bundle">Bundle small files</string>
+    <string name="settings_bundle_desc">Faster for many small photos.</string>
+    <string name="settings_storage">Storage</string>
+    <string name="settings_save_location">Save location</string>
+    <string name="settings_save_location_default">Photos to Gallery, files to Downloads</string>
+    <string name="settings_clear_partials">Clear partial files</string>
+    <string name="settings_clear_partials_desc">Unfinished transfers are kept for 24 hours so they can resume.</string>
+    <string name="settings_clear_partials_title">Clear partial files?</string>
+    <string name="settings_clear_partials_body">Transfers waiting to resume stop and cannot continue.</string>
+    <string name="settings_clear_partials_confirm">Clear</string>
+    <string name="settings_clear_partials_done">Cleared %1$s</string>
+    <string name="settings_profile">Profile</string>
+    <string name="settings_nickname">Nickname</string>
+    <string name="settings_avatar">Avatar</string>
+    <string name="settings_avatar_initials">Use initials</string>
+    <string name="settings_language">Language</string>
+    <string name="settings_language_system">System default</string>
+    <!-- Language names are written in their own script in every language -->
+    <string name="language_en">English</string>
+    <string name="language_hi">हिन्दी</string>
+    <string name="settings_privacy">Privacy</string>
+    <string name="settings_privacy_statement">Privacy statement</string>
+    <string name="settings_crash_reports">Send crash reports</string>
+    <string name="settings_crash_reports_desc">Off unless you turn it on. Reports never include your files.</string>
+    <!-- NEW section: design §11 says haptics can be turned off in Settings -->
+    <string name="settings_accessibility">Accessibility</string>
+    <string name="settings_haptics">Haptic feedback</string>
+    <string name="settings_about">About</string>
+    <string name="settings_version">Version %1$s</string>
+    <string name="settings_change">Change</string>
+
+    <!-- Privacy (F‑J4, design §8.3; the second sentence explains the Internet permission, architecture §11) -->
+    <string name="privacy_statement">No account, no cloud, no tracking. Nothing leaves your phone except the file you chose to send.</string>
+    <string name="privacy_internet">The app needs the Internet permission to open connections to devices next to you. It never goes online.</string>
+
+    <!-- Onboarding (design §7) -->
+    <string name="welcome_sentence">Send anything to anyone nearby. No internet, no data, no limits.</string>
+    <string name="welcome_nickname">Your name</string>
+    <string name="welcome_nickname_hint">People nearby see this name.</string>
+    <string name="welcome_nickname_error">Enter a name with at least one letter or number.</string>
+    <string name="welcome_avatar">Add a photo</string>
+    <string name="welcome_avatar_change">Change photo</string>
+    <string name="welcome_start">Start</string>
+    <string name="brand_title">Keep transfers running</string>
+    <string name="brand_body">To keep transfers running with the screen off, allow the app to run in the background.</string>
+    <!-- NEW: brand-specific steps (F‑I2), to be checked on each OEM in the lab -->
+    <string name="brand_steps_xiaomi">Turn on Autostart, then set Battery saver to No restrictions.</string>
+    <string name="brand_steps_vivo">Allow background activity and high background power use.</string>
+    <string name="brand_steps_oppo">Allow Auto launch and background activity.</string>
+    <string name="brand_steps_samsung">Set Battery to Unrestricted and keep the app out of Sleeping apps.</string>
+    <string name="brand_open">Open settings</string>
+    <string name="brand_skip">Skip for now</string>
+
+    <!-- Just-in-time permission sheets (design §7 step 2, architecture §11); NEW copy -->
+    <string name="perm_nearby_title">Find people nearby</string>
+    <string name="perm_nearby_reason">Nearby devices lets the app find phones around you and connect to them directly.</string>
+    <string name="perm_location_title">Direct Wi‑Fi on Android 12</string>
+    <string name="perm_location_reason">Android 12 asks for Location to set up a direct Wi‑Fi link. The app never reads where you are.</string>
+    <string name="perm_media_title">Pick photos and videos</string>
+    <string name="perm_media_reason">Photo access lets you choose what to send and shows previews.</string>
+    <string name="perm_notifications_title">Show progress</string>
+    <string name="perm_notifications_reason">Notifications show transfer progress and files waiting for you.</string>
+    <string name="perm_camera_title">Scan codes</string>
+    <string name="perm_camera_reason">The camera is used only to scan the other device's code.</string>
+    <string name="perm_battery_title">Finish with the screen off</string>
+    <string name="perm_battery_reason">Staying on in the background lets transfers finish with the screen off.</string>
+    <string name="perm_continue">Continue</string>
+    <string name="perm_not_now">Not now</string>
+    <string name="perm_blocked">This permission is turned off. You can allow it in Settings.</string>
+    <string name="perm_open_settings">Open settings</string>
+
+    <!-- Common -->
+    <string name="common_cancel">Cancel</string>
+    <string name="common_close">Close</string>
+    <string name="common_save">Save</string>
+    <string name="common_back">Back</string>
+
+    <!-- Accessibility (design §11). Action labels are read as "Double-tap to …". -->
+    <string name="a11y_bubble">%1$s, %2$s</string>
+    <string name="a11y_bubble_trusted">%1$s, %2$s, trusted</string>
+    <string name="a11y_ring_inner">right here</string>
+    <string name="a11y_ring_middle">nearby</string>
+    <string name="a11y_ring_outer">far</string>
+    <string name="a11y_ring_network">on the same network</string>
+    <string name="a11y_action_send">send</string>
+    <string name="a11y_action_open">open</string>
+    <string name="a11y_action_share">share</string>
+    <string name="a11y_action_select">select</string>
+    <string name="a11y_action_show_more">show everyone nearby</string>
+    <string name="a11y_sending">Sending to %1$s, %2$d percent</string>
+    <string name="a11y_receiving">Receiving from %1$s, %2$d percent</string>
+    <string name="a11y_self">You, %1$s</string>
+    <string name="a11y_cancel_transfer">Cancel transfer</string>
+    <string name="a11y_clear_attachment">Remove attached files</string>
+    <string name="a11y_visibility">Visibility: %1$s</string>
+    <string name="a11y_qr">Code for %1$s</string>
+    <string name="a11y_selected">Selected</string>
+    <string name="a11y_done">Done</string>
+    <plurals name="a11y_incoming_seconds">
+        <item quantity="one">%1$d second left to answer</item>
+        <item quantity="other">%1$d seconds left to answer</item>
+    </plurals>
+    <string name="a11y_qr_refresh">The code refreshes in %1$s</string>
+    <string name="a11y_chart">Transfers per week, last 12 weeks: %1$s</string>
+    <string name="unnamed_device">Nearby device</string>
+    <!-- Joins a name and its state for screen readers ("IMG_0042.jpg, Selected") -->
+    <string name="a11y_joined">%1$s, %2$s</string>
+</resources>

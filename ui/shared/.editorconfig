@@ -1,0 +1,4 @@
+# Module overrides on top of the repository .editorconfig.
+[*.{kt,kts}]
+# The generated Compose resource accessors (Res.string.*, Res.plurals.*) are imported with a wildcard.
+ij_kotlin_packages_to_use_import_on_demand = java.util.*,com.constrivo.drop.ui.shared.resources.*
