@@ -22,6 +22,7 @@ include(":core:crypto", ":core:protocol", ":core:discovery", ":core:transfer", "
 
 // Desktop platform layers and the shared desktop/browser pieces.
 include(":platform:desktop-win", ":platform:desktop-mac", ":platform:desktop-linux")
+include(":platform:desktop-common")
 include(":web-receive")
 include(":ui:shared", ":ui:desktop")
 

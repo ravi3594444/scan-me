@@ -1,4 +1,33 @@
 # ui/desktop
 
-Compose Desktop app for Windows, macOS and Linux: window, drag-and-drop, tray menus (design §9). Run it with
-`./gradlew :ui:desktop:run`; package with `./gradlew :ui:desktop:packageDistributionForCurrentOS`. WP10.
+The Compose Desktop app for Windows, macOS and Linux (design §9, architecture §10.2). WP10a. Run it with
+`./gradlew :ui:desktop:run`; package with `./gradlew :ui:desktop:packageDistributionForCurrentOS`.
+
+It shows the shared app (`ui/shared`'s `DropApp`, its presenters driven by `DropAppController`) over a
+`DesktopNode` from `:platform:desktop-common`, and adds what only a desktop has:
+
+| Type | Role |
+| --- | --- |
+| `Main.kt` | Entry point: single instance, directories, LAN interface (followed by a `LanWatcher`: the node moves when the network changes), platform services, node, window and tray. `--minimized` starts in the tray (the login entry). |
+| `DesktopApp` | The app around a started node: the controller, the shell, tray view and notifications, the banner (following the network), a finished send's unanswered code, window requests, shutdown. |
+| `DesktopPorts`, `PortMappers` | The shared UI's ports over `DesktopNode` and `core/data` (radar, incoming card, Live, History, Devices, Stats, Settings, "Show my code" as a five-minute code with the LAN address, browser path). Offer previews are decoded off the UI thread, once per offer, only up to 512 pixels a side. |
+| `DesktopWindow`, `WindowPlacement` | The 420 × 640 resizable window; its placement is remembered in `window.properties` and restored while it is still on a screen. Closing hides to the tray when there is one. |
+| `DesktopShell`, `ShellState`, `DropTargets` | The whole window as a drop zone: a drop target over each bubble sends to it (none under a sheet or card), a drop on the open picker joins it, any other drop asks "Send to…" with the bubble list; folders are walked off the UI thread and Esc stops the walk; the no-Bluetooth banner with the static QR (or the no-network banner); a finished send's code asked for once more (F‑B3). |
+| `KeyboardShortcuts` | Ctrl/Cmd+O pick files, Esc cancels the current selection, Enter sends. |
+| `TrayModel`, `TrayIcons`, `SystemTrayController` | The tray: idle, transferring (the animated arc, while bytes move), attention; menu Open, Visibility, Received folder, Start at login, Quit. The model and icons are pure; the AWT binding only renders them. |
+| `Notifications` | Completion notifications with "Open" on the drop's folder, and incoming cards while the window is in the background. |
+| `SingleInstance` | One app per user: a lock file and a loopback activation port with an owner-only token. A quitting copy stops answering; a copy started meanwhile waits for the lock and then starts. |
+| `DesktopHost` | Opening files, showing folders, the file dialogs (AWT / Swing, `xdg-open` fallback). |
+| `DesktopStrings` | The shell's own copy in English and Hindi (`strings.properties`, `strings_hi.properties`). |
+
+## Tests
+
+`./gradlew :ui:desktop:test` runs headless (`java.awt.headless=true`): the tray model and icons, drop targets and
+shortcuts, notifications and their click, strings in both languages, single instance (including a start while the
+first copy quits), window placement, the port mappers (previews too large to decode), `MainWindowUiTest` (the
+window's content at 420 × 640 rendered offscreen with Skia: banner and QR, drop targets checked against the rendered
+bubbles and absent under the picker, the card and the code prompt, "Send to…", a drop on a bubble, a drop on the open
+picker, Esc and Enter, onboarding, the incoming card, a finished send's code) and `DesktopAppTest` (two real nodes on
+loopback: a drop on a bubble through the shell reaches the peer, both trays ask for attention while the code waits,
+the completion notification opens the folder, History and the files through the ports, the tray's Visibility menu,
+the banner following the network, and a small first send's code confirmed after the end pairing both ways).
