@@ -1,19 +1,101 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Runtime permissions (architecture §11) are added with the features that use them in WP7. -->
+    <!--
+        The runtime permissions the UI asks for just in time (architecture §11; AndroidPermissions, PermissionMatrix).
+        The install-time permissions of the transfer service (foreground service, wake lock, sockets, Wi-Fi changes)
+        are declared with it in platform/android (WP7).
+    -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="tiramisu" />
+    <!-- Android 12 only, for Wi-Fi Direct discovery; since API 31 fine location is asked together with coarse. -->
+    <uses-permission
+        android:name="android.permission.ACCESS_FINE_LOCATION"
+        android:maxSdkVersion="32" />
+    <uses-permission
+        android:name="android.permission.ACCESS_COARSE_LOCATION"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Onboarding, once, skippable (architecture §11). -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- The radar's "Wi-Fi off" state (RadioMonitor). -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <uses-feature
+        android:name="android.hardware.camera.any"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.bluetooth_le"
+        android:required="false" />
+
+    <!-- The picker's Apps tab (decision 8, off by default) lists launchable apps. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
+    <!--
+        localeConfig: the languages of decision 9, offered as the per-app language in the system settings (13+);
+        Settings → Language sets the same (AppLocales).
+    -->
     <application
+        android:name=".ui.android.DropApplication"
         android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
+        android:localeConfig="@xml/locales_config"
         android:supportsRtl="true"
-        android:theme="@android:style/Theme.Material.NoActionBar">
+        android:theme="@style/Theme.Drop"
+        tools:targetApi="tiramisu">
+        <!--
+            requireContentUriPermissionFromCaller (Android 15+): the system refuses a share whose sender cannot read
+            the content URIs it passes, so no app can make this one read, with its own rights, files the sender has no
+            access to (a confused deputy). Below 15 the same rule is checked in code (SharedFiles.grantedStreams).
+        -->
         <activity
-            android:name=".MainActivity"
-            android:exported="true">
+            android:name=".ui.android.MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:requireContentUriPermissionFromCaller="read"
+            android:windowSoftInputMode="adjustResize"
+            tools:targetApi="35">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Share sheet (design §4.3, architecture §10.1): one or many files of any type. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <!-- Direct-share targets (F-C3), see res/xml/shortcuts.xml. -->
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
         </activity>
     </application>
 </manifest>

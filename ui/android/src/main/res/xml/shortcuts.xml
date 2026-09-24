@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Direct share (F-C3, architecture §10.1): the share sheet offers this app's dynamic shortcuts with the category
+    below as targets for any type. DirectSharePublisher publishes one per trusted nearby device.
+-->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <share-target android:targetClass="com.constrivo.drop.ui.android.MainActivity">
+        <data android:mimeType="*/*" />
+        <category android:name="com.constrivo.drop.category.DIRECT_SHARE_TARGET" />
+    </share-target>
+</shortcuts>

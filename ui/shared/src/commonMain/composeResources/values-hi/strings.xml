@@ -1,0 +1,387 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Hindi (decision 9). NEEDS NATIVE-SPEAKER REVIEW: every string below was translated by WP8 and has not been checked
+  by a Hindi speaker or the designer yet. Product names (Wi‑Fi Direct, Bluetooth, Android) and units (MB, GHz) stay in
+  Latin script, as Indian Android UIs usually write them; digits are Latin.
+  Keep the keys and placeholders identical to values/strings.xml (StringResourcesTest checks both).
+-->
+<resources>
+    <string name="app_name">Drop</string>
+
+    <string name="radar_title">आस-पास</string>
+    <string name="action_scan">स्कैन करके भेजें</string>
+    <string name="action_show_qr">मेरा कोड दिखाएँ</string>
+    <string name="action_dashboard">डैशबोर्ड</string>
+    <string name="ring_inner">बिल्कुल पास</string>
+    <string name="ring_middle">आस-पास</string>
+    <string name="ring_outer">दूर</string>
+    <string name="ring_network">एक ही नेटवर्क पर</string>
+    <string name="more_devices">+%1$d और</string>
+    <string name="more_devices_title">आस-पास के सभी लोग</string>
+
+    <string name="empty_no_devices">अभी आस-पास कोई नहीं है। उनसे ऐप खोलने को कहें, या उनका कोड स्कैन करें।</string>
+    <string name="empty_bluetooth_off">आस-पास के लोगों को ढूँढने के लिए Bluetooth चालू करें।</string>
+    <string name="empty_wifi_off">तेज़ ट्रांसफ़र के लिए Wi‑Fi चालू करें। किसी नेटवर्क की ज़रूरत नहीं।</string>
+    <string name="empty_permission">आस-पास के डिवाइस की अनुमति दें, ताकि ऐप आपके आस-पास के फ़ोन ढूँढ सके।</string>
+    <string name="empty_hidden">आप छिपे हुए हैं। जब तक आप दृश्यता नहीं बदलते, दूसरे आपको नहीं देख सकते।</string>
+    <string name="action_turn_on">चालू करें</string>
+    <string name="action_allow">अनुमति दें</string>
+    <string name="action_change">बदलें</string>
+
+    <string name="visibility_everyone">सभी</string>
+    <string name="visibility_ten_min">10 मिनट के लिए सभी</string>
+    <string name="visibility_trusted">केवल भरोसेमंद</string>
+    <string name="visibility_hidden">छिपा हुआ</string>
+    <string name="visibility_chip_ten_min">सभी · %1$d मिनट</string>
+    <string name="visibility_title">आपको कौन देख सकता है</string>
+    <string name="visibility_everyone_desc">आस-पास का कोई भी, जिसके पास ऐप है।</string>
+    <string name="visibility_ten_min_desc">आस-पास का कोई भी, फिर वापस केवल भरोसेमंद।</string>
+    <string name="visibility_trusted_desc">केवल वे डिवाइस जिनकी आपने कोड से पुष्टि की है।</string>
+    <string name="visibility_hidden_desc">कोई आपको नहीं देख सकता। आप फिर भी भेज सकते हैं।</string>
+
+    <string name="share_banner">%1$s · %2$s भेजने के लिए किसी डिवाइस पर टैप करें</string>
+    <plurals name="share_banner_names_more">
+        <item quantity="one">%1$s और %2$d अन्य</item>
+        <item quantity="other">%1$s और %2$d अन्य</item>
+    </plurals>
+    <string name="share_banner_waiting">%3$s के पास आते ही %1$s · %2$s भेजे जाएँगे</string>
+
+    <plurals name="summary_photos">
+        <item quantity="one">%1$d फ़ोटो</item>
+        <item quantity="other">%1$d फ़ोटो</item>
+    </plurals>
+    <plurals name="summary_videos">
+        <item quantity="one">%1$d वीडियो</item>
+        <item quantity="other">%1$d वीडियो</item>
+    </plurals>
+    <plurals name="summary_media">
+        <item quantity="one">%1$d फ़ोटो या वीडियो</item>
+        <item quantity="other">%1$d फ़ोटो और वीडियो</item>
+    </plurals>
+    <plurals name="summary_files">
+        <item quantity="one">%1$d फ़ाइल</item>
+        <item quantity="other">%1$d फ़ाइलें</item>
+    </plurals>
+    <string name="summary_with_size">%1$s · %2$s</string>
+
+    <string name="size_b">%1$s B</string>
+    <string name="size_kb">%1$s KB</string>
+    <string name="size_mb">%1$s MB</string>
+    <string name="size_gb">%1$s GB</string>
+    <string name="size_tb">%1$s TB</string>
+
+    <string name="duration_seconds">%1$d सेकंड</string>
+    <string name="duration_minutes">%1$d मिनट</string>
+    <string name="duration_hours_minutes">%1$d घंटे %2$d मिनट</string>
+
+    <plurals name="send_button">
+        <item quantity="one">%1$d आइटम भेजें · %2$s</item>
+        <item quantity="other">%1$d आइटम भेजें · %2$s</item>
+    </plurals>
+    <string name="send_button_empty">भेजने के लिए कुछ चुनें</string>
+    <string name="picker_title">%1$s को भेजें</string>
+    <string name="picker_title_unnamed">भेजें</string>
+    <string name="picker_title_add">%1$s के लिए फ़ाइलें जोड़ें</string>
+    <string name="picker_title_browser">कंप्यूटर के लिए फ़ाइलें</string>
+    <plurals name="add_button">
+        <item quantity="one">%1$d आइटम जोड़ें · %2$s</item>
+        <item quantity="other">%1$d आइटम जोड़ें · %2$s</item>
+    </plurals>
+    <string name="picker_tab_photos">फ़ोटो</string>
+    <string name="picker_tab_files">फ़ाइलें</string>
+    <string name="picker_tab_apps">ऐप</string>
+    <string name="picker_photos_empty">इस डिवाइस पर अभी कोई फ़ोटो या वीडियो नहीं है।</string>
+    <string name="picker_photos_access">गैलरी से चुनने के लिए फ़ोटो की अनुमति दें।</string>
+    <string name="picker_files_browse">फ़ाइलें देखें</string>
+    <string name="picker_files_hint">दस्तावेज़, संगीत और इस डिवाइस पर बाकी सब कुछ।</string>
+    <string name="picker_apps_hint">इंस्टॉल किए गए ऐप APK फ़ाइल के रूप में भेजे जाते हैं।</string>
+    <string name="picker_apps_empty">शेयर करने के लिए कोई ऐप नहीं है।</string>
+
+    <string name="transfer_speed">%1$s MB/s · %2$s बाकी</string>
+    <string name="transfer_speed_only">%1$s MB/s</string>
+    <string name="transfer_done_sent">भेज दिया</string>
+    <string name="transfer_done_received">मिल गया</string>
+    <string name="transfer_resumed">फिर से शुरू हुआ</string>
+    <string name="transfer_connecting">कनेक्ट हो रहा है…</string>
+    <string name="transfer_waiting_accept">उनके स्वीकार करने का इंतज़ार</string>
+    <string name="transfer_reconnecting">फिर से कनेक्ट हो रहा है…</string>
+    <string name="transfer_waiting_peer">%1$s का इंतज़ार</string>
+    <string name="transfer_verifying">फ़ाइलें जाँची जा रही हैं…</string>
+    <string name="transfer_paused">रुका हुआ</string>
+    <string name="transfer_failed">पूरा नहीं हुआ</string>
+    <string name="transfer_cancelled">रद्द किया गया</string>
+    <string name="transfer_declined">अस्वीकार किया गया</string>
+    <string name="transfer_no_answer">कोई जवाब नहीं</string>
+
+    <string name="cancel_send_title">%1$s को भेजना रोकें?</string>
+    <string name="cancel_receive_title">%1$s से पाना रोकें?</string>
+    <string name="cancel_body">%2$s में से %1$s पहले ही जा चुका है।</string>
+    <string name="cancel_confirm">रोकें</string>
+    <string name="cancel_keep">जारी रखें</string>
+
+    <string name="badge_p2p_5">Wi‑Fi Direct · 5 GHz</string>
+    <string name="badge_p2p_24">Wi‑Fi Direct · 2.4 GHz</string>
+    <string name="badge_p2p_6">Wi‑Fi Direct · 6 GHz</string>
+    <string name="badge_p2p">Wi‑Fi Direct</string>
+    <string name="badge_lan">एक ही नेटवर्क</string>
+    <string name="badge_hotspot">हॉटस्पॉट · %1$s</string>
+    <string name="badge_hotspot_plain">हॉटस्पॉट</string>
+    <string name="badge_bt">Bluetooth</string>
+    <string name="band_24">2.4 GHz</string>
+    <string name="band_5">5 GHz</string>
+    <string name="band_6">6 GHz</string>
+
+    <string name="hint_band24">पूरी स्पीड के लिए पास आएँ</string>
+    <string name="hint_peer_band24_only">%1$s का डिवाइस केवल 2.4 GHz सपोर्ट करता है</string>
+    <string name="hint_peer_band24_only_unnamed">दूसरा डिवाइस केवल 2.4 GHz सपोर्ट करता है</string>
+    <string name="hint_sdcard">SD कार्ड में सेव करने से स्पीड कम हो रही है</string>
+    <string name="hint_thermal">फ़ोन गर्म है और धीमा हो रहा है</string>
+    <plurals name="hint_bundling">
+        <item quantity="one">%1$d छोटी फ़ाइल को एक साथ जोड़ा जा रहा है</item>
+        <item quantity="other">%1$d छोटी फ़ाइलों को एक साथ जोड़ा जा रहा है</item>
+    </plurals>
+    <string name="hint_bundling_many">कई छोटी फ़ाइलों को एक साथ जोड़ा जा रहा है</string>
+    <string name="hint_bt_fallback">धीमा मोड: एक डिवाइस पर Wi‑Fi बंद है</string>
+    <string name="hint_lan_slow">सीधे लिंक पर जा रहे हैं…</string>
+    <string name="hint_sta_band24">आपका Wi‑Fi नेटवर्क 2.4 GHz पर है</string>
+    <string name="hint_sta_band24_peer">%1$s का Wi‑Fi नेटवर्क 2.4 GHz पर है</string>
+    <string name="hint_sta_band24_peer_unnamed">दूसरे डिवाइस का Wi‑Fi नेटवर्क 2.4 GHz पर है</string>
+
+    <string name="qr_title">%1$s को भेजने के लिए स्कैन करें</string>
+    <string name="qr_fallback">या यह कोड डालें: %1$s</string>
+    <string name="qr_computer_hint">बिना ऐप वाले कंप्यूटर पर खोलें: Wi‑Fi %1$s से जुड़ें, पासवर्ड %2$s, फिर %3$s खोलें</string>
+    <string name="qr_computer_start">बिना ऐप वाले कंप्यूटर पर भेजें</string>
+    <string name="qr_computer_starting">नेटवर्क शुरू हो रहा है…</string>
+    <string name="qr_computer_ip">अगर यह पता न खुले, तो %1$s खोलें</string>
+    <string name="qr_computer_failed">कंप्यूटर के लिए नेटवर्क शुरू नहीं हो सका।</string>
+    <string name="qr_computer_retry">फिर से कोशिश करें</string>
+    <string name="qr_show_browser_code">पेज का कोड दिखाएँ</string>
+    <string name="qr_show_app_code">मेरा ऐप कोड दिखाएँ</string>
+
+    <string name="scan_prompt">पाने वाले का कोड स्कैन करें</string>
+    <string name="scan_success">मिल गया</string>
+    <string name="scan_expired">इस कोड की समय सीमा खत्म हो गई है। उनसे इसे रीफ़्रेश करने को कहें।</string>
+    <string name="scan_invalid">यह इस ऐप का कोड नहीं है।</string>
+    <string name="scan_camera_permission">कोड स्कैन करने के लिए कैमरे की अनुमति दें।</string>
+
+    <string name="incoming_title">%1$s भेजना चाहते हैं</string>
+    <string name="incoming_accept">स्वीकार करें</string>
+    <string name="incoming_decline">अस्वीकार करें</string>
+    <string name="incoming_always">%1$s से हमेशा स्वीकार करें</string>
+    <string name="incoming_new_device">नया डिवाइस — पहली बार</string>
+    <string name="incoming_verified">पुष्टि किया गया डिवाइस</string>
+    <string name="incoming_more">+%1$d</string>
+    <string name="pair_code">दोनों स्क्रीन पर एक ही कोड है?</string>
+    <string name="pair_confirm">हाँ, मेल खाता है</string>
+    <string name="pair_confirmed">कोड की पुष्टि हो गई</string>
+    <string name="pair_sender_title">%1$s पर कोड जाँचें</string>
+    <string name="pair_later">अभी नहीं</string>
+
+    <string name="tray_open_folder">फ़ोल्डर खोलें</string>
+    <string name="installer_title">यह ऐप इंस्टॉलर खोलें?</string>
+    <string name="installer_body">यह %1$s की भेजी हुई ऐप इंस्टॉलर फ़ाइल है। इसे तभी खोलें जब आपको उन पर भरोसा हो।</string>
+    <string name="installer_body_unknown">यह एक ऐप इंस्टॉलर फ़ाइल है। इसे तभी खोलें जब आपको भेजने वाले पर भरोसा हो।</string>
+    <string name="installer_open">फिर भी खोलें</string>
+
+    <string name="browser_title">इस कंप्यूटर को अनुमति दें?</string>
+    <string name="browser_title_again">एक और कंप्यूटर जुड़ना चाहता है</string>
+    <string name="browser_body">%1$s पर एक ब्राउज़र आपकी शेयर की जा रही फ़ाइलें देखना चाहता है।</string>
+    <string name="browser_agent">%2$s पर %1$s</string>
+    <string name="browser_unknown">अनजान ब्राउज़र</string>
+    <string name="browser_allow">अनुमति दें</string>
+    <string name="browser_deny">अनुमति न दें</string>
+
+    <string name="dashboard_title">डैशबोर्ड</string>
+    <string name="tab_live">लाइव</string>
+    <string name="tab_history">इतिहास</string>
+    <string name="tab_devices">डिवाइस</string>
+    <string name="tab_stats">आँकड़े</string>
+    <string name="tab_settings">सेटिंग</string>
+    <string name="live_empty">अभी कुछ नहीं भेजा जा रहा है।</string>
+    <string name="live_pause">रोकें</string>
+    <string name="live_resume">फिर शुरू करें</string>
+    <string name="live_cancel">रद्द करें</string>
+    <string name="live_add">फ़ाइलें जोड़ें</string>
+    <string name="live_progress">%2$s में से %1$s</string>
+    <string name="history_empty">आप जो भेजते या पाते हैं, वह यहाँ दिखेगा।</string>
+    <string name="history_today">आज</string>
+    <string name="history_yesterday">कल</string>
+    <string name="history_date">%1$d %2$s %3$d</string>
+    <string name="history_to">%1$s को</string>
+    <string name="history_from">%1$s से</string>
+    <string name="history_time">%1$s:%2$s</string>
+    <string name="history_details">%1$s · %2$s · %3$s</string>
+    <string name="history_details_short">%1$s · %2$s</string>
+    <string name="history_clear">इतिहास मिटाएँ</string>
+    <string name="history_clear_title">इतिहास मिटाएँ?</string>
+    <string name="history_clear_body">इससे केवल सूची मिटेगी। मिली हुई फ़ाइलें अपनी जगह रहेंगी।</string>
+    <string name="history_clear_confirm">मिटाएँ</string>
+    <string name="history_detail_when">%1$s, %2$s</string>
+    <string name="history_via">%1$s के ज़रिए</string>
+    <string name="history_resend">फिर से भेजें</string>
+    <string name="history_files_loading">फ़ाइलें लोड हो रही हैं…</string>
+    <string name="history_file_missing">अब उपलब्ध नहीं</string>
+    <string name="status_done">पूरा</string>
+    <string name="status_partial">आंशिक रूप से पूरा</string>
+    <string name="status_failed">विफल</string>
+    <string name="status_cancelled">रद्द</string>
+    <string name="status_interrupted">इंतज़ार में</string>
+    <string name="month_1">जन॰</string>
+    <string name="month_2">फ़र॰</string>
+    <string name="month_3">मार्च</string>
+    <string name="month_4">अप्रैल</string>
+    <string name="month_5">मई</string>
+    <string name="month_6">जून</string>
+    <string name="month_7">जुल॰</string>
+    <string name="month_8">अग॰</string>
+    <string name="month_9">सित॰</string>
+    <string name="month_10">अक्तू॰</string>
+    <string name="month_11">नव॰</string>
+    <string name="month_12">दिस॰</string>
+    <string name="devices_empty">जिन डिवाइस की आप 6 अंकों वाले कोड से पुष्टि करते हैं, वे यहाँ दिखेंगे।</string>
+    <string name="devices_seen_now">अभी देखा गया</string>
+    <plurals name="devices_seen_minutes">
+        <item quantity="one">%1$d मिनट पहले देखा गया</item>
+        <item quantity="other">%1$d मिनट पहले देखा गया</item>
+    </plurals>
+    <plurals name="devices_seen_hours">
+        <item quantity="one">%1$d घंटा पहले देखा गया</item>
+        <item quantity="other">%1$d घंटे पहले देखा गया</item>
+    </plurals>
+    <plurals name="devices_seen_days">
+        <item quantity="one">%1$d दिन पहले देखा गया</item>
+        <item quantity="other">%1$d दिन पहले देखा गया</item>
+    </plurals>
+    <string name="devices_auto_accept">अपने-आप स्वीकार करें</string>
+    <string name="devices_rename">नाम बदलें</string>
+    <string name="devices_forget">भूल जाएँ</string>
+    <string name="devices_rename_title">डिवाइस का नाम बदलें</string>
+    <string name="devices_forget_title">%1$s को भूल जाएँ?</string>
+    <string name="devices_forget_body">अगली बार यह नए डिवाइस की तरह दिखेगा, और आपको फिर से कोड मिलाने होंगे।</string>
+    <string name="platform_phone">फ़ोन</string>
+    <string name="platform_laptop">लैपटॉप</string>
+    <string name="platform_desktop">कंप्यूटर</string>
+    <string name="platform_browser">ब्राउज़र</string>
+    <string name="platform_unknown">डिवाइस</string>
+    <string name="stats_total">कुल ट्रांसफ़र</string>
+    <string name="stats_average">औसत स्पीड</string>
+    <string name="stats_week">इस हफ़्ते के ट्रांसफ़र</string>
+    <string name="stats_saved_label">Bluetooth के मुकाबले बचे घंटे</string>
+    <string name="stats_saved">Bluetooth के मुकाबले %1$s घंटे बचे</string>
+    <string name="stats_hours">%1$s घंटे</string>
+    <string name="stats_speed">%1$s MB/s</string>
+    <string name="stats_none">—</string>
+    <string name="stats_chart_title">हर हफ़्ते के ट्रांसफ़र</string>
+    <string name="stats_axis_this_week">इस हफ़्ते</string>
+    <plurals name="stats_axis_weeks_ago">
+        <item quantity="one">%1$d हफ़्ता पहले</item>
+        <item quantity="other">%1$d हफ़्ते पहले</item>
+    </plurals>
+    <string name="stats_share">आँकड़ों का कार्ड शेयर करें</string>
+    <string name="settings_visibility">दृश्यता</string>
+    <string name="settings_speed">स्पीड</string>
+    <string name="settings_prefer_5ghz">5 GHz को प्राथमिकता दें</string>
+    <string name="settings_prefer_5ghz_desc">दोनों डिवाइस सपोर्ट करें तो तेज़ बैंड माँगता है।</string>
+    <string name="settings_keep_awake">स्क्रीन चालू रखें</string>
+    <string name="settings_keep_awake_desc">जब तक ट्रांसफ़र चल रहा हो।</string>
+    <string name="settings_bundle">छोटी फ़ाइलें एक साथ भेजें</string>
+    <string name="settings_bundle_desc">कई छोटी फ़ोटो के लिए तेज़।</string>
+    <string name="settings_storage">स्टोरेज</string>
+    <string name="settings_save_location">सेव करने की जगह</string>
+    <string name="settings_save_location_default">फ़ोटो गैलरी में, फ़ाइलें Downloads में</string>
+    <string name="settings_clear_partials">अधूरी फ़ाइलें मिटाएँ</string>
+    <string name="settings_clear_partials_desc">अधूरे ट्रांसफ़र 24 घंटे तक रखे जाते हैं, ताकि वे फिर से शुरू हो सकें।</string>
+    <string name="settings_clear_partials_title">अधूरी फ़ाइलें मिटाएँ?</string>
+    <string name="settings_clear_partials_body">फिर से शुरू होने का इंतज़ार कर रहे ट्रांसफ़र रुक जाएँगे और आगे नहीं चल पाएँगे।</string>
+    <string name="settings_clear_partials_confirm">मिटाएँ</string>
+    <string name="settings_clear_partials_done">%1$s खाली हुआ</string>
+    <string name="settings_clear_partials_failed">अधूरी फ़ाइलें साफ़ नहीं हो सकीं। फिर से कोशिश करें।</string>
+    <string name="settings_profile">प्रोफ़ाइल</string>
+    <string name="settings_nickname">उपनाम</string>
+    <string name="settings_avatar">अवतार</string>
+    <string name="settings_avatar_initials">नाम के अक्षर इस्तेमाल करें</string>
+    <string name="settings_language">भाषा</string>
+    <string name="settings_language_system">सिस्टम की भाषा</string>
+    <string name="language_en">English</string>
+    <string name="language_hi">हिन्दी</string>
+    <string name="settings_privacy">निजता</string>
+    <string name="settings_privacy_statement">निजता का बयान</string>
+    <string name="settings_crash_reports">क्रैश रिपोर्ट भेजें</string>
+    <string name="settings_crash_reports_desc">जब तक आप चालू न करें, बंद रहता है। रिपोर्ट में आपकी फ़ाइलें कभी शामिल नहीं होतीं।</string>
+    <string name="settings_accessibility">सुलभता</string>
+    <string name="settings_haptics">हैप्टिक फ़ीडबैक</string>
+    <string name="settings_about">जानकारी</string>
+    <string name="settings_version">वर्शन %1$s</string>
+    <string name="settings_change">बदलें</string>
+
+    <string name="privacy_statement">कोई अकाउंट नहीं, कोई क्लाउड नहीं, कोई ट्रैकिंग नहीं। आपकी चुनी हुई फ़ाइल के सिवा आपके फ़ोन से कुछ भी बाहर नहीं जाता।</string>
+    <string name="privacy_internet">आपके पास के डिवाइस से कनेक्शन खोलने के लिए ऐप को इंटरनेट की अनुमति चाहिए। यह कभी ऑनलाइन नहीं जाता।</string>
+
+    <string name="welcome_sentence">आस-पास किसी को भी कुछ भी भेजें। न इंटरनेट, न डेटा, न कोई सीमा।</string>
+    <string name="welcome_nickname">आपका नाम</string>
+    <string name="welcome_nickname_hint">आस-पास के लोग यह नाम देखते हैं।</string>
+    <string name="welcome_nickname_error">कम से कम एक अक्षर या अंक वाला नाम डालें।</string>
+    <string name="welcome_avatar">फ़ोटो जोड़ें</string>
+    <string name="welcome_avatar_change">फ़ोटो बदलें</string>
+    <string name="welcome_start">शुरू करें</string>
+    <string name="brand_title">ट्रांसफ़र चालू रखें</string>
+    <string name="brand_body">स्क्रीन बंद होने पर भी ट्रांसफ़र चालू रखने के लिए, ऐप को बैकग्राउंड में चलने की अनुमति दें।</string>
+    <string name="brand_steps_xiaomi">Autostart चालू करें, फिर Battery saver को No restrictions पर सेट करें।</string>
+    <string name="brand_steps_vivo">बैकग्राउंड गतिविधि और ज़्यादा बैकग्राउंड पावर इस्तेमाल की अनुमति दें।</string>
+    <string name="brand_steps_oppo">Auto launch और बैकग्राउंड गतिविधि की अनुमति दें।</string>
+    <string name="brand_steps_samsung">Battery को Unrestricted पर सेट करें और ऐप को Sleeping apps से बाहर रखें।</string>
+    <string name="brand_open">सेटिंग खोलें</string>
+    <string name="brand_skip">अभी छोड़ें</string>
+
+    <string name="perm_nearby_title">आस-पास के लोगों को ढूँढें</string>
+    <string name="perm_nearby_reason">आस-पास के डिवाइस की अनुमति से ऐप आपके आस-पास के फ़ोन ढूँढकर उनसे सीधे जुड़ पाता है।</string>
+    <string name="perm_location_title">Android 12 पर सीधा Wi‑Fi</string>
+    <string name="perm_location_reason">सीधा Wi‑Fi लिंक बनाने के लिए Android 12 लोकेशन की अनुमति माँगता है। ऐप कभी नहीं पढ़ता कि आप कहाँ हैं।</string>
+    <string name="perm_media_title">फ़ोटो और वीडियो चुनें</string>
+    <string name="perm_media_reason">फ़ोटो की अनुमति से आप चुन पाते हैं कि क्या भेजना है, और प्रीव्यू दिखते हैं।</string>
+    <string name="perm_notifications_title">प्रोग्रेस दिखाएँ</string>
+    <string name="perm_notifications_reason">सूचनाएँ ट्रांसफ़र की प्रोग्रेस और आपके लिए आई फ़ाइलें दिखाती हैं।</string>
+    <string name="perm_camera_title">कोड स्कैन करें</string>
+    <string name="perm_camera_reason">कैमरा केवल दूसरे डिवाइस का कोड स्कैन करने के लिए इस्तेमाल होता है।</string>
+    <string name="perm_battery_title">स्क्रीन बंद होने पर भी पूरा करें</string>
+    <string name="perm_battery_reason">बैकग्राउंड में चालू रहने से स्क्रीन बंद होने पर भी ट्रांसफ़र पूरे होते हैं।</string>
+    <string name="perm_continue">आगे बढ़ें</string>
+    <string name="perm_not_now">अभी नहीं</string>
+    <string name="perm_blocked">यह अनुमति बंद है। आप इसे सेटिंग में चालू कर सकते हैं।</string>
+    <string name="perm_open_settings">सेटिंग खोलें</string>
+
+    <string name="common_cancel">रद्द करें</string>
+    <string name="common_close">बंद करें</string>
+    <string name="common_save">सेव करें</string>
+    <string name="common_back">वापस</string>
+
+    <string name="a11y_bubble">%1$s, %2$s</string>
+    <string name="a11y_bubble_trusted">%1$s, %2$s, भरोसेमंद</string>
+    <string name="a11y_ring_inner">बिल्कुल पास</string>
+    <string name="a11y_ring_middle">आस-पास</string>
+    <string name="a11y_ring_outer">दूर</string>
+    <string name="a11y_ring_network">एक ही नेटवर्क पर</string>
+    <string name="a11y_action_send">भेजें</string>
+    <string name="a11y_action_open">खोलें</string>
+    <string name="a11y_action_share">शेयर करें</string>
+    <string name="a11y_action_select">चुनें</string>
+    <string name="a11y_action_show_more">आस-पास के सभी लोग देखें</string>
+    <string name="a11y_sending">%1$s को भेजा जा रहा है, %2$d प्रतिशत</string>
+    <string name="a11y_receiving">%1$s से मिल रहा है, %2$d प्रतिशत</string>
+    <string name="a11y_self">आप, %1$s</string>
+    <string name="a11y_cancel_transfer">ट्रांसफ़र रद्द करें</string>
+    <string name="a11y_clear_attachment">जोड़ी गई फ़ाइलें हटाएँ</string>
+    <string name="a11y_visibility">दृश्यता: %1$s</string>
+    <string name="a11y_qr">%1$s का कोड</string>
+    <string name="a11y_qr_browser">%1$s वाले पेज का कोड</string>
+    <string name="a11y_selected">चुना गया</string>
+    <string name="a11y_done">हो गया</string>
+    <plurals name="a11y_incoming_seconds">
+        <item quantity="one">जवाब देने के लिए %1$d सेकंड बाकी</item>
+        <item quantity="other">जवाब देने के लिए %1$d सेकंड बाकी</item>
+    </plurals>
+    <string name="a11y_qr_refresh">कोड %1$s में रीफ़्रेश होगा</string>
+    <string name="a11y_chart">हर हफ़्ते के ट्रांसफ़र, पिछले 12 हफ़्ते: %1$s</string>
+    <string name="unnamed_device">आस-पास का डिवाइस</string>
+    <string name="a11y_joined">%1$s, %2$s</string>
+</resources>

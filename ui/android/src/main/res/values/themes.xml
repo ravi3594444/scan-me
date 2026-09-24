@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        The window under the Compose UI: the design background, so launch and rotation never flash another colour,
+        and the Android 12+ splash screen on the same colour. Compose draws everything else.
+    -->
+    <style name="Theme.Drop" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/drop_bg</item>
+        <item name="android:windowSplashScreenBackground">@color/drop_bg</item>
+    </style>
+</resources>

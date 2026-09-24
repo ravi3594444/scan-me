@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- design.md §1 `bg` (dark). -->
+    <color name="drop_bg">#0E1116</color>
+</resources>
