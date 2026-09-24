@@ -988,6 +988,12 @@ internal class SendSide(
                 config.debug.corruptPlaintext(unit, offset, block, ChunkHeader.SIZE, n)
                 val outcome = CompletableDeferred<BlockOutcome>()
                 lock.withLock { btBlock = BtBlock(g, offset, n, outcome) }
+                if (!firstBlockReported) {
+                    // Posted before the block goes out: the peer's ack for it, read on another coroutine, posts the first
+                    // progress to the actor, and that must come after the phase change (no bytes counted in Accepted).
+                    firstBlockReported = true
+                    run.reduceLater(TransferEvent.FirstChunkOverBluetooth)
+                }
                 try {
                     config.debug.beforeChunkSealed(conn.streamId)
                     conn.secure.sendChunk(block, 0, ChunkHeader.SIZE + n)
@@ -1005,10 +1011,6 @@ internal class SendSide(
                     }
                 run.meter.add(n.toLong())
                 signal?.complete(Unit)
-                if (!firstBlockReported) {
-                    firstBlockReported = true
-                    run.reduceLater(TransferEvent.FirstChunkOverBluetooth)
-                }
                 if (offset + n >= length) unitSent(g, unit)
                 when (outcome.await()) {
                     BlockOutcome.Acked -> {

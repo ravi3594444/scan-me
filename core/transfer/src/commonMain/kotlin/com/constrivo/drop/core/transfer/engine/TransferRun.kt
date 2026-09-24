@@ -593,13 +593,26 @@ internal class TransferRun(
     @Volatile
     private var publishedBytes = 0L
 
+    @Volatile
+    private var publishQueued = false
+
     /**
-     * Bytes moved: publish now when the last publication is [PUBLISH_MIN_MILLIS] old or this is the first progress, so the
+     * Bytes moved: publish when the last publication is [PUBLISH_MIN_MILLIS] old or this is the first progress, so the
      * UI sees movement at once (F-E5, F-G1); otherwise the next tick publishes.
+     *
+     * The publication runs in the actor, after every event already posted to it. The data path posts a phase change
+     * (the first Bluetooth block's [TransferEvent.FirstChunkOverBluetooth]) before it counts the block's bytes, so no
+     * observer sees bytes moving in a phase that has not begun, and [machineState] is only read by the actor.
      */
     fun progressChanged(bytesDone: Long) {
         val t = elapsed()
-        if ((publishedBytes == 0L && bytesDone > 0) || t - lastPublishAt >= PUBLISH_MIN_MILLIS) publishProgress()
+        val due = (publishedBytes == 0L && bytesDone > 0) || t - lastPublishAt >= PUBLISH_MIN_MILLIS
+        if (!due || publishQueued) return
+        publishQueued = true
+        call {
+            publishQueued = false
+            publishProgress()
+        }
     }
 
     fun publishProgress() {

@@ -1,5 +1,6 @@
 package com.constrivo.drop.web
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -90,13 +91,17 @@ class BrowserSessionsTest {
     fun anUnansweredRequestExpiresAndCanBeAskedAgain() =
         runBlocking<Unit> {
             val asked = AtomicInteger()
+            // The second ask answers only when the test says so: the approver runs on another thread, and an answer that
+            // came at once could land before the test looks at the PENDING state.
+            val answerSecond = CompletableDeferred<Unit>()
             val s =
                 sessions(
                     {
                         if (asked.incrementAndGet() == 1) awaitCancellation()
+                        answerSecond.await()
                         it.browserNumber == 1
                     },
-                    timeout = 50,
+                    timeout = 500,
                 )
             val browser = assertNotNull(s.claim("10.0.0.1", "UA"))
             assertEquals(BrowserState.PENDING, browser.state)
@@ -106,6 +111,7 @@ class BrowserSessionsTest {
 
             assertTrue(s.retry(browser))
             assertEquals(BrowserState.PENDING, browser.state)
+            answerSecond.complete(Unit)
             assertEquals(BrowserState.APPROVED, withTimeout(5_000) { browser.decision.await() })
             assertEquals(2, asked.get())
             assertEquals(listOf(BrowserState.APPROVED), s.states(), "the same session, no new slot")

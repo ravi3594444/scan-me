@@ -28,6 +28,7 @@ import com.constrivo.drop.core.protocol.HintCode
 import com.constrivo.drop.core.protocol.InMemoryDataChannel
 import com.constrivo.drop.core.protocol.LinkKind
 import com.constrivo.drop.core.protocol.LinkReady
+import com.constrivo.drop.core.protocol.ProtocolConstants
 import com.constrivo.drop.core.protocol.TransferPhase
 import com.constrivo.drop.core.protocol.TransferRole
 import com.constrivo.drop.core.transfer.SourceFile
@@ -71,7 +72,9 @@ import kotlin.test.assertTrue
  * exchange (§7.2), the first authenticated `StreamOpen` stream of each link, the receiver's selection travelling as
  * N13 `ControlMoved` and the sender following it when the data link changes, and a byte-exact transfer.
  *
- * The rung deadlines are stretched to 20 s so that the gates, not the machine's speed, decide when a link comes up.
+ * The rung deadlines are stretched to 20 s so that the gates, not the machine's speed, decide when a link comes up. The
+ * LAN's throughput check is kept far from its threshold for the same reason: a fast LAN passes a lowered mark by a wide
+ * margin, and a slow one stays well under the production mark, which a busy machine can only make slower.
  */
 class LadderTransferEndToEndTest {
     private val mib = 1024 * 1024
@@ -80,7 +83,9 @@ class LadderTransferEndToEndTest {
     fun `head start over Bluetooth, then the LAN is measured, selected and carries the transfer`() =
         runBlocking<Unit> {
             // The LAN comes up only once the head start is seen; the Wi-Fi Direct group never forms and loses the race.
-            Phones(lanBytesPerSecond = 6_000_000, p2pGate = LinkGate()).use { phones ->
+            // The LAN's pass mark is 1 MB/s here (10 MB/s in production): each stream is paced at 6 MB/s, so the LAN passes
+            // by a wide margin however busy the machine is, and the check stays a gate, not a race against the CPU.
+            Phones(lanBytesPerSecond = 6_000_000, p2pGate = LinkGate(), lanMinBytesPerSecond = 1_000_000).use { phones ->
                 val files = listOf(MemorySource("movie.mp4", bytes(40 * mib + 3, 1)), MemorySource("notes.txt", bytes(50_000, 2)))
                 withTimeout(90_000) {
                     val (sending, receiving) = phones.start(files)
@@ -119,7 +124,7 @@ class LadderTransferEndToEndTest {
                 assertTrue(phones.senderEvents.moved.any { it.generation == 0 }, "the receiver moved control to the LAN")
                 assertTrue(phones.receiverEvents.moved.any { it.generation == 0 }, "the sender followed onto the LAN")
 
-                // The LAN was measured on the bytes that arrived over it (10 MB in 1 s, §4), after the Bluetooth head start.
+                // The LAN was measured on the bytes that arrived over it (§4), after the Bluetooth head start.
                 assertTrue(phones.receiverEvents.bytes(LinkKind.BLUETOOTH) > 0)
                 assertTrue(
                     phones.receiverEvents.bytes(LinkKind.LAN) >= 10_000_000,
@@ -235,6 +240,7 @@ class LadderTransferEndToEndTest {
         lanBytesPerSecond: Long?,
         val p2pGate: LinkGate,
         p2pBytesPerSecond: Long? = null,
+        lanMinBytesPerSecond: Long = ProtocolConstants.LAN_MIN_BPS,
     ) : AutoCloseable {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val lanGate = LinkGate()
@@ -249,6 +255,7 @@ class LadderTransferEndToEndTest {
             LinkLifecycle(
                 LadderTimeouts(
                     lanConnectMillis = STRETCHED_MILLIS,
+                    lanMinBytesPerSecond = lanMinBytesPerSecond,
                     p2pFormationMillis = STRETCHED_MILLIS,
                     hotspotMillis = STRETCHED_MILLIS,
                 ),

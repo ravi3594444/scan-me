@@ -7,11 +7,14 @@ import com.constrivo.drop.core.protocol.TransferPhase
 import com.constrivo.drop.core.transfer.MemorySource
 import com.constrivo.drop.core.transfer.TestSupport
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -62,6 +65,39 @@ class HeadStartHopTest {
                         TestSupport.sha256(pair.receivedFile(file.name)),
                         file.name,
                     )
+                }
+            }
+        }
+
+    @Test
+    fun `no progress counts bytes before the streaming phase has begun`() =
+        runBlocking<Unit> {
+            // The first Bluetooth block both starts Streaming_BT and brings the first bytes; every publication must show
+            // them in that order, on both sides (the phase change used to be queued while the bytes were published at once).
+            repeat(3) { round ->
+                EnginePair(primaryKind = LinkKind.BLUETOOTH, primaryBytesPerSecond = 200_000).use { pair ->
+                    val files = listOf(MemorySource("photo-$round.jpg", TestSupport.randomBytes(120_000, 20L + round)))
+                    withTimeout(60_000) {
+                        val (a, b) = pair.connect()
+                        val sending = pair.senderEngine.send(a, files, SendOptions(reconnect = pair.senderReconnect))
+                        val incoming = pair.scope.async { pair.receiverEngine.receive(b) }.await()
+                        val seen = CopyOnWriteArrayList<TransferProgress>()
+                        val watchers =
+                            listOf(sending.progress, incoming.transfer.progress).map { flow ->
+                                pair.scope.launch(Dispatchers.Unconfined) { flow.collect { seen += it } }
+                            }
+                        val receiving = incoming.accept()
+                        assertEquals(TransferPhase.DONE, sending.await().phase)
+                        assertEquals(TransferPhase.DONE, receiving.await().phase)
+                        watchers.forEach { it.cancel() }
+                        val early =
+                            seen.filter {
+                                it.bytesDone > 0 &&
+                                    (it.phase == TransferPhase.OFFERED || it.phase == TransferPhase.ACCEPTED)
+                            }
+                        assertTrue(early.isEmpty(), "bytes counted before streaming began: $early")
+                        assertTrue(seen.any { it.bytesDone > 0 && it.phase == TransferPhase.STREAMING_BLUETOOTH }, "head start seen")
+                    }
                 }
             }
         }
