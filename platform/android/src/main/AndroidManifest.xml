@@ -48,6 +48,35 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!--
+        WP7c/d: Wi-Fi Direct groups, the local-only hotspot, WifiNetworkSpecifier joins, LAN sockets and NSD
+        (architecture §8, §11). The runtime ones match ui/android's declarations exactly, so the manifests merge.
+        INTERNET (TCP streams on the link networks) and CHANGE_WIFI_MULTICAST_STATE (mDNS reception for NsdManager
+        before the Tiramisu SDK extension 7, and the drop.local responder) are declared once, above.
+    -->
+    <!-- createGroup, connect, removeGroup, startLocalOnlyHotspot and the multicast lock. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <!-- ConnectivityManager.requestNetwork with a WifiNetworkSpecifier (the hotspot and legacy group joins). -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <!-- Wi-Fi Direct and the local-only hotspot on Android 13+, without location. -->
+    <uses-permission
+        xmlns:tools="http://schemas.android.com/tools"
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="tiramisu" />
+    <!-- Android 12 only: Wi-Fi Direct and the local-only hotspot need fine location, asked together with coarse. -->
+    <uses-permission
+        android:name="android.permission.ACCESS_FINE_LOCATION"
+        android:maxSdkVersion="32" />
+    <uses-permission
+        android:name="android.permission.ACCESS_COARSE_LOCATION"
+        android:maxSdkVersion="32" />
+    <!-- Android 17, target 37: LAN sockets and NsdManager need the local network permission. -->
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
+    <uses-feature
+        android:name="android.hardware.wifi.direct"
+        android:required="false" />
+
     <application>
         <!-- Not exported: only this app starts and binds it (notification actions go through PendingIntents). -->
         <service

@@ -52,4 +52,7 @@ dependencies {
     implementation(libs.androidx.sqlite)
     // The node and the storage tests run on the JVM against core/data's in-memory SQLite database.
     testImplementation(libs.sqldelight.sqlite.driver)
+    // WP7c/d: the Wi-Fi Direct, hotspot and LAN links hand the engine TCP channels (TcpDataChannel, TcpListener) and
+    // implement its TcpSocketFactory (NetworkBoundSocketFactory), so core/transfer is part of this module's API.
+    api(project(":core:transfer"))
 }
