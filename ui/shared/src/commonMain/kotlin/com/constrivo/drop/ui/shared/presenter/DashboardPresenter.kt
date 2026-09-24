@@ -4,6 +4,7 @@ import com.constrivo.drop.core.discovery.Nicknames
 import com.constrivo.drop.core.discovery.Visibility
 import com.constrivo.drop.core.discovery.WallClock
 import com.constrivo.drop.ui.shared.model.AppLanguage
+import com.constrivo.drop.ui.shared.model.AttachedFiles
 import com.constrivo.drop.ui.shared.model.Avatars
 import com.constrivo.drop.ui.shared.model.ClearPartialsResult
 import com.constrivo.drop.ui.shared.model.DashboardTab
@@ -31,11 +32,16 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.EmptyCoroutineContext
 
 /** Live tab actions (F‑G1: pause, cancel, add). */
 interface LiveActions {
@@ -45,8 +51,14 @@ interface LiveActions {
 
     fun cancel(transferId: String)
 
-    /** Opens the picker to queue more files into a running transfer (F‑C5). */
-    fun addFiles(transferId: String)
+    /**
+     * Queues [files] into the running transfer [transferId] (F‑C5), picked in the file picker the Live tab's "Add
+     * files" opens ([DropAppController.openAddFiles]).
+     */
+    fun addFiles(
+        transferId: String,
+        files: AttachedFiles,
+    )
 }
 
 /** History (F‑G2), backed by core/data's `TransferRepository` in the app layer. */
@@ -114,7 +126,8 @@ interface SettingsSource {
 
     /**
      * "Clear partial files": the app layer stops parked and reconnecting transfers first (they would otherwise keep
-     * writing), then deletes the partials and manifests (core/data `ResumeDataCleaner.clearPartials`).
+     * writing), then deletes the partials and manifests (core/data `ResumeDataCleaner.clearPartials`). It may throw
+     * (an I/O or storage error); the Settings tab then says it could not clear them.
      */
     suspend fun clearPartialFiles(): ClearPartialsResult
 
@@ -151,16 +164,21 @@ interface DayCalendar {
             }
 
         /**
-         * The device's time zone, read on every call so a zone change (travel, daylight saving) regroups History at
-         * once. Both apps run on the JVM, so `java.time` supplies the zone rules.
+         * The device's time zone. Both apps run on the JVM, so `java.time` supplies the zone rules; each call looks up
+         * only the zone's offset at that instant (no date objects), which keeps grouping 10,000 History rows cheap.
+         * The zone is read on every call, so a zone change (travel, daylight saving) regroups History at the next
+         * minute ([HistoryPresenter] watches today's day number and offset).
          */
         val System: DayCalendar =
             object : DayCalendar {
-                private fun local(unixMillis: Long) = java.time.Instant.ofEpochMilli(unixMillis).atZone(java.time.ZoneId.systemDefault())
+                private fun localMillis(unixMillis: Long): Long {
+                    val offset = java.time.ZoneId.systemDefault().rules.getOffset(java.time.Instant.ofEpochMilli(unixMillis))
+                    return unixMillis + offset.totalSeconds * 1_000L
+                }
 
-                override fun epochDayOf(unixMillis: Long): Long = local(unixMillis).toLocalDate().toEpochDay()
+                override fun epochDayOf(unixMillis: Long): Long = localMillis(unixMillis).floorDiv(DAY_MILLIS)
 
-                override fun minuteOfDay(unixMillis: Long): Int = local(unixMillis).let { it.hour * 60 + it.minute }
+                override fun minuteOfDay(unixMillis: Long): Int = (localMillis(unixMillis).mod(DAY_MILLIS) / 60_000L).toInt()
             }
 
         const val DAY_MILLIS: Long = 86_400_000L
@@ -184,7 +202,14 @@ class LivePresenter(
 
     fun cancel(id: String) = actions.cancel(id)
 
-    fun addFiles(id: String) = actions.addFiles(id)
+    /** Queues [files] into the running transfer [id] (F‑C5). */
+    fun addFiles(
+        id: String,
+        files: AttachedFiles,
+    ) {
+        if (files.items.isEmpty()) return
+        actions.addFiles(id, files)
+    }
 
     private fun row(t: TransferSnapshot) =
         LiveRowUi(
@@ -217,33 +242,45 @@ data class HistoryUi(
 
 /**
  * History tab (F‑G2, design §6): transfers newest first, grouped by local day with "Today" and "Yesterday", a detail
- * sheet with per-file open and "Send again", and "Clear history" behind a confirmation. Day labels are re-evaluated
- * every minute, so "Today" becomes "Yesterday" after midnight.
+ * sheet with per-file open and "Send again", and "Clear history" behind a confirmation.
+ *
+ * Grouping 10,000 rows is the heavy part, so it runs on [computeContext] (the controller passes
+ * `Dispatchers.Default`) and only when History changes or the local day does: a minute ticker checks today's day
+ * number and the zone offset, so "Today" becomes "Yesterday" after midnight and a zone change regroups, while opening
+ * the detail sheet or the clear confirmation never regroups.
  */
 class HistoryPresenter(
     private val scope: CoroutineScope,
     private val source: HistorySource,
     private val calendar: DayCalendar,
     private val wallClock: WallClock,
+    computeContext: CoroutineContext = EmptyCoroutineContext,
 ) {
     private val detail = MutableStateFlow<HistoryDetailUi?>(null)
     private val confirmClear = MutableStateFlow(false)
+
+    // Written by the state collector (on the scope, after flowOn), read by openDetail on the same thread.
     private var days: List<HistoryDayUi> = emptyList()
 
-    private val minutes: Flow<Long> =
+    /** Today's local day number and the zone offset in minutes, re-read every minute; changes only at midnight or a zone change. */
+    private val localDay: Flow<Pair<Long, Int>> =
         flow {
             while (true) {
                 val now = wallClock.nowMillis()
-                emit(now)
+                val utcMinute = (now.mod(DayCalendar.DAY_MILLIS) / MINUTE_MILLIS).toInt()
+                emit(calendar.epochDayOf(now) to (calendar.minuteOfDay(now) - utcMinute).mod(MINUTES_PER_DAY))
                 delay(MINUTE_MILLIS - now.mod(MINUTE_MILLIS))
             }
-        }
+        }.distinctUntilChanged()
+
+    private val grouped: Flow<List<HistoryDayUi>> =
+        combine(source.history, localDay) { entries, (today, _) -> group(entries, today) }
+            .flowOn(computeContext)
+            .onEach { days = it }
 
     val state: StateFlow<HistoryUi> =
-        combine(source.history, minutes, detail, confirmClear) { entries, now, d, c ->
-            days = group(entries, calendar.epochDayOf(now))
-            HistoryUi(days, d, c)
-        }.stateIn(scope, SharingStarted.Eagerly, HistoryUi())
+        combine(grouped, detail, confirmClear) { d, open, c -> HistoryUi(d, open, c) }
+            .stateIn(scope, SharingStarted.Eagerly, HistoryUi())
 
     /** Opens the detail sheet of [transferId] and loads its files. */
     fun openDetail(transferId: String) {
@@ -331,6 +368,7 @@ class HistoryPresenter(
 
     private companion object {
         const val MINUTE_MILLIS = 60_000L
+        const val MINUTES_PER_DAY = 1_440
     }
 }
 
@@ -437,10 +475,11 @@ class SettingsPresenter(
 ) {
     private val clearing = MutableStateFlow(false)
     private val lastClear = MutableStateFlow<ClearPartialsResult?>(null)
+    private val clearFailed = MutableStateFlow(false)
     private val confirmingClear = MutableStateFlow(false)
 
     val state: StateFlow<SettingsUi> =
-        combine(source.settings, clearing, lastClear) { v, c, l -> SettingsUi(v, c, l) }
+        combine(source.settings, clearing, lastClear, clearFailed) { v, c, l, f -> SettingsUi(v, c, l, f) }
             .stateIn(scope, SharingStarted.Eagerly, SettingsUi(initial))
 
     /** Whether the "Clear partial files?" confirmation is up. */
@@ -486,9 +525,15 @@ class SettingsPresenter(
         if (clearing.value) return
         clearing.value = true
         lastClear.value = null
+        clearFailed.value = false
         scope.launch {
             try {
                 lastClear.value = source.clearPartialFiles()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // An I/O or storage error in the app layer must not take the app down; the tab says it failed.
+                clearFailed.value = true
             } finally {
                 clearing.value = false
             }

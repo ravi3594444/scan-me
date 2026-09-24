@@ -59,6 +59,8 @@ data class HistoryFile(
     val kind: FileKind,
     /** False when the file failed or is gone from disk; the row is shown without the open action. */
     val openable: Boolean,
+    /** The type it was saved with, if known (the installer warning, F‑D5). */
+    val mime: String? = null,
 )
 
 /** A calendar date for day headers, from the app's local calendar. */
@@ -251,4 +253,6 @@ data class SettingsUi(
     val values: SettingsValues,
     val clearingPartials: Boolean = false,
     val lastClear: ClearPartialsResult? = null,
+    /** The last "Clear partial files" failed (the app layer threw); the tab says so and the button stays available. */
+    val clearFailed: Boolean = false,
 )

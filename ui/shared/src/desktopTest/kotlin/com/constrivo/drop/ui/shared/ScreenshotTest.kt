@@ -12,11 +12,14 @@ import com.constrivo.drop.ui.shared.model.DashboardTab
 import com.constrivo.drop.ui.shared.model.FileKind
 import com.constrivo.drop.ui.shared.model.FilePickerUi
 import com.constrivo.drop.ui.shared.model.FileThumb
+import com.constrivo.drop.ui.shared.model.InstallerWarningUi
 import com.constrivo.drop.ui.shared.model.OemBrand
 import com.constrivo.drop.ui.shared.model.PickableUi
 import com.constrivo.drop.ui.shared.model.PickedItem
 import com.constrivo.drop.ui.shared.model.PickerTab
+import com.constrivo.drop.ui.shared.model.PickerTarget
 import com.constrivo.drop.ui.shared.model.RadarUiState
+import com.constrivo.drop.ui.shared.model.SenderPairingUi
 import com.constrivo.drop.ui.shared.model.ShowQrUi
 import com.constrivo.drop.ui.shared.onboarding.BrandStepCallbacks
 import com.constrivo.drop.ui.shared.onboarding.BrandStepScreen
@@ -29,6 +32,9 @@ import com.constrivo.drop.ui.shared.receive.BrowserApprovalCallbacks
 import com.constrivo.drop.ui.shared.receive.BrowserApprovalSheet
 import com.constrivo.drop.ui.shared.receive.IncomingCallbacks
 import com.constrivo.drop.ui.shared.receive.IncomingCard
+import com.constrivo.drop.ui.shared.receive.InstallerWarningSheet
+import com.constrivo.drop.ui.shared.receive.SenderPairingCallbacks
+import com.constrivo.drop.ui.shared.receive.SenderPairingSheet
 import com.constrivo.drop.ui.shared.send.FilePickerCallbacks
 import com.constrivo.drop.ui.shared.send.FilePickerSheet
 import com.constrivo.drop.ui.shared.send.ShowQrCallbacks
@@ -160,8 +166,15 @@ class ScreenshotTest {
                         matrix = QrMatrix.encode("drop1.AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5"),
                         fallbackCode = "318204",
                         refreshFraction = 0.3f,
-                        browserHint = BrowserShareHint("DIRECT-xy-Drop", "k7Qm2pX9", "http://drop.local:8765/t/7h2kq9x3m4pz/"),
+                        browserHint =
+                            BrowserShareHint(
+                                "DIRECT-xy-Drop",
+                                "k7Qm2pX9",
+                                "http://drop.local:8765/t/7h2kq9x3m4pz/",
+                                "http://192.168.49.1:8765/t/7h2kq9x3m4pz/",
+                            ),
                         browserStarting = false,
+                        browserMatrix = QrMatrix.encode("http://192.168.49.1:8765/t/7h2kq9x3m4pz/"),
                     ),
                     ShowQrCallbacks(),
                 )
@@ -174,8 +187,7 @@ class ScreenshotTest {
             OverRadar("picker", heightFraction = 0.8f) {
                 FilePickerSheet(
                     FilePickerUi(
-                        targetKey = "t:rohan",
-                        targetName = "Rohan's Pixel",
+                        target = PickerTarget.Device("t:rohan", "Rohan's Pixel"),
                         tabs = listOf(PickerTab.PHOTOS, PickerTab.FILES),
                         tab = PickerTab.PHOTOS,
                         photos =
@@ -216,6 +228,21 @@ class ScreenshotTest {
                     BrowserApprovalCallbacks(),
                 )
             }
+        }
+
+    @Test
+    fun installerWarning() =
+        Screenshots.check("installer_warning") {
+            OverRadar("installer") { InstallerWarningSheet(InstallerWarningUi("WhatsApp.apk", "Dev"), onOpen = {}, onCancel = {}) }
+        }
+
+    @Test
+    fun shareBannerWithNames() = Screenshots.check("radar_share_banner") { Radar(Samples.shareBanner) }
+
+    @Test
+    fun senderPairing() =
+        Screenshots.check("sender_pairing") {
+            OverRadar("pairing") { SenderPairingSheet(SenderPairingUi("tx", "Rohan's Pixel", "042917"), SenderPairingCallbacks()) }
         }
 
     @Composable

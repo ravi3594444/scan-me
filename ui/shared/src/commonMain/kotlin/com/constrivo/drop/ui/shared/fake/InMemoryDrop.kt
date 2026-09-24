@@ -1,10 +1,12 @@
 package com.constrivo.drop.ui.shared.fake
 
 import com.constrivo.drop.core.discovery.NearbyDevice
+import com.constrivo.drop.core.discovery.SystemWallClock
 import com.constrivo.drop.core.discovery.Visibility
+import com.constrivo.drop.core.discovery.WallClock
 import com.constrivo.drop.ui.shared.model.AppLanguage
 import com.constrivo.drop.ui.shared.model.AttachedFiles
-import com.constrivo.drop.ui.shared.model.BrowserShareHint
+import com.constrivo.drop.ui.shared.model.BrowserShareState
 import com.constrivo.drop.ui.shared.model.ClearPartialsResult
 import com.constrivo.drop.ui.shared.model.HistoryEntry
 import com.constrivo.drop.ui.shared.model.HistoryFile
@@ -47,6 +49,8 @@ import kotlinx.coroutines.flow.update
 class InMemoryDrop(
     self: SelfProfile = SelfProfile(nickname = "", deviceKey = "self"),
     settingsValues: SettingsValues = defaultSettings(self.nickname),
+    /** The clock the "Everyone for 10 min" window ends on (the same one the controller's presenters use). */
+    private val wallClock: WallClock = SystemWallClock,
 ) : RadarActions,
     IncomingActions,
     LiveActions,
@@ -73,7 +77,11 @@ class InMemoryDrop(
     val mediaItems = MutableStateFlow<List<PickedItem>>(emptyList())
     val mediaAccessState = MutableStateFlow(true)
     val appItems = MutableStateFlow<List<PickedItem>>(emptyList())
-    val hint = MutableStateFlow<BrowserShareHint?>(null)
+    val browserShareState = MutableStateFlow<BrowserShareState>(BrowserShareState.Idle)
+
+    /** How often the picker asked for more media ([requestMore]). */
+    var mediaPageRequests: Int = 0
+        private set
 
     /** The code "Show my code" displays; null makes [current] fail (no code yet). */
     var code: MyCode? = null
@@ -124,7 +132,10 @@ class InMemoryDrop(
 
     override fun resume(transferId: String) = record("resume:$transferId")
 
-    override fun addFiles(transferId: String) = record("add:$transferId")
+    override fun addFiles(
+        transferId: String,
+        files: AttachedFiles,
+    ) = record("add:$transferId:${files.count}")
 
     // HistorySource
     override val history: Flow<List<HistoryEntry>> get() = historyEntries
@@ -178,7 +189,9 @@ class InMemoryDrop(
     override fun setVisibility(mode: Visibility) {
         record("visibility:$mode")
         settingsState.update { it.copy(visibility = mode) }
-        visibility.value = VisibilityState(mode)
+        // Like core/data's VisibilityPreference: the 10-minute window ends on the wall clock, then Trusted only.
+        val end = if (mode == Visibility.EVERYONE_TEN_MINUTES) wallClock.nowMillis() + TEN_MINUTES_MILLIS else null
+        visibility.value = VisibilityState(mode, expiresAtMillis = end)
     }
 
     override fun setPrefer5Ghz(enabled: Boolean) = setting("prefer5Ghz:$enabled") { it.copy(prefer5Ghz = enabled) }
@@ -220,14 +233,26 @@ class InMemoryDrop(
     // MyCodeSource
     override suspend fun current(): MyCode = code ?: throw IllegalStateException("no code configured")
 
-    override val browserHint: Flow<BrowserShareHint?> get() = hint
+    override val browserShare: Flow<BrowserShareState> get() = browserShareState
 
-    override fun startBrowserShare() = record("startBrowserShare")
+    override fun startBrowserShare(files: AttachedFiles) {
+        record("startBrowserShare:${files.count}")
+        browserShareState.value = BrowserShareState.Starting
+    }
+
+    override fun stopBrowserShare() {
+        record("stopBrowserShare")
+        browserShareState.value = BrowserShareState.Idle
+    }
 
     // MediaLibrary
     override val media: Flow<List<PickedItem>> get() = mediaItems
     override val mediaAccess: Flow<Boolean> get() = mediaAccessState
     override val apps: Flow<List<PickedItem>> get() = appItems
+
+    override fun requestMore() {
+        mediaPageRequests++
+    }
 
     // PlatformActions
     override fun turnOnBluetooth() = record("turnOnBluetooth")
@@ -251,6 +276,8 @@ class InMemoryDrop(
     override fun openBrandSettings(brand: OemBrand) = record("brandSettings:$brand")
 
     companion object {
+        private const val TEN_MINUTES_MILLIS = 10 * 60_000L
+
         fun defaultSettings(nickname: String): SettingsValues =
             SettingsValues(
                 visibility = VisibilityState.DEFAULT.mode,

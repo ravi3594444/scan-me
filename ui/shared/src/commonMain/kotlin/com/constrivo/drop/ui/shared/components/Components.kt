@@ -209,6 +209,19 @@ fun ProgressRing(
     modifier: Modifier = Modifier,
     strokeWidth: Dp = DropDimens.progressRing,
     trackColor: Color = Color.Transparent,
+) = ProgressRing({ fraction }, color, modifier, strokeWidth, trackColor)
+
+/**
+ * A clockwise progress ring from 12 o'clock whose [fraction] is read only while drawing: an animated value then
+ * redraws the ring every frame without recomposing it or its parent (F‑C4: 60 fps during a transfer).
+ */
+@Composable
+fun ProgressRing(
+    fraction: () -> Float,
+    color: Color,
+    modifier: Modifier = Modifier,
+    strokeWidth: Dp = DropDimens.progressRing,
+    trackColor: Color = Color.Transparent,
 ) {
     Canvas(modifier = modifier) {
         val stroke = strokeWidth.toPx()
@@ -217,7 +230,7 @@ fun ProgressRing(
         if (trackColor.alpha > 0f) {
             drawArc(trackColor, 0f, 360f, useCenter = false, topLeft = Offset(inset, inset), size = arcSize, style = Stroke(stroke))
         }
-        val sweep = 360f * fraction.coerceIn(0f, 1f)
+        val sweep = 360f * fraction().coerceIn(0f, 1f)
         if (sweep > 0f) {
             drawArc(
                 color,

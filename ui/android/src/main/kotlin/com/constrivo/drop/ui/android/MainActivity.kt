@@ -34,6 +34,9 @@ import com.constrivo.drop.ui.shared.DropApp
 class MainActivity : ComponentActivity() {
     private val graph: AppGraph get() = (application as DropApplication).graph
 
+    /** The share this activity received (its read grants live and die with this activity), if any. */
+    private var shareId: String? = null
+
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { graph.permissions.onPermissionsResult(it) }
     private val screenLauncher =
@@ -72,31 +75,55 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         graph.bridge.attach(host)
-        // A recreated activity (rotation, process restore) must not attach the same share twice.
-        if (savedInstanceState == null) graph.handleIntent(intent)
+        // A recreated activity must not attach the same share twice (rotation), but must read it again when the
+        // process died while it was still waiting (the grants survive with the activity, the controller does not).
+        val saved = savedInstanceState?.getString(KEY_SHARE_ID)
+        val pending = savedInstanceState?.getBoolean(KEY_SHARE_PENDING) == true
+        val live = saved != null && graph.shareLive(saved)
+        shareId =
+            when (ShareRestore.decide(savedInstanceState != null, saved, pending, live)) {
+                ShareRestore.Action.HANDLE -> graph.handleIntent(intent, host)
+                ShareRestore.Action.ADOPT -> saved?.also { graph.adoptShare(it, host) }
+                ShareRestore.Action.SKIP -> null
+            }
         setContent { ActivityContent(graph) }
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        graph.handleIntent(intent)
+        graph.handleIntent(intent, host)?.let { shareId = it }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        shareId?.let {
+            outState.putString(KEY_SHARE_ID, it)
+            outState.putBoolean(KEY_SHARE_PENDING, graph.shareLive(it))
+        }
     }
 
     override fun onStart() {
         super.onStart()
         graph.bridge.attach(host)
-        graph.onForeground()
+        graph.onHostStarted()
+    }
+
+    override fun onStop() {
+        graph.onHostStopped()
+        super.onStop()
     }
 
     override fun onDestroy() {
         graph.bridge.detach(host)
-        if (!isChangingConfigurations) graph.permissions.onHostFinished(host)
+        if (!isChangingConfigurations) graph.onHostFinished(host)
         super.onDestroy()
     }
 
     private companion object {
         const val ANY_TYPE = "*/*"
+        const val KEY_SHARE_ID = "drop.shareId"
+        const val KEY_SHARE_PENDING = "drop.sharePending"
     }
 }
 
@@ -107,7 +134,13 @@ private fun ActivityContent(graph: AppGraph) {
     BackHandler(enabled = canGoBack) { controller.back() }
     val view = LocalView.current
     val haptics = remember(view) { AndroidHaptics(view, graph::hapticsEnabled) }
-    DropApp(controller, reducedMotion = rememberReducedMotion(), haptics = haptics)
+    // Settings "Keep screen awake" (design §6): on while the setting is on and a transfer is moving.
+    val keepScreenOn by controller.keepScreenOn.collectAsState()
+    DisposableEffect(view, keepScreenOn) {
+        view.keepScreenOn = keepScreenOn
+        onDispose { view.keepScreenOn = false }
+    }
+    DropApp(controller, reducedMotion = rememberReducedMotion(), haptics = haptics, applyLanguage = graph.languageInApp)
 }
 
 /** The system's "Remove animations" setting, followed while the activity shows (design §3.3 reduced motion). */

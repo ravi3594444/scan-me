@@ -15,6 +15,7 @@ import kotlin.math.round
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -82,18 +83,50 @@ class FormatsTest {
             BrowserNames.describe(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36",
             )
-        assertEquals(BrowserDescription("Chrome", "Linux", null), chrome)
+        assertEquals(BrowserDescription("Chrome", "Linux"), chrome)
         assertEquals("Edge", BrowserNames.describe("Mozilla/5.0 (Windows NT 10.0) Chrome/140.0 Safari/537.36 Edg/140.0")?.browser)
         assertEquals("Safari", BrowserNames.describe("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) Version/17.0 Safari/605.1.15")?.browser)
         val odd = BrowserNames.describe("curl/8.0\u0007\n" + "x".repeat(200))
-        assertEquals(60, odd?.raw?.length)
-        assertTrue(odd?.raw?.none { it.code < 0x20 } == true)
+        assertEquals(BrowserDescription(null, null), odd, "an unrecognised agent is never quoted")
+        assertTrue(odd!!.isUnknown)
         assertNull(BrowserNames.describe("   "))
         assertNull(BrowserNames.describe(null))
+    }
+
+    @Test
+    fun n15_craftedAgentsCannotSpeakInThePrompt() {
+        // Text of the attacker's choosing, with a right-to-left override to reorder it: nothing of it is shown.
+        val crafted = BrowserNames.describe("Asha's laptop (this is your computer) \u202Eexe.gpj")
+        assertEquals(BrowserDescription(null, null), crafted)
+        // Format characters cannot split a recognised token either way.
+        assertEquals("Firefox", BrowserNames.describe("Mozilla/5.0 Fire\u200Bfox/130.0")?.browser, "zero-width space removed")
+        assertEquals("Windows", BrowserNames.describe("Win\u2066dows NT")?.os, "isolate controls removed")
     }
 }
 
 class FileModelsTest {
+    @Test
+    fun fD5_installersAndExecutablesAreRecognised() {
+        fun installer(
+            name: String,
+            mime: String? = null,
+            kind: FileKind = FileKind.OTHER,
+        ) = InstallerFiles.isInstaller(name, mime, kind)
+        assertTrue(installer("WhatsApp.apk"))
+        assertTrue(installer("setup.EXE"), "extensions in any case")
+        assertTrue(installer("photo.jpg.exe"), "the last extension counts")
+        assertTrue(installer("invoice.pdf.bat. "), "Windows ignores trailing dots and spaces")
+        assertTrue(installer("run.sh"))
+        assertTrue(installer("Tool.dmg"))
+        assertTrue(installer("package", mime = "application/vnd.android.package-archive"), "the type counts without an extension")
+        assertTrue(installer("x", mime = "application/x-msdownload; charset=binary"))
+        assertTrue(installer("Maps", kind = FileKind.APP))
+        assertFalse(installer("IMG_0042.jpg", "image/jpeg", FileKind.IMAGE))
+        assertFalse(installer("notes.txt"))
+        assertFalse(installer("apk"), "no extension")
+        assertFalse(installer("archive."))
+    }
+
     @Test
     fun mimeTypesMapToKinds() {
         assertEquals(FileKind.IMAGE, FileKind.fromMime("image/jpeg"))

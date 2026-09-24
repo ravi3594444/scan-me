@@ -20,9 +20,17 @@ every empty and error state and copy key of §8, and the accessibility rules of 
 | `fake` | `InMemoryDrop`, an in-memory implementation of every port, for tests, previews and the apps until the engine is wired |
 
 App layers implement the ports in `DropDependencies` (devices, transfers, offers, History, trusted devices, stats,
-settings, the QR code, media, permissions, platform actions, calendar and clocks), create a `DropAppController` and
-call `DropApp(controller, …)`. The browser-receive approval plugs in as
-`BrowserApprover { r -> controller.browserApproval.ask(r.browserNumber, r.remoteAddress, r.userAgent) }`.
+settings, the QR code and browser page, media, permissions, platform actions, calendar and clocks), create a
+`DropAppController` and call `DropApp(controller, …)`. The browser-receive approval plugs in as
+`BrowserApprover { r -> controller.browserApproval.ask(r.browserNumber, r.remoteAddress, r.userAgent) }`. Hosts also
+report their lifecycle (`onHostStarted` / `onHostStopped`: "Show my code" stops ticking in the background), apply
+`keepScreenOn`, and either let `DropApp` apply Settings → Language or apply it themselves (`applyLanguage = false`).
+
+Safety rules the shared UI enforces: a received installer or executable asks before it opens (F‑D5,
+`InstallerFiles`); the prompts that appear unasked ("Allow this computer?", the incoming card, the code confirmations)
+ignore taps for their first 600 ms (`TapGuard`) and keep their buttons on screen at 200% text; a sheet hides what is
+under it from screen readers; the browser's user agent is never quoted; every send path asks for Android 12's
+location permission first; a direct share that does not find its device within 45 s waits for a tap.
 
 ## Strings
 
@@ -47,8 +55,10 @@ design §8 copy and the `core/ladder` badge and hint texts are mirrored exactly.
 ### Screenshots
 
 The references are `src/desktopTest/resources/screenshots/*.png`. A pixel differs when a colour channel differs by
-more than 24; a case passes while at most 0.3% of its pixels differ (anti-aliasing noise between Skia builds). A
-failing case writes the actual image and a diff (differing pixels in magenta) to `build/reports/screenshots/`.
+more than 24; a case passes while at most 0.05% of its pixels differ (anti-aliasing noise between Skia builds, not a
+changed digit or word). The texts that carry numbers (speed line, badge, hint, chip) are checked exactly on the
+semantics tree as well. A failing case writes the actual image and a diff (differing pixels in magenta) to
+`build/reports/screenshots/`.
 
 After an intended visual change, re-record, look at every changed PNG, and commit them:
 

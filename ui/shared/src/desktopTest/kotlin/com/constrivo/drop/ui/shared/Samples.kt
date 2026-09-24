@@ -8,7 +8,10 @@ import com.constrivo.drop.core.ladder.TransportBadge
 import com.constrivo.drop.core.protocol.LinkKind
 import com.constrivo.drop.ui.shared.dashboard.DashboardUiState
 import com.constrivo.drop.ui.shared.model.AppLanguage
+import com.constrivo.drop.ui.shared.model.AttachmentUi
 import com.constrivo.drop.ui.shared.model.Avatars
+import com.constrivo.drop.ui.shared.model.BrowserApprovalUi
+import com.constrivo.drop.ui.shared.model.BrowserNames
 import com.constrivo.drop.ui.shared.model.BubbleActivity
 import com.constrivo.drop.ui.shared.model.BubbleUi
 import com.constrivo.drop.ui.shared.model.DashboardTab
@@ -154,6 +157,17 @@ object Samples {
         )
 
     val bluetoothOff = radar(notice = RadarNotice.BLUETOOTH_OFF)
+
+    val shareBanner =
+        radar(Samples.threeDevices).copy(
+            attachment =
+                AttachmentUi(
+                    ItemSummary(12, SummaryKind.PHOTOS),
+                    48_000_000,
+                    names = listOf("IMG_2034.jpg", "IMG_2035.jpg"),
+                    moreCount = 10,
+                ),
+        )
 
     val tray =
         radar(
@@ -339,6 +353,14 @@ object Samples {
                 haptics = true,
                 appVersion = "0.1.0",
             ),
+        )
+
+    val browserApproval =
+        BrowserApprovalUi(
+            requestId = 1,
+            browserNumber = 1,
+            remoteAddress = "192.168.49.23",
+            browser = BrowserNames.describe("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36"),
         )
 
     fun dashboard(tab: DashboardTab) = DashboardUiState(tab, live, history, devices, stats, settings)

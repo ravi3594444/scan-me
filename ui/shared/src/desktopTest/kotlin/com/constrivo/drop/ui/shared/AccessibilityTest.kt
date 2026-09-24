@@ -14,30 +14,52 @@ import androidx.compose.ui.semantics.SemanticsNode
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.ExperimentalTestApi
+import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.SkikoComposeUiTest
+import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onRoot
+import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.v2.runSkikoComposeUiTest
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.LayoutDirection
+import com.constrivo.drop.core.discovery.SystemWallClock
+import com.constrivo.drop.ui.shared.components.LocalTapClock
 import com.constrivo.drop.ui.shared.components.SheetHost
 import com.constrivo.drop.ui.shared.components.SheetSpec
+import com.constrivo.drop.ui.shared.components.TapGuard
 import com.constrivo.drop.ui.shared.dashboard.DashboardCallbacks
 import com.constrivo.drop.ui.shared.dashboard.DashboardScreen
+import com.constrivo.drop.ui.shared.model.AppLanguage
 import com.constrivo.drop.ui.shared.model.DashboardTab
 import com.constrivo.drop.ui.shared.model.RadarUiState
+import com.constrivo.drop.ui.shared.model.ScanStatus
 import com.constrivo.drop.ui.shared.onboarding.WelcomeCallbacks
 import com.constrivo.drop.ui.shared.onboarding.WelcomeScreen
+import com.constrivo.drop.ui.shared.platform.DropHaptics
+import com.constrivo.drop.ui.shared.platform.LocalDropHaptics
+import com.constrivo.drop.ui.shared.presenter.DropAppController
+import com.constrivo.drop.ui.shared.presenter.DropDependencies
 import com.constrivo.drop.ui.shared.radar.RadarCallbacks
 import com.constrivo.drop.ui.shared.radar.RadarScreen
+import com.constrivo.drop.ui.shared.receive.BrowserApprovalCallbacks
+import com.constrivo.drop.ui.shared.receive.BrowserApprovalSheet
 import com.constrivo.drop.ui.shared.receive.IncomingCallbacks
 import com.constrivo.drop.ui.shared.receive.IncomingCard
+import com.constrivo.drop.ui.shared.send.ScanQrCallbacks
+import com.constrivo.drop.ui.shared.send.ScanQrScreen
 import com.constrivo.drop.ui.shared.theme.DropTheme
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import java.util.Locale
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -195,7 +217,15 @@ class AccessibilityTest {
         }
         ui(fontScale = 2f) {
             show { Incoming() }
+            // The content above the buttons may scroll; Accept and Decline are always fully on screen, so the user can
+            // answer inside the 30 s countdown without scrolling.
             assertTextFits("incoming card", TestTags.INCOMING_CARD, unclipped = false)
+            assertFullyVisible("incoming card", TestTags.INCOMING_ACCEPT)
+            assertFullyVisible("incoming card", TestTags.INCOMING_DECLINE)
+        }
+        ui(fontScale = 2f) {
+            show { OverRadar { BrowserApprovalSheet(Samples.browserApproval, BrowserApprovalCallbacks()) } }
+            assertFullyVisible("allow this computer", TestTags.BROWSER_ALLOW)
         }
         ui(fontScale = 2f) {
             show { Radar(Samples.bluetoothOff) }
@@ -206,6 +236,154 @@ class AccessibilityTest {
             assertTextFits("settings", TestTags.DASHBOARD, unclipped = false)
         }
     }
+
+    /** The node tagged [tag] is laid out whole and not clipped by any parent or the screen. */
+    private fun SkikoComposeUiTest.assertFullyVisible(
+        where: String,
+        tag: String,
+    ) {
+        val node = onNodeWithTag(tag, useUnmergedTree = true).fetchSemanticsNode()
+        val screen = onRoot().fetchSemanticsNode().boundsInRoot
+        val b = node.boundsInRoot
+        assertTrue(b.width >= node.size.width - 0.5f && b.height >= node.size.height - 0.5f, "$where: $tag is clipped at 200% ($b)")
+        assertTrue(b.bottom <= screen.bottom + 0.5f && b.top >= screen.top - 0.5f, "$where: $tag is off screen at 200% ($b)")
+    }
+
+    @Composable
+    private fun OverRadar(sheet: @Composable () -> Unit) =
+        SheetHost(SheetSpec("sheet", content = sheet), onDismiss = {}) { Radar(Samples.radar(Samples.threeDevices)) }
+
+    @Test
+    fun designSection11_sheetsAreModalForScreenReaders() =
+        ui {
+            show { Incoming() }
+            val hidden = SemanticsMatcher.keyIsDefined(SemanticsProperties.HideFromAccessibility)
+            onNode(hasTestTag(TestTags.bubble("t:rohan")) and hasAnyAncestor(hidden), useUnmergedTree = true).assertExistsCompat()
+            onNode(hasTestTag(TestTags.RADAR_BOTTOM_BAR) and hasAnyAncestor(hidden), useUnmergedTree = true).assertExistsCompat()
+            val accept = onNodeWithTag(TestTags.INCOMING_ACCEPT, useUnmergedTree = true)
+            accept.assert(!hasAnyAncestor(hidden) and !hidden)
+        }
+
+    /** Shows [content] with a tap clock the test moves; returns a setter for "now". */
+    private fun SkikoComposeUiTest.showWithTapClock(content: @Composable () -> Unit): (Long) -> Unit {
+        var now by mutableStateOf(0L)
+        show { CompositionLocalProvider(LocalTapClock provides { now }, content = content) }
+        return { now = it }
+    }
+
+    @Test
+    fun securityPromptsIgnoreTapsWhileTheyAppear() {
+        ui {
+            var allowed = 0
+            val setNow =
+                showWithTapClock { BrowserApprovalSheet(Samples.browserApproval, BrowserApprovalCallbacks(onAllow = { allowed++ })) }
+            onNodeWithTag(TestTags.BROWSER_ALLOW).performClick()
+            waitForIdle()
+            assertEquals(0, allowed, "a tap meant for what was underneath grants nothing")
+            setNow(TapGuard.ARM_MILLIS)
+            onNodeWithTag(TestTags.BROWSER_ALLOW).performClick()
+            waitForIdle()
+            assertEquals(1, allowed, "a deliberate tap works once the prompt has settled")
+        }
+        ui {
+            var accepted = 0
+            var confirmed = 0
+            val setNow =
+                showWithTapClock {
+                    IncomingCard(
+                        Samples.incoming(trusted = false),
+                        IncomingCallbacks(onAccept = {
+                            accepted++
+                        }, onSasConfirmed = { confirmed++ }),
+                    )
+                }
+            onNodeWithTag(TestTags.INCOMING_ACCEPT).performClick()
+            onNodeWithText("Yes, it matches").performClick()
+            waitForIdle()
+            assertEquals(0 to 0, accepted to confirmed)
+            setNow(TapGuard.ARM_MILLIS)
+            onNodeWithTag(TestTags.INCOMING_ACCEPT).performClick()
+            onNodeWithText("Yes, it matches").performClick()
+            waitForIdle()
+            assertEquals(1 to 1, accepted to confirmed)
+        }
+    }
+
+    @Test
+    fun designSection44_aScannedCodePlaysTheHaptic() =
+        ui {
+            var scanned = 0
+            val haptics =
+                object : DropHaptics {
+                    override fun confirm() = Unit
+
+                    override fun scanned() {
+                        scanned++
+                    }
+                }
+            var status by mutableStateOf(ScanStatus.SCANNING)
+            show { CompositionLocalProvider(LocalDropHaptics provides haptics) { ScanQrScreen(status, ScanQrCallbacks()) } }
+            waitForIdle()
+            assertEquals(0, scanned)
+            status = ScanStatus.SUCCESS
+            waitForIdle()
+            assertEquals(1, scanned)
+            onNodeWithText("Found it").assertExistsCompat()
+        }
+
+    @Test
+    fun screenshotsKeyTextsAreExact() =
+        ui {
+            // The screenshots guard layout; the texts that carry numbers are checked exactly here.
+            show { Radar(Samples.sendingRadar) }
+            // The resources put no-break spaces between numbers and units.
+            onNode(hasText("44\u00A0MB/s · 45\u00A0s left"), useUnmergedTree = true).assertExistsCompat()
+            onNode(hasText("Wi‑Fi Direct · 2.4 GHz"), useUnmergedTree = true).assertExistsCompat()
+            onNode(hasText("Move closer for full speed"), useUnmergedTree = true).assertExistsCompat()
+            onNode(hasText("Everyone · 7\u00A0min"), useUnmergedTree = true).assertExistsCompat()
+        }
+
+    @Test
+    fun designSection43_theShareBannerNamesTheFiles() =
+        ui {
+            show { Radar(Samples.shareBanner) }
+            onNode(hasText("Sending 12 photos · 48\u00A0MB — tap a device"), useUnmergedTree = true).assertExistsCompat()
+            onNode(hasText("IMG_2034.jpg, IMG_2035.jpg and 10 more"), useUnmergedTree = true).assertExistsCompat()
+        }
+
+    @Test
+    fun fI4_theStatsAxisDoesNotMirrorInRightToLeftLayouts() =
+        ui {
+            show {
+                CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+                    DashboardScreen(Samples.dashboard(DashboardTab.STATS), DashboardCallbacks())
+                }
+            }
+            val thisWeek = onNode(hasText("This week"), useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
+            val oldest = onNode(hasText("11 weeks ago"), useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
+            assertTrue(thisWeek.left > oldest.left, "\"This week\" stays under the newest bar, on the right")
+        }
+
+    @Test
+    fun decision9_theLanguageSettingAppliesWithoutARestart() =
+        ui {
+            val previous = Locale.getDefault()
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+            try {
+                val controller = DropAppController(scope, DropDependencies.inMemory(wallClock = SystemWallClock))
+                setContent { DropApp(controller, fontFamily = Screenshots.testFont, dark = false) }
+                onNode(hasText("Nearby"), useUnmergedTree = true).assertExistsCompat()
+                controller.dashboard.settings.setLanguage(AppLanguage.HINDI)
+                waitForIdle()
+                onNode(hasText("आस-पास"), useUnmergedTree = true).assertExistsCompat()
+                controller.dashboard.settings.setLanguage(AppLanguage.SYSTEM)
+                waitForIdle()
+                onNode(hasText("Nearby"), useUnmergedTree = true).assertExistsCompat()
+            } finally {
+                scope.cancel()
+                Locale.setDefault(previous)
+            }
+        }
 
     @Test
     fun decision9_hindiLocaleUsesTheHindiStrings() =

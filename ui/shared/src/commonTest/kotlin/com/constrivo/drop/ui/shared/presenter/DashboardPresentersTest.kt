@@ -6,6 +6,7 @@ import com.constrivo.drop.ui.shared.Fixtures
 import com.constrivo.drop.ui.shared.VirtualClocks
 import com.constrivo.drop.ui.shared.fake.InMemoryDrop
 import com.constrivo.drop.ui.shared.model.AppLanguage
+import com.constrivo.drop.ui.shared.model.AttachedFiles
 import com.constrivo.drop.ui.shared.model.ClearPartialsResult
 import com.constrivo.drop.ui.shared.model.DashboardTab
 import com.constrivo.drop.ui.shared.model.DayDate
@@ -17,6 +18,7 @@ import com.constrivo.drop.ui.shared.model.HistoryFile
 import com.constrivo.drop.ui.shared.model.HistoryStatus
 import com.constrivo.drop.ui.shared.model.ItemSummary
 import com.constrivo.drop.ui.shared.model.LastSeen
+import com.constrivo.drop.ui.shared.model.PickedItem
 import com.constrivo.drop.ui.shared.model.StatsSnapshot
 import com.constrivo.drop.ui.shared.model.SummaryKind
 import com.constrivo.drop.ui.shared.model.TransferStage
@@ -70,8 +72,9 @@ class DashboardPresentersTest {
             live.pause("a")
             live.resume("a")
             live.cancel("a")
-            live.addFiles("a")
-            assertEquals(listOf("pause:a", "resume:a", "cancel:a", "add:a"), fake.calls)
+            live.addFiles("a", AttachedFiles(emptyList()))
+            live.addFiles("a", AttachedFiles(listOf(PickedItem("u", "b.pdf", 1, FileKind.DOCUMENT))))
+            assertEquals(listOf("pause:a", "resume:a", "cancel:a", "add:a:1"), fake.calls, "F‑C5: the picked files reach the engine")
         }
 
     @Test
@@ -249,6 +252,66 @@ class DashboardPresentersTest {
             runCurrent()
             assertFalse(settings.state.value.clearingPartials)
             assertEquals(5, settings.state.value.lastClear?.bytesFreed)
+        }
+
+    @Test
+    fun aFailingClearPartialsIsReportedNotThrown() =
+        runTest {
+            val fake = InMemoryDrop()
+            var fail = true
+            val source =
+                object : SettingsSource by fake {
+                    override suspend fun clearPartialFiles(): ClearPartialsResult {
+                        if (fail) throw IllegalStateException("storage unavailable")
+                        return ClearPartialsResult(2, 7)
+                    }
+                }
+            val settings = SettingsPresenter(backgroundScope, source, fake.settingsState.value)
+            settings.confirmClearPartials()
+            runCurrent()
+            val failed = settings.state.value
+            assertTrue(failed.clearFailed, "the tab says it could not clear them")
+            assertFalse(failed.clearingPartials)
+            assertNull(failed.lastClear)
+            assertTrue(backgroundScope.coroutineContext[kotlinx.coroutines.Job]!!.isActive, "the scope survives")
+            fail = false
+            settings.confirmClearPartials()
+            runCurrent()
+            assertFalse(settings.state.value.clearFailed)
+            assertEquals(7, settings.state.value.lastClear?.bytesFreed)
+        }
+
+    @Test
+    fun fG2_historyRegroupsOnlyWhenHistoryOrTheDayChanges() =
+        runTest {
+            val fake = InMemoryDrop()
+            val clocks = VirtualClocks(this)
+            var calls = 0
+            val base = DayCalendar.fixedOffset(0)
+            val counting =
+                object : DayCalendar {
+                    override fun epochDayOf(unixMillis: Long): Long {
+                        calls++
+                        return base.epochDayOf(unixMillis)
+                    }
+
+                    override fun minuteOfDay(unixMillis: Long): Int = base.minuteOfDay(unixMillis)
+                }
+            fake.historyEntries.value = List(1_000) { entry("h$it", clocks.nowMillis() - it * 60_000L) }
+            val history = HistoryPresenter(backgroundScope, fake, counting, clocks)
+            runCurrent()
+            assertEquals(1_000, history.state.value.days.sumOf { it.rows.size })
+            val afterGrouping = calls
+            history.openDetail("h1")
+            history.closeDetail()
+            history.askClear()
+            history.dismissClear()
+            advanceTimeBy(10 * 60_000L)
+            runCurrent()
+            assertTrue(
+                calls - afterGrouping <= 20,
+                "opening sheets and minute ticks do not regroup 1,000 rows (${calls - afterGrouping} lookups)",
+            )
         }
 
     @Test

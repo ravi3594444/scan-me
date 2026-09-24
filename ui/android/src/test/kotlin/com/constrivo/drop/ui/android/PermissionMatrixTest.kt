@@ -114,4 +114,22 @@ class PermissionMatrixTest {
         val denied = mapOf(Manifest.permission.CAMERA to false, Manifest.permission.BLUETOOTH_SCAN to true)
         assertEquals(setOf(Manifest.permission.CAMERA), PermissionMatrix.deniedWithRationale(denied, every))
     }
+
+    @Test
+    fun fI1_withoutAnActivityADenialIsNeverReadAsBlocked() {
+        val scan = Manifest.permission.BLUETOOTH_SCAN
+        // Denied before, and no activity to ask for a rationale (a cold start before the first activity attaches).
+        val cold =
+            PermissionMatrix.status(
+                DropPermission.NEARBY,
+                android13,
+                none,
+                showRationale = none,
+                deniedBefore = only(scan),
+                rationaleKnown = false,
+            )
+        assertEquals(PermissionStatus.DENIED, cold, "the system dialog may still show: not blocked")
+        val known = PermissionMatrix.status(DropPermission.NEARBY, android13, none, showRationale = none, deniedBefore = only(scan))
+        assertEquals(PermissionStatus.BLOCKED, known, "with an activity, no rationale after a denial means blocked")
+    }
 }

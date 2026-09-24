@@ -5,7 +5,8 @@ import com.constrivo.drop.ui.shared.model.PickedItem
 
 /**
  * Turns what the content resolver says about shared or picked URIs into [PickedItem]s (design §4.1 Files tab, §4.3
- * share sheet). Pure, so the rules are unit-tested off-device:
+ * share sheet), and decides which streams of a share this app may read at all ([grantedStreams]). Pure, so the rules
+ * are unit-tested off-device:
  *
  * - Only `content:` URIs are accepted. A `file:` URI from another app would make this app read a path with its own
  *   rights (possibly its private files), and Android 7+ forbids sending them anyway.
@@ -29,6 +30,41 @@ internal object SharedFiles {
     )
 
     const val CONTENT_SCHEME: String = "content"
+
+    /** One stream of a share intent: its URI, its provider's authority, and whether the intent's `ClipData` has it. */
+    data class Stream(
+        val uri: String,
+        val authority: String?,
+        val inClipData: Boolean,
+    )
+
+    /**
+     * The streams this app reads on the sender's behalf (the confused-deputy guard of a share, design §4.3).
+     *
+     * `MainActivity` is exported, so any app can hand it any `content:` URI, including ones only this app can read:
+     * MediaStore rows once the picker's media permission is granted, documents under a folder this app holds a
+     * persisted grant for, this app's own providers. Reading those with this app's rights and sending them would leak
+     * the user's files on behalf of an app that has no access to them.
+     *
+     * A stream is therefore used only when the system checked that the sender may grant it: it is in the intent's
+     * `ClipData` and the intent carries [readGranted] (`FLAG_GRANT_READ_URI_PERMISSION`), which makes the system verify
+     * the grant when the sender starts the activity (the sheet's `EXTRA_STREAM` is copied into `ClipData` with that
+     * flag automatically, so every ordinary share qualifies). A URI only in `EXTRA_STREAM`, next to a `ClipData` the
+     * sender chose to leave without it, is not. Neither is a URI of one of this app's own authorities
+     * ([ownAuthorities]): the system does not check a grant the receiver would not need. On Android 15+ the manifest's
+     * `requireContentUriPermissionFromCaller` makes the system refuse such a launch outright.
+     */
+    fun grantedStreams(
+        streams: List<Stream>,
+        readGranted: Boolean,
+        ownAuthorities: Set<String>,
+    ): List<String> {
+        if (!readGranted) return emptyList()
+        return streams
+            .filter { it.inClipData && it.authority != null && it.authority !in ownAuthorities }
+            .map { it.uri }
+            .distinct()
+    }
 
     fun toItems(
         facts: List<Facts>,

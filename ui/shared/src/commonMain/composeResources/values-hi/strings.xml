@@ -40,6 +40,11 @@
     <string name="visibility_hidden_desc">कोई आपको नहीं देख सकता। आप फिर भी भेज सकते हैं।</string>
 
     <string name="share_banner">%1$s · %2$s भेजने के लिए किसी डिवाइस पर टैप करें</string>
+    <plurals name="share_banner_names_more">
+        <item quantity="one">%1$s और %2$d अन्य</item>
+        <item quantity="other">%1$s और %2$d अन्य</item>
+    </plurals>
+    <string name="share_banner_waiting">%3$s के पास आते ही %1$s · %2$s भेजे जाएँगे</string>
 
     <plurals name="summary_photos">
         <item quantity="one">%1$d फ़ोटो</item>
@@ -76,6 +81,12 @@
     <string name="send_button_empty">भेजने के लिए कुछ चुनें</string>
     <string name="picker_title">%1$s को भेजें</string>
     <string name="picker_title_unnamed">भेजें</string>
+    <string name="picker_title_add">%1$s के लिए फ़ाइलें जोड़ें</string>
+    <string name="picker_title_browser">कंप्यूटर के लिए फ़ाइलें</string>
+    <plurals name="add_button">
+        <item quantity="one">%1$d आइटम जोड़ें · %2$s</item>
+        <item quantity="other">%1$d आइटम जोड़ें · %2$s</item>
+    </plurals>
     <string name="picker_tab_photos">फ़ोटो</string>
     <string name="picker_tab_files">फ़ाइलें</string>
     <string name="picker_tab_apps">ऐप</string>
@@ -141,6 +152,11 @@
     <string name="qr_computer_hint">बिना ऐप वाले कंप्यूटर पर खोलें: Wi‑Fi %1$s से जुड़ें, पासवर्ड %2$s, फिर %3$s खोलें</string>
     <string name="qr_computer_start">बिना ऐप वाले कंप्यूटर पर भेजें</string>
     <string name="qr_computer_starting">नेटवर्क शुरू हो रहा है…</string>
+    <string name="qr_computer_ip">अगर यह पता न खुले, तो %1$s खोलें</string>
+    <string name="qr_computer_failed">कंप्यूटर के लिए नेटवर्क शुरू नहीं हो सका।</string>
+    <string name="qr_computer_retry">फिर से कोशिश करें</string>
+    <string name="qr_show_browser_code">पेज का कोड दिखाएँ</string>
+    <string name="qr_show_app_code">मेरा ऐप कोड दिखाएँ</string>
 
     <string name="scan_prompt">पाने वाले का कोड स्कैन करें</string>
     <string name="scan_success">मिल गया</string>
@@ -159,13 +175,19 @@
     <string name="pair_confirm">हाँ, मेल खाता है</string>
     <string name="pair_confirmed">कोड की पुष्टि हो गई</string>
     <string name="pair_sender_title">%1$s पर कोड जाँचें</string>
+    <string name="pair_later">अभी नहीं</string>
 
     <string name="tray_open_folder">फ़ोल्डर खोलें</string>
+    <string name="installer_title">यह ऐप इंस्टॉलर खोलें?</string>
+    <string name="installer_body">यह %1$s की भेजी हुई ऐप इंस्टॉलर फ़ाइल है। इसे तभी खोलें जब आपको उन पर भरोसा हो।</string>
+    <string name="installer_body_unknown">यह एक ऐप इंस्टॉलर फ़ाइल है। इसे तभी खोलें जब आपको भेजने वाले पर भरोसा हो।</string>
+    <string name="installer_open">फिर भी खोलें</string>
 
     <string name="browser_title">इस कंप्यूटर को अनुमति दें?</string>
     <string name="browser_title_again">एक और कंप्यूटर जुड़ना चाहता है</string>
     <string name="browser_body">%1$s पर एक ब्राउज़र आपकी शेयर की जा रही फ़ाइलें देखना चाहता है।</string>
     <string name="browser_agent">%2$s पर %1$s</string>
+    <string name="browser_unknown">अनजान ब्राउज़र</string>
     <string name="browser_allow">अनुमति दें</string>
     <string name="browser_deny">अनुमति न दें</string>
 
@@ -273,6 +295,7 @@
     <string name="settings_clear_partials_body">फिर से शुरू होने का इंतज़ार कर रहे ट्रांसफ़र रुक जाएँगे और आगे नहीं चल पाएँगे।</string>
     <string name="settings_clear_partials_confirm">मिटाएँ</string>
     <string name="settings_clear_partials_done">%1$s खाली हुआ</string>
+    <string name="settings_clear_partials_failed">अधूरी फ़ाइलें साफ़ नहीं हो सकीं। फिर से कोशिश करें।</string>
     <string name="settings_profile">प्रोफ़ाइल</string>
     <string name="settings_nickname">उपनाम</string>
     <string name="settings_avatar">अवतार</string>
@@ -350,6 +373,7 @@
     <string name="a11y_clear_attachment">जोड़ी गई फ़ाइलें हटाएँ</string>
     <string name="a11y_visibility">दृश्यता: %1$s</string>
     <string name="a11y_qr">%1$s का कोड</string>
+    <string name="a11y_qr_browser">%1$s वाले पेज का कोड</string>
     <string name="a11y_selected">चुना गया</string>
     <string name="a11y_done">हो गया</string>
     <plurals name="a11y_incoming_seconds">

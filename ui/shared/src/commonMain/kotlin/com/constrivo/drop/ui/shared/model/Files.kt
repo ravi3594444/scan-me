@@ -153,7 +153,13 @@ data class AttachedFiles(
     val summary: ItemSummary get() = ItemSummary.of(items.map { it.kind })
 }
 
-/** A finished received file in the tray (design §5.2). */
+/**
+ * A finished received file in the tray (design §5.2).
+ *
+ * @property mime the type the file was saved with, if known; with [name] and [kind] it decides the installer warning
+ *   ([InstallerFiles], F‑D5).
+ * @property senderName who sent it, for that warning.
+ */
 @Immutable
 data class ReceivedFile(
     val id: String,
@@ -161,4 +167,111 @@ data class ReceivedFile(
     val name: String,
     val kind: FileKind,
     val thumb: FileThumb = FileThumb.Glyph(kind),
+    val mime: String? = null,
+    val senderName: String? = null,
 )
+
+/**
+ * Files that install or run code when opened (F‑D5 "APK/executable warning"): Android packages, Windows, macOS and
+ * Linux installers and executables, and scripts a double-click runs. Opening one first shows a warning sheet.
+ *
+ * The name decides as well as the type, because the type comes from the sender: a file is an installer when its MIME
+ * type or its last extension says so (after the trailing dots and spaces Windows ignores, so `photo.jpg.exe.` counts).
+ */
+object InstallerFiles {
+    fun isInstaller(
+        name: String,
+        mime: String?,
+        kind: FileKind,
+    ): Boolean {
+        if (kind == FileKind.APP) return true
+        val type = mime?.substringBefore(';')?.trim()?.lowercase()
+        if (type != null && type in MIME_TYPES) return true
+        val base = name.trimEnd('.', ' ', '\u00A0')
+        val dot = base.lastIndexOf('.')
+        if (dot < 0 || dot == base.length - 1) return false
+        return base.substring(dot + 1).lowercase() in EXTENSIONS
+    }
+
+    private val EXTENSIONS =
+        setOf(
+            // Android
+            "apk",
+            "apks",
+            "apkm",
+            "xapk",
+            "aab",
+            // Windows
+            "exe",
+            "msi",
+            "msp",
+            "msix",
+            "msixbundle",
+            "appx",
+            "appxbundle",
+            "bat",
+            "cmd",
+            "com",
+            "scr",
+            "pif",
+            "cpl",
+            "hta",
+            "js",
+            "jse",
+            "vbs",
+            "vbe",
+            "wsf",
+            "wsh",
+            "ps1",
+            "psm1",
+            "reg",
+            "lnk",
+            // macOS and Linux
+            "app",
+            "dmg",
+            "pkg",
+            "mpkg",
+            "command",
+            "sh",
+            "bash",
+            "zsh",
+            "run",
+            "deb",
+            "rpm",
+            "appimage",
+            "snap",
+            "flatpakref",
+            // Java
+            "jar",
+        )
+
+    private val MIME_TYPES =
+        setOf(
+            "application/vnd.android.package-archive",
+            "application/x-msdownload",
+            "application/x-msdos-program",
+            "application/x-ms-dos-executable",
+            "application/x-dosexec",
+            "application/vnd.microsoft.portable-executable",
+            "application/x-ms-installer",
+            "application/x-msi",
+            "application/x-ms-shortcut",
+            "application/x-bat",
+            "application/hta",
+            "application/x-executable",
+            "application/x-elf",
+            "application/x-mach-binary",
+            "application/x-sh",
+            "application/x-shellscript",
+            "application/x-csh",
+            "application/java-archive",
+            "application/x-java-archive",
+            "application/x-apple-diskimage",
+            "application/vnd.debian.binary-package",
+            "application/x-debian-package",
+            "application/x-rpm",
+            "application/x-redhat-package-manager",
+            "application/vnd.appimage",
+            "application/x-iso9660-appimage",
+        )
+}

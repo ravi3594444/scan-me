@@ -27,7 +27,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.AbsoluteAlignment
@@ -50,7 +49,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import com.constrivo.drop.core.discovery.Ring
 import com.constrivo.drop.ui.shared.TestTags
 import com.constrivo.drop.ui.shared.components.Avatar
 import com.constrivo.drop.ui.shared.components.BadgeChip
@@ -83,6 +84,7 @@ import com.constrivo.drop.ui.shared.theme.LocalReducedMotion
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import org.jetbrains.compose.resources.stringResource
+import kotlin.math.floor
 
 /** Rings, bubbles, the avatar and the drop flyers, laid out by [RadarFrame] for this area. */
 @Composable
@@ -96,43 +98,55 @@ internal fun RadarField(
         RadarFrame.DEFAULT_TOP_RESERVE_DP +
             (if (state.attachment != null) BANNER_RESERVE_DP else 0.0) +
             (if (state.notice != null) NOTICE_RESERVE_DP else 0.0)
+    // Placement depends only on who is where and how they rank, not on progress or every RSSI sample: keyed on that
+    // projection, a progress snapshot or a small signal wobble does not re-run the placement solver.
+    val placement = remember(state.bubbles) { state.bubbles.map(::placementKey) }
     val frame =
-        remember(state.bubbles, widthDp, heightDp, topReserve) {
+        remember(placement, widthDp, heightDp, topReserve) {
             RadarFrame.compute(state.bubbles, widthDp, heightDp, topReserveDp = topReserve)
         }
-    // Departed bubbles stay composed until their leave animation ends (design §3.3), at their last position.
-    val retained = remember { mutableStateListOf<BubbleUi>().apply { addAll(state.bubbles) } }
-    // A plain cache (not snapshot state): written while composing, read by departed bubbles.
+    // Departed bubbles stay composed until their leave animation ends (design §3.3), at their last position and as they
+    // last were. Keys only: present bubbles are always drawn from the current state.
+    val retained = remember { mutableStateListOf<String>().apply { addAll(state.bubbles.map { it.key }) } }
+    // Plain caches (not snapshot state): written while composing, read by departed and replacing bubbles.
     val lastPositions = remember { HashMap<String, DpPoint>() }
-    LaunchedEffect(state.bubbles) {
-        val current = state.bubbles.associateBy { it.key }
-        val merged = ArrayList<BubbleUi>(retained.size + state.bubbles.size)
-        for (b in retained) merged += current[b.key] ?: b
-        for (b in state.bubbles) if (merged.none { it.key == b.key }) merged += b
-        retained.clear()
-        retained.addAll(merged)
+    val lastBubbles = remember { HashMap<String, BubbleUi>() }
+    val presentKeys = remember(placement) { state.bubbles.mapTo(LinkedHashSet()) { it.key } }
+    LaunchedEffect(presentKeys) {
+        val fresh = presentKeys.filter { it !in retained }
+        if (fresh.isNotEmpty()) retained.addAll(fresh)
     }
+    val current = state.bubbles.associateBy { it.key }
+    for (b in state.bubbles) lastBubbles[b.key] = b
+    // Where a replacing bubble starts (the same stranger under a new rotating ID): its predecessor's last position.
+    val startPositions = HashMap<String, DpPoint>()
+    for (b in state.bubbles) b.replacesKey?.let { old -> lastPositions[old]?.let { startPositions[b.key] = it } }
     for ((key, point) in frame.bubbles) lastPositions[key] = point
-    val presentKeys = remember(state.bubbles) { state.bubbles.mapTo(HashSet()) { it.key } }
     val visibleKeys = frame.bubbles.keys
+    val order = retained.toList() + presentKeys.filter { it !in retained }
 
     Box(Modifier.fillMaxSize(), contentAlignment = AbsoluteAlignment.TopLeft) {
         Rings(frame, dimmed = state.ringsDimmed)
-        for (bubble in retained) {
-            val present = bubble.key in presentKeys
-            if (present && bubble.key !in visibleKeys) continue // folded into "+N more"
-            val point = frame.bubbles[bubble.key] ?: lastPositions[bubble.key] ?: continue
-            androidx.compose.runtime.key(bubble.key) {
+        for (key in order) {
+            val bubble = current[key] ?: lastBubbles[key] ?: continue
+            val present = key in current
+            if (present && key !in visibleKeys) continue // folded into "+N more"
+            val point = frame.bubbles[key] ?: lastPositions[key] ?: continue
+            androidx.compose.runtime.key(key) {
                 BubbleNode(
                     bubble = bubble,
                     present = present,
                     center = point,
+                    startAt = startPositions[key],
                     avatar = frame.avatarCenter,
-                    selected = bubble.key == state.selectedKey,
+                    selected = key == state.selectedKey,
                     callbacks = callbacks,
                     onGone = {
-                        retained.removeAll { it.key == bubble.key && it.key !in presentKeys }
-                        lastPositions.remove(bubble.key)
+                        if (key !in presentKeys) {
+                            retained.remove(key)
+                            lastPositions.remove(key)
+                            lastBubbles.remove(key)
+                        }
                     },
                 )
             }
@@ -144,6 +158,19 @@ internal fun RadarField(
         DropFlights(state.bubbles, frame)
     }
 }
+
+/** What placement depends on (RSSI only in 5 dB steps: it only ranks bubbles when a ring overflows). */
+private data class PlacementKey(
+    val key: String,
+    val ring: Ring,
+    val trusted: Boolean,
+    val busy: Boolean,
+    val rssiStep: Int?,
+)
+
+private fun placementKey(b: BubbleUi) = PlacementKey(b.key, b.ring, b.trusted, b.busy, b.rssiDbm?.let { floor(it / RSSI_STEP_DB).toInt() })
+
+private const val RSSI_STEP_DB = 5.0
 
 private const val BANNER_RESERVE_DP = 64.0
 private const val NOTICE_RESERVE_DP = 104.0
@@ -231,6 +258,7 @@ private fun BubbleNode(
     bubble: BubbleUi,
     present: Boolean,
     center: DpPoint,
+    startAt: DpPoint?,
     avatar: DpPoint,
     selected: Boolean,
     callbacks: RadarCallbacks,
@@ -242,7 +270,10 @@ private fun BubbleNode(
     val size = if (bubble.trusted) DropDimens.bubbleTrusted else DropDimens.bubble
     val activity = bubble.activity
 
-    val visibility = remember { Animatable(0f) }
+    // Animated values are read only in the layout and draw phases (the Layout's measure block and graphicsLayer
+    // lambdas), so appearing, moving, scaling and popping redraw the bubble without recomposing it (F‑C4: 60 fps).
+    // A bubble that replaces another (a stranger's new rotating ID) starts where that one was, already visible.
+    val visibility = remember { Animatable(if (startAt != null) 1f else 0f) }
     LaunchedEffect(present) {
         if (present) {
             visibility.animateTo(1f, tween(DropMotion.APPEAR_MILLIS, easing = DropMotion.Decelerate))
@@ -251,13 +282,20 @@ private fun BubbleNode(
             onGone()
         }
     }
-    val x by animateFloatAsState(center.x.toFloat(), tween(DropMotion.REPOSITION_MILLIS, easing = DropMotion.Standard))
-    val y by animateFloatAsState(center.y.toFloat(), tween(DropMotion.REPOSITION_MILLIS, easing = DropMotion.Standard))
+    val origin = remember { startAt ?: center }
+    val x = remember { Animatable(origin.x.toFloat()) }
+    val y = remember { Animatable(origin.y.toFloat()) }
+    LaunchedEffect(center) {
+        val move = tween<Float>(DropMotion.REPOSITION_MILLIS, easing = DropMotion.Standard)
+        launch { x.animateTo(center.x.toFloat(), move) }
+        launch { y.animateTo(center.y.toFloat(), move) }
+    }
     val raised = activity is BubbleActivity.Active || (selected && activity == null)
-    val selectScale by animateFloatAsState(
-        if (raised) DropMotion.SELECTED_SCALE else 1f,
-        tween(DropMotion.SELECT_MILLIS, easing = DropMotion.Overshoot),
-    )
+    val selectScale =
+        animateFloatAsState(
+            if (raised) DropMotion.SELECTED_SCALE else 1f,
+            tween(DropMotion.SELECT_MILLIS, easing = DropMotion.Overshoot),
+        )
     val pop = remember { Animatable(1f) }
     if (activity is BubbleActivity.Completed) {
         LaunchedEffect(activity.token) {
@@ -266,9 +304,8 @@ private fun BubbleNode(
             pop.animateTo(1f, tween(DropMotion.COMPLETION_POP_MILLIS, easing = DropMotion.Decelerate))
         }
     }
-    val scale = if (activity is BubbleActivity.Completed) pop.value else selectScale
+    val completed = activity is BubbleActivity.Completed
     val entry = if (present) DropMotion.APPEAR_SCALE_START else DropMotion.LEAVE_SCALE_END
-    val enterScale = entry + (1f - entry) * visibility.value
 
     val name = deviceNameText(bubble.name)
     val ring = ringA11yText(bubble.ring, bubble.lanOnly)
@@ -295,8 +332,10 @@ private fun BubbleNode(
                             .align(Alignment.Center)
                             .size(size + RING_GAP)
                             .graphicsLayer {
-                                scaleX = scale * enterScale
-                                scaleY = scale * enterScale
+                                val v = visibility.value
+                                val scale = (if (completed) pop.value else selectScale.value) * (entry + (1f - entry) * v)
+                                scaleX = scale
+                                scaleY = scale
                             },
                     contentAlignment = Alignment.Center,
                 ) {
@@ -315,7 +354,7 @@ private fun BubbleNode(
                     ) {
                         Avatar(bubble.initials, bubble.avatarHash, size - 8.dp, platform = bubble.platform)
                     }
-                    BubbleRing(activity, size)
+                    BubbleRing(activity, selected, size)
                     // Platform glyph bottom-left, trust shield top-right, network glyph top-left (design §3.1, §3.2).
                     MiniGlyph(platformIcon(bubble.platform), Modifier.align(AbsoluteAlignment.BottomLeft))
                     if (bubble.trusted) {
@@ -365,8 +404,8 @@ private fun BubbleNode(
         val loose = Constraints()
         val bubblePlaceable = measurables[0].measure(loose)
         val texts = measurables[1].measure(loose)
-        val cx = x.dp.roundToPx()
-        val cy = y.dp.roundToPx()
+        val cx = x.value.dp.roundToPx()
+        val cy = y.value.dp.roundToPx()
         val half = bubblePlaceable.height / 2
         val width = if (constraints.hasBoundedWidth) constraints.maxWidth else cx * 2
         val height = if (constraints.hasBoundedHeight) constraints.maxHeight else cy * 2
@@ -416,10 +455,14 @@ private fun MiniGlyph(
     }
 }
 
-/** The 4 dp progress ring around a busy bubble: appears at 0%, fills clockwise, snaps full on completion. */
+/**
+ * The 4 dp progress ring around a busy bubble: appears at 0% when the bubble is selected (design §3.3), fills
+ * clockwise while it sends or receives, snaps full on completion. The fraction is read only while drawing.
+ */
 @Composable
 private fun BubbleRing(
     activity: BubbleActivity?,
+    selected: Boolean,
     size: Dp,
 ) {
     val colors = LocalDropColors.current
@@ -429,13 +472,14 @@ private fun BubbleRing(
             is BubbleActivity.Completed -> 1f
             else -> 0f
         }
-    val fraction by animateFloatAsState(
-        target,
-        if (activity is BubbleActivity.Active) tween(250, easing = LinearEasing) else snap(),
-    )
-    if (activity is BubbleActivity.Active || activity is BubbleActivity.Completed) {
+    val fraction =
+        animateFloatAsState(
+            target,
+            if (activity is BubbleActivity.Active) tween(250, easing = LinearEasing) else snap(),
+        )
+    if (activity is BubbleActivity.Active || activity is BubbleActivity.Completed || (selected && activity == null)) {
         ProgressRing(
-            fraction = fraction,
+            fraction = { fraction.value },
             color = if (activity is BubbleActivity.Completed) colors.success else colors.accent,
             trackColor = colors.accent.copy(alpha = 0.15f),
             modifier = Modifier.size(size + 10.dp),
@@ -603,20 +647,30 @@ private fun Flight(
         }
         onDone()
     }
+    // Each tile's progress is read only in the layout (offset) and layer lambdas: the flight moves eight tiles every
+    // frame without recomposing them.
+    val half = DropDimens.flyer / 2
     plan.tiles.forEachIndexed { i, tile ->
-        val p = progress[i].value
-        if (p <= 0f || p >= 1f) return@forEachIndexed
-        val cx = from.x + (to.x - from.x) * p
-        val cy = from.y + (to.y - from.y) * p
-        val s = 1f - (1f - DropMotion.FLYER_END_SCALE) * p
+        val anim = progress[i]
         Box(
             Modifier
-                .centeredAt(DpPoint(cx, cy), DropDimens.flyer)
-                .wrapContentSize()
+                .absoluteOffset {
+                    val p = anim.value
+                    val cx = from.x + (to.x - from.x) * p
+                    val cy = from.y + (to.y - from.y) * p
+                    IntOffset((cx.toFloat().dp - half).roundToPx(), (cy.toFloat().dp - half).roundToPx())
+                }.wrapContentSize()
                 .graphicsLayer {
+                    val p = anim.value
+                    val s = 1f - (1f - DropMotion.FLYER_END_SCALE) * p
                     scaleX = s
                     scaleY = s
-                    alpha = if (p > 0.9f) (1f - p) * 10f else 1f
+                    alpha =
+                        when {
+                            p <= 0f || p >= 1f -> 0f
+                            p > 0.9f -> (1f - p) * 10f
+                            else -> 1f
+                        }
                 },
         ) {
             when (tile) {

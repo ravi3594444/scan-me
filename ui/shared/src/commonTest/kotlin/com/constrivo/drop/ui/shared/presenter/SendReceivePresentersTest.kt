@@ -3,10 +3,13 @@ package com.constrivo.drop.ui.shared.presenter
 import com.constrivo.drop.ui.shared.Fixtures
 import com.constrivo.drop.ui.shared.VirtualClocks
 import com.constrivo.drop.ui.shared.fake.InMemoryDrop
+import com.constrivo.drop.ui.shared.model.AttachedFiles
 import com.constrivo.drop.ui.shared.model.BrowserShareHint
+import com.constrivo.drop.ui.shared.model.BrowserShareState
 import com.constrivo.drop.ui.shared.model.FileKind
 import com.constrivo.drop.ui.shared.model.PickedItem
 import com.constrivo.drop.ui.shared.model.PickerTab
+import com.constrivo.drop.ui.shared.model.PickerTarget
 import com.constrivo.drop.ui.shared.model.SelfProfile
 import com.constrivo.drop.ui.shared.theme.DropMotion
 import kotlinx.coroutines.CancellationException
@@ -175,6 +178,54 @@ class FilePickerPresenterTest {
         }
 
     @Test
+    fun fC1_selectedPhotosStaySelectedWhenTheLibraryWindowMoves() =
+        runTest {
+            val fake = InMemoryDrop()
+            fake.mediaItems.value = photos(120)
+            val p = FilePickerPresenter(backgroundScope, fake)
+            p.open("t:rohan", "Rohan")
+            runCurrent()
+            for (i in 100 until 120) p.toggle("p$i")
+            // New photos arrive and push the oldest (selected) ones out of the library's 120-item window.
+            fake.mediaItems.value = List(30) { PickedItem("new$it", "NEW_$it.jpg", 1_000, FileKind.IMAGE) } + photos(90)
+            runCurrent()
+            val ui = p.state.value!!
+            assertEquals(20, ui.selectedCount, "selections outside the loaded list still count")
+            assertEquals((100 until 120).sumOf { 3_000_000L + it }, ui.selectedBytes)
+            assertEquals((100 until 120).map { "p$it" }, p.selection().items.map { it.id })
+            p.toggle("p100")
+            runCurrent()
+            assertEquals(19, p.state.value!!.selectedCount, "and can still be deselected")
+        }
+
+    @Test
+    fun fC1_theGridAsksTheLibraryForMore() =
+        runTest {
+            val fake = InMemoryDrop()
+            val p = FilePickerPresenter(backgroundScope, fake)
+            p.loadMore()
+            assertEquals(0, fake.mediaPageRequests, "nothing is read while the picker is closed")
+            p.open("k", null)
+            p.loadMore()
+            assertEquals(1, fake.mediaPageRequests)
+        }
+
+    @Test
+    fun fC5_thePickerCanBeForARunningTransferOrTheBrowserPage() =
+        runTest {
+            val fake = InMemoryDrop()
+            val p = FilePickerPresenter(backgroundScope, fake)
+            p.open(PickerTarget.Transfer("tx", "Rohan"))
+            runCurrent()
+            assertEquals(PickerTarget.Transfer("tx", "Rohan"), p.state.value!!.target)
+            assertEquals("Rohan", p.state.value!!.targetName)
+            assertNull(p.targetKey, "not a bubble")
+            p.open(PickerTarget.Browser)
+            runCurrent()
+            assertEquals(PickerTarget.Browser, p.target)
+        }
+
+    @Test
     fun filesFromTheSystemPickerAreSelectedAtOnceWithoutDuplicates() =
         runTest {
             val fake = InMemoryDrop()
@@ -196,26 +247,45 @@ class FilePickerPresenterTest {
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ShowQrPresenterTest {
+    /** A [MyCodeSource] on the virtual clock whose browser path the test drives. */
+    private class ScriptedCodes(
+        private val clocks: VirtualClocks,
+        private val lifetimeMillis: Long = 300_000,
+    ) : MyCodeSource {
+        var issued = 0
+        val share = MutableStateFlow<BrowserShareState>(BrowserShareState.Idle)
+        val started = ArrayList<Int>()
+        var stopped = 0
+
+        override suspend fun current(): MyCode {
+            issued++
+            val now = clocks.nowMillis()
+            return MyCode("drop1.payload$issued", "318204", now, now + lifetimeMillis)
+        }
+
+        override val browserShare = share
+
+        override fun startBrowserShare(files: AttachedFiles) {
+            started += files.count
+            share.value = BrowserShareState.Starting
+        }
+
+        override fun stopBrowserShare() {
+            stopped++
+            share.value = BrowserShareState.Idle
+        }
+    }
+
+    private val hint =
+        BrowserShareHint("DIRECT-xy-Drop", "k7Qm2pX9", "http://drop.local:8765/t/7h2kq9x3m4pz/", "http://192.168.49.1:8765/t/7h2kq9x3m4pz/")
+
+    private val files = AttachedFiles(listOf(PickedItem("u1", "a.pdf", 10, FileKind.DOCUMENT)))
+
     @Test
     fun fB5_encodesTheCodeRefreshesEveryFiveMinutesAndShowsTheRealBrowserHint() =
         runTest {
             val clocks = VirtualClocks(this)
-            var issued = 0
-            val hint = MutableStateFlow<BrowserShareHint?>(null)
-            val source =
-                object : MyCodeSource {
-                    override suspend fun current(): MyCode {
-                        issued++
-                        val now = clocks.nowMillis()
-                        return MyCode("drop1.payload$issued", "318204", now, now + 300_000)
-                    }
-
-                    override val browserHint = hint
-
-                    override fun startBrowserShare() {
-                        hint.value = BrowserShareHint("DIRECT-xy-Drop", "k7Qm2pX9", "http://drop.local:8765/t/7h2kq9x3m4pz/")
-                    }
-                }
+            val source = ScriptedCodes(clocks)
             val p = ShowQrPresenter(backgroundScope, source, flowOf(SelfProfile("Asha", "self")), clocks)
             assertNull(p.state.value)
             p.open()
@@ -229,22 +299,105 @@ class ShowQrPresenterTest {
             assertEquals(0.5f, p.state.value!!.refreshFraction, 0.01f)
             advanceTimeBy(150_001)
             runCurrent()
-            assertEquals(2, issued, "a new code is signed when the old one expires")
+            assertEquals(2, source.issued, "a new code is signed when the old one expires")
             assertEquals("drop1.payload2", p.state.value!!.matrix?.text)
 
-            p.startBrowserShare()
+            p.startBrowserShare(files)
             runCurrent()
-            assertEquals(
-                "http://drop.local:8765/t/7h2kq9x3m4pz/",
-                p.state.value!!.browserHint?.url,
-                "N15: the full address with port and token",
-            )
+            assertEquals(listOf(1), source.started, "the page serves the chosen files")
+            assertTrue(p.state.value!!.browserStarting)
+            source.share.value = BrowserShareState.Ready(hint)
+            runCurrent()
+            val ready = p.state.value!!
+            assertEquals("http://drop.local:8765/t/7h2kq9x3m4pz/", ready.browserHint?.url, "N15: the full address with port and token")
+            assertEquals("http://192.168.49.1:8765/t/7h2kq9x3m4pz/", ready.browserHint?.ipUrl, "design §10: the IP shown as fallback")
+            assertEquals("http://192.168.49.1:8765/t/7h2kq9x3m4pz/", ready.browserMatrix?.text, "the page's own QR code")
+            assertFalse(ready.showingBrowserCode)
+            p.toggleBrowserCode()
+            runCurrent()
+            assertTrue(p.state.value!!.showingBrowserCode)
+
             p.close()
             runCurrent()
             assertNull(p.state.value)
+            assertEquals(1, source.stopped, "closing the sheet stops the browser path it started")
             advanceTimeBy(600_000)
             runCurrent()
-            assertEquals(2, issued, "nothing is signed while closed")
+            assertEquals(2, source.issued, "nothing is signed while closed")
+        }
+
+    @Test
+    fun n15_aFailedStartIsShownAndCanBeRetried() =
+        runTest {
+            val clocks = VirtualClocks(this)
+            val source = ScriptedCodes(clocks)
+            val p = ShowQrPresenter(backgroundScope, source, flowOf(SelfProfile("Asha", "self")), clocks)
+            p.open()
+            p.startBrowserShare(files)
+            source.share.value = BrowserShareState.Failed
+            runCurrent()
+            assertTrue(p.state.value!!.browserFailed)
+            assertFalse(p.state.value!!.browserStarting, "no endless \"Starting the network…\"")
+            p.startBrowserShare(files)
+            runCurrent()
+            assertEquals(listOf(1, 1), source.started)
+            assertTrue(p.state.value!!.browserStarting)
+            p.close()
+            // Closing a sheet that never started the page does not stop anything.
+            val q = ShowQrPresenter(backgroundScope, source, flowOf(SelfProfile("Asha", "self")), clocks)
+            q.open()
+            q.close()
+            assertEquals(1, source.stopped)
+        }
+
+    @Test
+    fun anAlreadyExpiredCodeDoesNotMakeTheLoopSpin() =
+        runTest {
+            val clocks = VirtualClocks(this)
+            // A caching source: it hands back the same code, whose end has already passed, until a second later.
+            var calls = 0
+            val stale = MyCode("drop1.stale", null, clocks.nowMillis() - 300_000, clocks.nowMillis() - 1)
+            val source =
+                object : MyCodeSource {
+                    override suspend fun current(): MyCode {
+                        calls++
+                        return stale
+                    }
+
+                    override val browserShare = flowOf(BrowserShareState.Idle)
+
+                    override fun startBrowserShare(files: AttachedFiles) = Unit
+
+                    override fun stopBrowserShare() = Unit
+                }
+            val p = ShowQrPresenter(backgroundScope, source, flowOf(SelfProfile("Asha", "self")), clocks)
+            p.open()
+            runCurrent()
+            assertEquals(1, calls, "one fetch, then a pause before asking again")
+            advanceTimeBy(5_000)
+            runCurrent()
+            assertTrue(calls in 5..7, "about one fetch a second, not a tight loop ($calls)")
+            assertEquals("drop1.stale", p.state.value!!.matrix?.text)
+        }
+
+    @Test
+    fun theRefreshLoopStopsInTheBackground() =
+        runTest {
+            val clocks = VirtualClocks(this)
+            val source = ScriptedCodes(clocks)
+            val p = ShowQrPresenter(backgroundScope, source, flowOf(SelfProfile("Asha", "self")), clocks)
+            p.open()
+            runCurrent()
+            assertTrue(p.isRefreshing)
+            p.pause()
+            advanceTimeBy(900_000)
+            runCurrent()
+            assertEquals(1, source.issued, "no re-signing while the app is in the background")
+            assertFalse(p.isRefreshing)
+            p.resume()
+            runCurrent()
+            assertEquals(2, source.issued, "a fresh code as soon as the app is back")
+            assertTrue(p.isRefreshing)
         }
 
     @Test

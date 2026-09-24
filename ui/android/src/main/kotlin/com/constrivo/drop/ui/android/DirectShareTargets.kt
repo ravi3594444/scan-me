@@ -53,6 +53,17 @@ internal class DirectShareIds(
         return id
     }
 
+    /** Remembers [name] for [key], for the share banner while a direct share waits for that device. */
+    fun rememberName(
+        key: String,
+        name: String,
+    ) {
+        if (store.getString(BY_KEY + key) != null && store.getString(NAME + key) != name) store.putString(NAME + key, name)
+    }
+
+    /** The name [key] was published with, if any. */
+    fun nameFor(key: String?): String? = key?.let { store.getString(NAME + it) }
+
     /** The radar key behind [id], or null for an id this app did not hand out (or no longer remembers). */
     fun keyFor(id: String?): String? {
         if (id == null || !ID_FORMAT.matches(id)) return null
@@ -70,6 +81,7 @@ internal class DirectShareIds(
         for (key in keys.filterNot { it in keep }.take(keys.size - MAX_ENTRIES)) {
             store.getString(BY_KEY + key)?.let { store.putString(BY_ID + it, null) }
             store.putString(BY_KEY + key, null)
+            store.putString(NAME + key, null)
         }
     }
 
@@ -80,5 +92,6 @@ internal class DirectShareIds(
         private val ID_FORMAT = Regex("ds_[0-9a-f]{32}")
         private const val BY_KEY = "share.key."
         private const val BY_ID = "share.id."
+        private const val NAME = "share.name."
     }
 }

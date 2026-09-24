@@ -45,13 +45,15 @@ import org.jetbrains.compose.resources.stringResource
 @Immutable
 class ShowQrCallbacks(
     val onStartBrowserShare: () -> Unit = {},
+    val onToggleBrowserCode: () -> Unit = {},
     val onClose: () -> Unit = {},
 )
 
 /**
  * "Show my code" (F‑B5, design §4.4 with N15): a QR code of at least 240 dp, dark on white in both themes so every
- * camera reads it, with the refresh arc around it; the nickname; the six-digit fallback code; and the "computer without
- * the app" hint carrying the real network name, password and full address.
+ * camera reads it, with the refresh arc around it; the nickname; the six-digit fallback code; and the "computer
+ * without the app" hint carrying the real network name, password and full address, with the IP address form as
+ * fallback (design §10). Once the page runs, the sheet can show the page's address as a QR code instead.
  */
 @Composable
 fun ShowQrSheet(
@@ -61,6 +63,8 @@ fun ShowQrSheet(
 ) {
     val colors = LocalDropColors.current
     val type = LocalDropTypography.current
+    val hint = state.browserHint
+    val pageCode = state.browserMatrix.takeIf { state.showingBrowserCode }
     SheetSurface(modifier.testTag(TestTags.SHEET)) {
         Column(
             Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
@@ -68,28 +72,35 @@ fun ShowQrSheet(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             SheetTitle(stringResource(Res.string.qr_title, state.nickname))
-            val description = stringResource(Res.string.a11y_qr, state.nickname)
+            val description =
+                if (pageCode != null && hint != null) {
+                    stringResource(Res.string.a11y_qr_browser, hint.ipUrl ?: hint.url)
+                } else {
+                    stringResource(Res.string.a11y_qr, state.nickname)
+                }
             Box(
                 Modifier.size(DropDimens.qrMin + FRAME_GAP * 2).semantics { contentDescription = description },
                 contentAlignment = Alignment.Center,
             ) {
-                RefreshArc(state.refreshFraction, Modifier.matchParentSize())
+                // The arc tracks the app code's 5-minute validity; the page's address does not expire that way.
+                if (pageCode == null) RefreshArc(state.refreshFraction, Modifier.matchParentSize())
                 Box(
                     Modifier.size(DropDimens.qrMin).clip(RoundedCornerShape(12.dp)).background(Color.White),
                     contentAlignment = Alignment.Center,
                 ) {
-                    state.matrix?.let { QrCode(it, Modifier.size(DropDimens.qrMin)) }
+                    (pageCode ?: state.matrix)?.let { QrCode(it, Modifier.size(DropDimens.qrMin)) }
                 }
             }
-            state.fallbackCode?.let {
-                Text(
-                    stringResource(Res.string.qr_fallback, Formats.sas(it)),
-                    style = type.body,
-                    color = colors.text,
-                    textAlign = TextAlign.Center,
-                )
+            if (pageCode == null) {
+                state.fallbackCode?.let {
+                    Text(
+                        stringResource(Res.string.qr_fallback, Formats.sas(it)),
+                        style = type.body,
+                        color = colors.text,
+                        textAlign = TextAlign.Center,
+                    )
+                }
             }
-            val hint = state.browserHint
             when {
                 hint != null -> {
                     Text(
@@ -98,10 +109,34 @@ fun ShowQrSheet(
                         color = colors.textMuted,
                         textAlign = TextAlign.Center,
                     )
+                    hint.ipUrl?.let {
+                        Text(
+                            stringResource(Res.string.qr_computer_ip, it),
+                            style = type.caption,
+                            color = colors.textMuted,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
+                    if (state.browserMatrix != null) {
+                        QuietButton(
+                            stringResource(if (pageCode != null) Res.string.qr_show_app_code else Res.string.qr_show_browser_code),
+                            callbacks.onToggleBrowserCode,
+                        )
+                    }
                 }
 
                 state.browserStarting -> {
                     Text(stringResource(Res.string.qr_computer_starting), style = type.caption, color = colors.textMuted)
+                }
+
+                state.browserFailed -> {
+                    Text(
+                        stringResource(Res.string.qr_computer_failed),
+                        style = type.caption,
+                        color = colors.dangerText,
+                        textAlign = TextAlign.Center,
+                    )
+                    QuietButton(stringResource(Res.string.qr_computer_retry), callbacks.onStartBrowserShare)
                 }
 
                 else -> {

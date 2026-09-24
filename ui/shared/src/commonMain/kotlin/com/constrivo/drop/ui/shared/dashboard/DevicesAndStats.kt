@@ -24,6 +24,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -39,6 +40,7 @@ import androidx.compose.ui.geometry.RoundRect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
@@ -48,6 +50,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import com.constrivo.drop.ui.shared.TestTags
 import com.constrivo.drop.ui.shared.components.Avatar
@@ -327,14 +330,18 @@ private fun WeeklyChart(weeks: List<Int>) {
             val lx = (centre - label.size.width / 2f).coerceIn(0f, maxOf(0f, size.width - label.size.width))
             drawText(label, topLeft = Offset(lx, barTop - label.size.height - 2.dp.toPx()))
         }
-        Row(Modifier.fillMaxWidth().padding(top = 4.dp)) {
-            Text(
-                pluralStringResource(Res.plurals.stats_axis_weeks_ago, values.size - 1, values.size - 1),
-                style = type.caption,
-                color = colors.textMuted,
-                modifier = Modifier.weight(1f),
-            )
-            Text(stringResource(Res.string.stats_axis_this_week), style = type.caption, color = colors.textMuted)
+        // The bars run oldest to newest from left to right in every layout direction (a time axis, like the canvas
+        // above), so the labels under them must not mirror either.
+        CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+            Row(Modifier.fillMaxWidth().padding(top = 4.dp)) {
+                Text(
+                    pluralStringResource(Res.plurals.stats_axis_weeks_ago, values.size - 1, values.size - 1),
+                    style = type.caption,
+                    color = colors.textMuted,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(stringResource(Res.string.stats_axis_this_week), style = type.caption, color = colors.textMuted)
+            }
         }
     }
 }

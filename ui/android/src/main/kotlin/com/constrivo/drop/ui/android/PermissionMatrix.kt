@@ -118,6 +118,10 @@ internal object PermissionMatrix {
      * wanting once the dialog will not be shown again. A dialog dismissed with Back is not a denial and never marks
      * [deniedBefore], so it cannot lead to a false "blocked".
      *
+     * `shouldShowRequestPermissionRationale` needs an activity: without one ([rationaleKnown] false, for example while
+     * the process starts before the first activity attaches) its "false" means nothing, so a permission is never
+     * inferred [PermissionStatus.BLOCKED] then; the shared gate reads the status again once its explainer is answered.
+     *
      * @param showRationale `shouldShowRequestPermissionRationale` for each permission.
      */
     fun status(
@@ -126,13 +130,14 @@ internal object PermissionMatrix {
         granted: (String) -> Boolean,
         showRationale: (String) -> Boolean,
         deniedBefore: (String) -> Boolean,
+        rationaleKnown: Boolean = true,
     ): PermissionStatus {
         require(permission != DropPermission.BATTERY) { "battery optimisation is not a runtime permission" }
         val needed = manifestPermissions(permission, sdk)
         if (needed.isEmpty()) return PermissionStatus.NOT_NEEDED
         if (isGranted(permission, sdk, granted)) return PermissionStatus.GRANTED
         val missing = needed.filterNot(granted)
-        val blocked = missing.any { deniedBefore(it) && !showRationale(it) }
+        val blocked = rationaleKnown && missing.any { deniedBefore(it) && !showRationale(it) }
         return if (blocked) PermissionStatus.BLOCKED else PermissionStatus.DENIED
     }
 

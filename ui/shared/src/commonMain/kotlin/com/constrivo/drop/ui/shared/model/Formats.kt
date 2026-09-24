@@ -184,13 +184,19 @@ object Avatars {
     private const val FNV_PRIME = 0x01000193
 }
 
-/** A short, safe description of a browser's `User-Agent` for "Allow this computer?" (N15); the raw text is untrusted. */
+/**
+ * A short, safe description of a browser's `User-Agent` for "Allow this computer?" (N15). The raw text is chosen by
+ * whoever sends the request, so none of it is shown: only browser and OS names recognised in it, from a fixed list.
+ * An agent with neither is described as unknown ([BrowserDescription.isUnknown]), never quoted, so a crafted agent
+ * cannot put words such as "(this is your computer)" or bidi-reordered text into the prompt.
+ */
 object BrowserNames {
-    private const val MAX_RAW = 60
-
-    /** "Chrome on Windows" style parts, or the sanitised raw agent cut to [MAX_RAW] characters, or null. */
+    /** "Chrome on Windows" style parts, or an unknown description; null when there is no agent at all. */
     fun describe(userAgent: String?): BrowserDescription? {
-        val ua = userAgent?.filter { it.code >= 0x20 && it.code != 0x7F && !it.isSurrogate() }?.trim()
+        val ua =
+            userAgent
+                ?.filter { it.code >= 0x20 && it.code != 0x7F && !it.isSurrogate() && it.category != CharCategory.FORMAT }
+                ?.trim()
         if (ua.isNullOrEmpty()) return null
         val browser =
             when {
@@ -211,13 +217,14 @@ object BrowserNames {
                 "Linux" in ua -> "Linux"
                 else -> null
             }
-        return if (browser != null) BrowserDescription(browser, os, null) else BrowserDescription(null, os, ua.take(MAX_RAW))
+        return BrowserDescription(browser, os)
     }
 }
 
-/** [browser] and [os] are product names (not translated); [raw] is shown only when neither was recognised. */
+/** [browser] and [os] are product names from a fixed list (not translated); both null means "unknown browser". */
 data class BrowserDescription(
     val browser: String?,
     val os: String?,
-    val raw: String?,
-)
+) {
+    val isUnknown: Boolean get() = browser == null && os == null
+}

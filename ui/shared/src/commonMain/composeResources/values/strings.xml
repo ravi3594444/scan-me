@@ -50,6 +50,12 @@
 
     <!-- Share-sheet entry (design §4.3) -->
     <string name="share_banner">Sending %1$s · %2$s — tap a device</string>
+    <!-- NEW: the first file names under the banner, and a direct-share target the files wait for (F‑C3) -->
+    <plurals name="share_banner_names_more">
+        <item quantity="one">%1$s and %2$d more</item>
+        <item quantity="other">%1$s and %2$d more</item>
+    </plurals>
+    <string name="share_banner_waiting">Sending %1$s · %2$s to %3$s as soon as it is nearby</string>
 
     <!-- Summaries (design §5.1 line 2 "12 photos · 48 MB") -->
     <plurals name="summary_photos">
@@ -92,6 +98,13 @@
     <!-- NEW: picker header -->
     <string name="picker_title">Send to %1$s</string>
     <string name="picker_title_unnamed">Send</string>
+    <!-- NEW: the picker for the Live tab's "Add files" (F‑C5) and for a computer without the app (N15) -->
+    <string name="picker_title_add">Add files for %1$s</string>
+    <string name="picker_title_browser">Files for the computer</string>
+    <plurals name="add_button">
+        <item quantity="one">Add %1$d item · %2$s</item>
+        <item quantity="other">Add %1$d items · %2$s</item>
+    </plurals>
     <string name="picker_tab_photos">Photos</string>
     <string name="picker_tab_files">Files</string>
     <string name="picker_tab_apps">Apps</string>
@@ -167,6 +180,12 @@
     <!-- NEW: starts the browser path when it is not running -->
     <string name="qr_computer_start">Send to a computer without the app</string>
     <string name="qr_computer_starting">Starting the network…</string>
+    <!-- NEW: the IP address fallback (design §10), failure, and the page's own QR code -->
+    <string name="qr_computer_ip">If that address does not open, visit %1$s</string>
+    <string name="qr_computer_failed">Couldn't start the network for the computer.</string>
+    <string name="qr_computer_retry">Try again</string>
+    <string name="qr_show_browser_code">Show the page's code</string>
+    <string name="qr_show_app_code">Show my app code</string>
 
     <!-- Scan to send (design §4.4) -->
     <string name="scan_prompt">Scan the receiver's code</string>
@@ -190,15 +209,23 @@
     <!-- NEW: after the code was confirmed; the sender's pairing sheet -->
     <string name="pair_confirmed">Code confirmed</string>
     <string name="pair_sender_title">Check the code on %1$s</string>
+    <!-- NEW: hides the sender's code sheet for this transfer without trusting the device -->
+    <string name="pair_later">Not now</string>
 
     <!-- Tray (design §5.2) -->
     <string name="tray_open_folder">Open folder</string>
+    <!-- NEW: F‑D5, before a received installer or executable opens -->
+    <string name="installer_title">Open this app installer?</string>
+    <string name="installer_body">This is an app installer from %1$s. Open it only if you trust them.</string>
+    <string name="installer_body_unknown">This is an app installer. Open it only if you trust the sender.</string>
+    <string name="installer_open">Open anyway</string>
 
     <!-- "Allow this computer?" for the browser receive page (N15); NEW copy -->
     <string name="browser_title">Allow this computer?</string>
     <string name="browser_title_again">Another computer wants to connect</string>
     <string name="browser_body">A browser at %1$s wants to see the files you are sharing.</string>
     <string name="browser_agent">%1$s on %2$s</string>
+    <string name="browser_unknown">Unknown browser</string>
     <string name="browser_allow">Allow</string>
     <string name="browser_deny">Don't allow</string>
 
@@ -312,6 +339,7 @@
     <string name="settings_clear_partials_body">Transfers waiting to resume stop and cannot continue.</string>
     <string name="settings_clear_partials_confirm">Clear</string>
     <string name="settings_clear_partials_done">Cleared %1$s</string>
+    <string name="settings_clear_partials_failed">Couldn't clear partial files. Try again.</string>
     <string name="settings_profile">Profile</string>
     <string name="settings_nickname">Nickname</string>
     <string name="settings_avatar">Avatar</string>
@@ -397,6 +425,7 @@
     <string name="a11y_clear_attachment">Remove attached files</string>
     <string name="a11y_visibility">Visibility: %1$s</string>
     <string name="a11y_qr">Code for %1$s</string>
+    <string name="a11y_qr_browser">Code for the page at %1$s</string>
     <string name="a11y_selected">Selected</string>
     <string name="a11y_done">Done</string>
     <plurals name="a11y_incoming_seconds">

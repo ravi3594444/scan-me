@@ -1,5 +1,6 @@
 package com.constrivo.drop.ui.shared.presenter
 
+import com.constrivo.drop.core.discovery.EphemeralIds
 import com.constrivo.drop.core.discovery.MonotonicClock
 import com.constrivo.drop.core.discovery.NearbyDevice
 import com.constrivo.drop.core.discovery.Visibility
@@ -11,6 +12,7 @@ import com.constrivo.drop.ui.shared.model.BubbleActivity
 import com.constrivo.drop.ui.shared.model.BubbleUi
 import com.constrivo.drop.ui.shared.model.CancelConfirmUi
 import com.constrivo.drop.ui.shared.model.Direction
+import com.constrivo.drop.ui.shared.model.InstallerFiles
 import com.constrivo.drop.ui.shared.model.ProgressAnnouncements
 import com.constrivo.drop.ui.shared.model.RadarNotice
 import com.constrivo.drop.ui.shared.model.RadarUiState
@@ -26,6 +28,7 @@ import com.constrivo.drop.ui.shared.model.VisibilityUi
 import com.constrivo.drop.ui.shared.theme.DropMotion
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -43,7 +46,15 @@ import kotlinx.coroutines.launch
 
 /** What the radar asks the engine to do (the app layer implements it). */
 interface RadarActions {
-    /** Starts a send of [files] to the device with radar key [deviceKey] (F‑C1, F‑C2). */
+    /**
+     * Starts a send of [files] to the device with radar key [deviceKey] (F‑C1, F‑C2).
+     *
+     * On Android the items are `content:` URIs. Those from the share sheet are readable only while the activity that
+     * received the share is alive: Android revokes the sender's grant when that activity is destroyed. The engine
+     * must take its own grant before the send can outlive it (WP7: start the `TransferService` with an Intent that
+     * carries the URIs in its `ClipData` with `FLAG_GRANT_READ_URI_PERMISSION`, which the service keeps until it
+     * stops). Picker and document URIs are readable by this app for as long as it runs.
+     */
     fun send(
         deviceKey: String,
         files: AttachedFiles,
@@ -82,8 +93,16 @@ enum class BubbleTapResult {
  * - The × asks for confirmation only past [CANCEL_CONFIRM_BYTES] (100 MB, design §4.2).
  * - The notice is the most important of design §8.1: missing permission, Bluetooth off, Wi‑Fi off, hidden, no one.
  * - The visibility chip counts down the minutes of "Everyone for 10 min" on [wallClock].
- * - Files from the share sheet are attached until a bubble is tapped; a direct-share target (F‑C3) receives them as
- *   soon as its bubble appears.
+ * - Files from the share sheet are attached until a bubble is tapped; a direct-share target (F‑C3) receives them if
+ *   its bubble appears within [DIRECT_SHARE_WINDOW_MILLIS], after which they wait for a tap like any share. Taking
+ *   the files is atomic, so they are sent once whichever path gets there first.
+ * - Received files reach the tray in batches every [TRAY_BATCH_MILLIS], so thousands of small files (F‑E7) cost a few
+ *   radar updates a second, and the collector never makes the engine wait.
+ * - A stranger's rotating ID (15-minute epochs, core/discovery `EphemeralId`) makes it reappear under a new key. Near
+ *   an epoch boundary a new stranger with the same name and platform as one that has just gone quiet is shown as that
+ *   bubble moving ([BubbleUi.replacesKey]), not as a second device; see [StrangerRotation].
+ * - The sender's code sheet (F‑B3) can be put aside for a transfer without trusting the device; tapping the bubble
+ *   brings it back while the transfer runs.
  *
  * Time comes only from [monotonicClock], [wallClock] and the scope's `delay`, so a test dispatcher makes it
  * deterministic.
@@ -104,8 +123,14 @@ class RadarPresenter(
 ) {
     private data class Local(
         val confirmedPairings: Set<String> = emptySet(),
+        val laterPairings: Set<String> = emptySet(),
         val attachment: AttachedFiles? = null,
+        /** Identifies the share that [attachment] came from, so its host can release it ([releaseShare]). */
+        val shareId: String? = null,
         val directTarget: String? = null,
+        val directTargetName: String? = null,
+        /** When the direct target stops receiving the files by itself, on the monotonic clock. */
+        val directDeadline: Long? = null,
         val tray: List<TrayItemUi> = emptyList(),
         val cancelConfirm: CancelConfirmUi? = null,
         val selectedKey: String? = null,
@@ -113,6 +138,9 @@ class RadarPresenter(
 
     private val local = MutableStateFlow(Local())
     private val tick = MutableStateFlow(0L)
+    private val rotation = StrangerRotation()
+    private val pendingTray = ArrayList<ReceivedFile>()
+    private var trayFlush: Job? = null
 
     // Touched only by the single state collector (stateIn), in order.
     private val seenRunning = HashSet<String>()
@@ -133,34 +161,87 @@ class RadarPresenter(
         }.stateIn(scope, SharingStarted.Eagerly, RadarUiState.initial(initialSelf))
 
     init {
+        // Received files: the collector only queues (it never makes the engine wait); the tray updates in batches.
         scope.launch {
             received.collect { file ->
-                local.update { l ->
-                    val item = TrayItemUi(file.id, file.name, file.thumb)
-                    l.copy(tray = (l.tray.filterNot { it.id == file.id } + item).takeLast(MAX_TRAY_ITEMS))
+                pendingTray += file
+                if (trayFlush == null) {
+                    trayFlush =
+                        scope.launch {
+                            delay(TRAY_BATCH_MILLIS)
+                            flushTray()
+                        }
                 }
             }
         }
-        // Direct share (F‑C3): the chosen device gets the files as soon as its bubble is on the radar.
+        // Direct share (F‑C3): the chosen device gets the files as soon as its bubble is on the radar. Follows the
+        // mapped state (devices and attachment together), so the device list is collected only once.
         scope.launch {
-            combine(devices, local) { d, l -> d to l }.collect { (d, l) ->
-                val target = l.directTarget ?: return@collect
-                val files = l.attachment ?: return@collect
-                if (d.any { it.key == target }) {
-                    local.update { it.copy(attachment = null, directTarget = null) }
-                    actions.send(target, files)
-                }
+            state.collect { st ->
+                val target = local.value.directTarget ?: return@collect
+                if (st.bubbles.any { it.key == target }) takeAttachmentFor(target)?.let { actions.send(target, it) }
             }
         }
     }
 
+    private fun flushTray() {
+        trayFlush = null
+        if (pendingTray.isEmpty()) return
+        val batch = pendingTray.takeLast(MAX_TRAY_ITEMS)
+        pendingTray.clear()
+        local.update { l ->
+            val ids = batch.mapTo(HashSet()) { it.id }
+            val items =
+                batch.map { f ->
+                    TrayItemUi(f.id, f.name, f.thumb, InstallerFiles.isInstaller(f.name, f.mime, f.kind), f.senderName)
+                }
+            l.copy(tray = (l.tray.filterNot { it.id in ids } + items).takeLast(MAX_TRAY_ITEMS))
+        }
+    }
+
+    /**
+     * Takes the attached files for the direct target [target] if they are still waiting for it and its window is
+     * open; null otherwise (a tap took them, or they now wait for a tap). Atomic, so the files go out once.
+     */
+    private fun takeAttachmentFor(target: String): AttachedFiles? {
+        while (true) {
+            val cur = local.value
+            if (cur.directTarget != target) return null
+            val files = cur.attachment ?: return null
+            val deadline = cur.directDeadline
+            if (deadline != null && monotonicClock.elapsedMillis() >= deadline) {
+                if (local.compareAndSet(cur, cur.copy(directTarget = null, directTargetName = null, directDeadline = null))) return null
+                continue
+            }
+            if (local.compareAndSet(cur, cur.withoutAttachment())) return files
+        }
+    }
+
+    /** Takes the attached files whoever they were for (a bubble tap, the browser path); null when there are none. */
+    fun takeAttachment(): AttachedFiles? {
+        while (true) {
+            val cur = local.value
+            val files = cur.attachment ?: return null
+            if (local.compareAndSet(cur, cur.withoutAttachment().copy(selectedKey = null))) return files
+        }
+    }
+
+    private fun Local.withoutAttachment() =
+        copy(attachment = null, shareId = null, directTarget = null, directTargetName = null, directDeadline = null)
+
     /** Taps a bubble: sends attached files, or asks the host to open the picker (and raises the bubble). */
     fun onBubbleTapped(key: String): BubbleTapResult {
         val bubble = latestBubbles.firstOrNull { it.key == key }
-        if (bubble?.activity is BubbleActivity.Active) return BubbleTapResult.BUSY
-        val files = local.value.attachment
+        val activity = bubble?.activity
+        if (activity is BubbleActivity.Active) {
+            // A code sheet put aside for this transfer comes back (F‑B3: the code stays reachable until it ends).
+            if (activity.transferId in local.value.laterPairings) {
+                local.update { it.copy(laterPairings = it.laterPairings - activity.transferId) }
+            }
+            return BubbleTapResult.BUSY
+        }
+        val files = takeAttachment()
         if (files != null) {
-            local.update { it.copy(attachment = null, directTarget = null, selectedKey = null) }
             actions.send(key, files)
             return BubbleTapResult.SENT
         }
@@ -185,17 +266,57 @@ class RadarPresenter(
 
     /**
      * Files from the share sheet (design §4.3); replaces any earlier attachment. [directTarget] is the radar key of a
-     * direct-share target chosen in the system sheet (F‑C3); null clears it. An empty list clears the attachment.
+     * direct-share target chosen in the system sheet (F‑C3), named [directTargetName] in the banner while the files
+     * wait for it; null clears it. [shareId] identifies the share for [releaseShare]. An empty list clears the
+     * attachment.
      */
     fun attach(
         files: AttachedFiles?,
         directTarget: String? = null,
+        directTargetName: String? = null,
+        shareId: String? = null,
     ) {
         val kept = files?.takeIf { it.items.isNotEmpty() }
-        local.update { it.copy(attachment = kept, directTarget = if (kept != null) directTarget else null) }
+        val target = if (kept != null) directTarget else null
+        val deadline = target?.let { monotonicClock.elapsedMillis() + DIRECT_SHARE_WINDOW_MILLIS }
+        local.update {
+            it.copy(
+                attachment = kept,
+                shareId = if (kept != null) shareId else null,
+                directTarget = target,
+                directTargetName = if (target != null) directTargetName else null,
+                directDeadline = deadline,
+            )
+        }
+        if (deadline != null) {
+            scope.launch {
+                delay(DIRECT_SHARE_WINDOW_MILLIS)
+                // The window closed without the device: the files stay attached and wait for a tap.
+                local.update { l ->
+                    if (l.directDeadline ==
+                        deadline
+                    ) {
+                        l.copy(directTarget = null, directTargetName = null, directDeadline = null)
+                    } else {
+                        l
+                    }
+                }
+            }
+        }
     }
 
     fun clearAttachment() = attach(null)
+
+    /** Whether the files of share [shareId] are still attached (not sent, cleared or replaced). */
+    fun holdsShare(shareId: String): Boolean = local.value.let { it.attachment != null && it.shareId == shareId }
+
+    /**
+     * The host of share [shareId] is gone for good (Android revoked the URI grants with it): its files, and a direct
+     * target waiting for them, are dropped. Another share's files are left alone.
+     */
+    fun releaseShare(shareId: String) {
+        local.update { if (it.shareId == shareId) it.withoutAttachment() else it }
+    }
 
     /** The × on a busy bubble: cancels at once, or asks first past 100 MB (design §4.2). */
     fun onCancelTapped(transferId: String) {
@@ -216,8 +337,16 @@ class RadarPresenter(
 
     /** "Yes, it matches" on the sender's pairing sheet. */
     fun confirmPairing(transferId: String) {
-        local.update { it.copy(confirmedPairings = it.confirmedPairings + transferId) }
+        local.update { it.copy(confirmedPairings = it.confirmedPairings + transferId, laterPairings = it.laterPairings - transferId) }
         actions.confirmPairing(transferId)
+    }
+
+    /**
+     * "Not now" (or Back, or the scrim) on the sender's pairing sheet: hides it for [transferId] without trusting the
+     * device. The transfer goes on; tapping the peer's bubble shows the code again while it runs.
+     */
+    fun pairLater(transferId: String) {
+        local.update { it.copy(laterPairings = it.laterPairings + transferId) }
     }
 
     fun dismissCancel() {
@@ -241,11 +370,13 @@ class RadarPresenter(
         track(transfers, now)
         latestTransfers = transfers
         val byPeer = transfers.filter { it.peerKey != null }.groupBy { it.peerKey!! }
+        val busyKeys = transfers.filter { !it.stage.isFinal }.mapNotNullTo(HashSet()) { it.peerKey }
+        val rotated = rotation.apply(devices.distinctBy { it.key }, busyKeys, now, wallClock.nowMillis())
+        rotated.recheckInMillis?.let(::scheduleTick)
         val bubbles =
-            devices
-                .distinctBy { it.key }
+            rotated.shown
                 .sortedBy { it.key }
-                .map { d -> bubbleOf(d, activityFor(byPeer[d.key].orEmpty(), now)) }
+                .map { d -> bubbleOf(d, activityFor(byPeer[d.key].orEmpty(), now), rotated.replaces[d.key]) }
         latestBubbles = bubbles
         val notice =
             when {
@@ -264,21 +395,29 @@ class RadarPresenter(
             bubbles = bubbles,
             notice = notice,
             visibility = visibility,
-            attachment = local.attachment?.let { AttachmentUi(it.summary, it.totalBytes) },
+            attachment = local.attachment?.let { attachmentUi(it, local.directTargetName.takeIf { _ -> local.directTarget != null }) },
             tray = local.tray,
             cancelConfirm = local.cancelConfirm?.takeIf { c -> transfers.any { it.id == c.transferId && !it.stage.isFinal } },
             selectedKey = selected,
-            senderPairing = pairingOf(transfers, local.confirmedPairings),
+            senderPairing = pairingOf(transfers, local.confirmedPairings + local.laterPairings),
         )
+    }
+
+    private fun attachmentUi(
+        files: AttachedFiles,
+        waitingFor: String?,
+    ): AttachmentUi {
+        val names = files.items.take(AttachmentUi.MAX_NAMES).map { it.name }
+        return AttachmentUi(files.summary, files.totalBytes, names, files.count - names.size, waitingFor)
     }
 
     private fun pairingOf(
         transfers: List<TransferSnapshot>,
-        confirmed: Set<String>,
+        hidden: Set<String>,
     ): SenderPairingUi? {
         for (t in transfers) {
             val code = t.pairingCode ?: continue
-            if (t.direction == Direction.SEND && !t.stage.isFinal && t.id !in confirmed) return SenderPairingUi(t.id, t.peerName, code)
+            if (t.direction == Direction.SEND && !t.stage.isFinal && t.id !in hidden) return SenderPairingUi(t.id, t.peerName, code)
         }
         return null
     }
@@ -363,6 +502,7 @@ class RadarPresenter(
     private fun bubbleOf(
         d: NearbyDevice,
         activity: BubbleActivity?,
+        replacesKey: String?,
     ): BubbleUi =
         BubbleUi(
             key = d.key,
@@ -375,6 +515,7 @@ class RadarPresenter(
             lanOnly = d.lanOnly,
             rssiDbm = d.smoothedRssiDbm,
             activity = activity,
+            replacesKey = replacesKey,
         )
 
     /** Emits the chip state now and again each time the minutes left (or the window itself) change. */
@@ -412,6 +553,105 @@ class RadarPresenter(
         const val DROP_TOKEN_WINDOW_MILLIS: Long = 2_000
 
         const val MAX_TRAY_ITEMS: Int = 50
+
+        /** Received files reach the tray at most this often (F‑E7: 5,000 photos in about 90 s). */
+        const val TRAY_BATCH_MILLIS: Long = 150
+
+        /**
+         * How long a direct-share target (F‑C3) receives the files by itself once they are attached. The share sheet
+         * lists devices that are on the radar, so one that has not appeared by then left; the files then wait for a
+         * tap instead of going out whenever that device next shows up, possibly hours later.
+         */
+        const val DIRECT_SHARE_WINDOW_MILLIS: Long = 45_000
         private const val MINUTE_MILLIS = 60_000L
+    }
+}
+
+/**
+ * Follows strangers across their 15-minute ID rotation (core/discovery `EphemeralIds`, WP1 carry-forward): a stranger
+ * that core cannot link reappears under a new radar key at an epoch boundary, while its old key lingers until core's
+ * 5 s beacon timeout, so the same person would show twice.
+ *
+ * Within [windowMillis] of a boundary (wall clock), a new stranger with the same nickname and platform as a stranger
+ * already on the radar is held back for up to [holdMillis]. If the old one goes quiet (not heard for
+ * [silentMillis]) meanwhile, it is taken off the radar and the new one takes its place, drawn as the old bubble moving
+ * to the new position ([BubbleUi.replacesKey]). If the old one is still heard, both are different devices and the new
+ * one appears normally. Trusted devices keep their key across rotations and never take part; neither does a busy
+ * bubble. Confined to the presenter's collector.
+ */
+internal class StrangerRotation(
+    private val windowMillis: Long = 30_000,
+    private val silentMillis: Long = 1_500,
+    private val holdMillis: Long = 3_000,
+) {
+    class Result(
+        val shown: List<NearbyDevice>,
+        /** New key → the old key whose bubble it replaces. */
+        val replaces: Map<String, String>,
+        /** Evaluate again after this long (a held-back device is waiting for a decision). */
+        val recheckInMillis: Long?,
+    )
+
+    private val firstSeen = HashMap<String, Long>()
+
+    /** New key → old key, while the new one is held back. */
+    private val pending = HashMap<String, String>()
+
+    /** New key → old key, once decided; the old key stays hidden while core still lists it. */
+    private val replaced = HashMap<String, String>()
+
+    fun apply(
+        devices: List<NearbyDevice>,
+        busyKeys: Set<String>,
+        now: Long,
+        wallNow: Long,
+    ): Result {
+        val present = devices.associateBy { it.key }
+        firstSeen.keys.retainAll(present.keys)
+        pending.entries.removeAll { (new, old) -> new !in present || old !in present }
+        replaced.keys.retainAll(present.keys)
+        val nearBoundary = nearEpochBoundary(wallNow)
+        for (d in devices) {
+            if (firstSeen.containsKey(d.key)) continue
+            firstSeen[d.key] = now
+            if (!nearBoundary || !d.isNamedStranger() || d.key in busyKeys) continue
+            val taken = pending.values.toSet() + replaced.values
+            val candidates =
+                devices.filter { o ->
+                    o.key != d.key && o.key !in taken && o.key !in pending && o.key !in busyKeys && o.isNamedStranger() &&
+                        o.nickname == d.nickname && o.platform == d.platform && (firstSeen[o.key] ?: now) < now
+                }
+            if (candidates.size == 1) pending[d.key] = candidates.single().key
+        }
+        var recheck: Long? = null
+        for ((new, old) in pending.entries.toList()) {
+            val quietFor = now - present.getValue(old).lastSeenElapsedMillis
+            val heldFor = now - firstSeen.getValue(new)
+            when {
+                quietFor >= silentMillis -> {
+                    pending.remove(new)
+                    replaced[new] = old
+                }
+
+                heldFor >= holdMillis -> {
+                    pending.remove(new)
+                }
+
+                else -> {
+                    val next = minOf(silentMillis - quietFor, holdMillis - heldFor).coerceAtLeast(1)
+                    recheck = recheck?.let { minOf(it, next) } ?: next
+                }
+            }
+        }
+        val hidden = pending.keys + replaced.values
+        return Result(devices.filter { it.key !in hidden }, replaced.toMap(), recheck)
+    }
+
+    private fun NearbyDevice.isNamedStranger() = trustedDeviceId == null && !nickname.isNullOrBlank()
+
+    private fun nearEpochBoundary(wallNow: Long): Boolean {
+        if (wallNow < 0) return false
+        val into = wallNow % EphemeralIds.EPOCH_MILLIS
+        return minOf(into, EphemeralIds.EPOCH_MILLIS - into) <= windowMillis
     }
 }

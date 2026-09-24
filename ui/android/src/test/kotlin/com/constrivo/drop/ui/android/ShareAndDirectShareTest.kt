@@ -74,6 +74,61 @@ class ShareAndDirectShareTest {
         assertEquals(listOf(FileKind.ARCHIVE, FileKind.OTHER, FileKind.DOCUMENT), items.map { it.kind })
     }
 
+    private fun stream(
+        uri: String,
+        inClip: Boolean = true,
+    ) = SharedFiles.Stream(uri, uri.removePrefix("content://").substringBefore('/'), inClip)
+
+    @Test
+    fun designSection43_onlyStreamsTheSenderCouldGrantAreRead() {
+        val own = setOf("com.constrivo.drop.files")
+        val streams =
+            listOf(
+                stream("content://com.android.providers.media.documents/document/image%3A1"),
+                // A guessable MediaStore row in EXTRA_STREAM only, next to a text-only ClipData: the system never
+                // checked the sender may grant it, and this app could read it with its own media permission.
+                stream("content://media/external/images/media/42", inClip = false),
+                // One of this app's own providers: the system does not check a grant this app would not need.
+                stream("content://com.constrivo.drop.files/received/1"),
+                stream("content://com.android.providers.media.documents/document/image%3A1"),
+            )
+        assertEquals(
+            listOf("content://com.android.providers.media.documents/document/image%3A1"),
+            SharedFiles.grantedStreams(streams, readGranted = true, ownAuthorities = own),
+        )
+        assertTrue(
+            SharedFiles.grantedStreams(streams, readGranted = false, ownAuthorities = own).isEmpty(),
+            "no read grant, nothing is read",
+        )
+        assertTrue(SharedFiles.grantedStreams(listOf(SharedFiles.Stream("content:///x", null, true)), true, own).isEmpty())
+    }
+
+    @Test
+    fun designSection43_aRecreatedActivityHandlesItsShareExactlyOnce() {
+        val a = ShareRestore
+        assertEquals(
+            ShareRestore.Action.HANDLE,
+            a.decide(restored = false, savedShareId = null, savedPending = false, live = false),
+            "a fresh start",
+        )
+        assertEquals(ShareRestore.Action.ADOPT, a.decide(true, "s1", savedPending = true, live = true), "rotation: not attached twice")
+        assertEquals(ShareRestore.Action.HANDLE, a.decide(true, "s1", savedPending = true, live = false), "process death: read again")
+        assertEquals(ShareRestore.Action.SKIP, a.decide(true, "s1", savedPending = false, live = false), "already sent or cleared")
+        assertEquals(ShareRestore.Action.SKIP, a.decide(true, null, savedPending = false, live = false), "no share to restore")
+    }
+
+    @Test
+    fun fC3_theBannerKnowsTheDirectTargetsName() {
+        val store = KeyValueStore.InMemory()
+        val ids = DirectShareIds(store)
+        ids.rememberName("t:rohan", "Rohan's Pixel")
+        assertNull(ids.nameFor("t:rohan"), "only for devices that were published")
+        ids.idFor("t:rohan")
+        ids.rememberName("t:rohan", "Rohan's Pixel")
+        assertEquals("Rohan's Pixel", ids.nameFor("t:rohan"))
+        assertNull(ids.nameFor(null))
+    }
+
     private fun bubble(
         key: String,
         name: String?,

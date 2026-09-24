@@ -52,7 +52,7 @@ internal class AndroidPermissions(
         if (permission == DropPermission.BATTERY) {
             batteryStatus()
         } else {
-            PermissionMatrix.status(permission, sdk, ::granted, ::showRationale, prefs::wasDenied)
+            PermissionMatrix.status(permission, sdk, ::granted, ::showRationale, prefs::wasDenied, rationaleKnown = bridge.current != null)
         }
 
     override suspend fun request(permission: DropPermission): PermissionStatus =

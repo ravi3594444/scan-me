@@ -23,8 +23,10 @@ import kotlin.test.fail
  * machine's fonts), and compares it with `src/desktopTest/resources/screenshots/<name>.png`.
  *
  * A pixel differs when any channel differs by more than [CHANNEL_TOLERANCE]; a case passes while at most
- * [PIXEL_TOLERANCE] of the pixels differ (anti-aliasing noise between Skia builds). On failure the actual image and a
- * diff (differing pixels in magenta) are written to `build/reports/screenshots/`.
+ * [PIXEL_TOLERANCE] of the pixels differ (0.05%, about 140 pixels of 360 × 760: anti-aliasing noise between Skia
+ * builds, not a changed digit or word). The texts that carry numbers are also checked exactly on the semantics tree
+ * (`AccessibilityTest.screenshotsKeyTextsAreExact`), so the images mostly guard layout. On failure the actual image
+ * and a diff (differing pixels in magenta) are written to `build/reports/screenshots/`.
  *
  * Re-record after an intended visual change with
  * `./gradlew :ui:shared:desktopTest -Pdrop.recordScreenshots=true`, look at the new PNGs, and commit them.
@@ -34,7 +36,7 @@ object Screenshots {
     const val HEIGHT_DP: Int = 760
     private const val DENSITY = 1f
     private const val CHANNEL_TOLERANCE = 24
-    private const val PIXEL_TOLERANCE = 0.003
+    private const val PIXEL_TOLERANCE = 0.0005
     private const val FRAME_NANOS = 16_000_000L
 
     /** Frames rendered before the capture: long enough for every entry animation (the longest is the tray spring). */

@@ -20,6 +20,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.toggleable
@@ -29,6 +30,10 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -51,11 +56,14 @@ import com.constrivo.drop.ui.shared.model.FilePickerUi
 import com.constrivo.drop.ui.shared.model.FileThumb
 import com.constrivo.drop.ui.shared.model.PickableUi
 import com.constrivo.drop.ui.shared.model.PickerTab
+import com.constrivo.drop.ui.shared.model.PickerTarget
 import com.constrivo.drop.ui.shared.resources.*
 import com.constrivo.drop.ui.shared.text.sizeText
 import com.constrivo.drop.ui.shared.theme.DropDimens
 import com.constrivo.drop.ui.shared.theme.LocalDropColors
 import com.constrivo.drop.ui.shared.theme.LocalDropTypography
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filter
 import org.jetbrains.compose.resources.pluralStringResource
 import org.jetbrains.compose.resources.stringResource
 
@@ -67,6 +75,8 @@ class FilePickerCallbacks(
     val onAllowPhotos: () -> Unit = {},
     val onSend: () -> Unit = {},
     val onClose: () -> Unit = {},
+    /** The Photos grid scrolled near its end: list older media (paging). */
+    val onLoadMore: () -> Unit = {},
 )
 
 /**
@@ -81,10 +91,13 @@ fun FilePickerSheet(
 ) {
     val colors = LocalDropColors.current
     SheetSurface(modifier.testTag(TestTags.PICKER)) {
-        SheetTitle(
-            state.targetName?.let { stringResource(Res.string.picker_title, it) } ?: stringResource(Res.string.picker_title_unnamed),
-            Modifier.padding(bottom = 8.dp),
-        )
+        val title =
+            when (val target = state.target) {
+                is PickerTarget.Device -> target.name?.let { stringResource(Res.string.picker_title, it) }
+                is PickerTarget.Transfer -> stringResource(Res.string.picker_title_add, target.peerName)
+                PickerTarget.Browser -> stringResource(Res.string.picker_title_browser)
+            } ?: stringResource(Res.string.picker_title_unnamed)
+        SheetTitle(title, Modifier.padding(bottom = 8.dp))
         PickerTabs(state.tabs, state.tab, callbacks.onTab)
         Box(Modifier.weight(1f).fillMaxWidth().padding(vertical = 8.dp)) {
             when (state.tab) {
@@ -95,7 +108,8 @@ fun FilePickerSheet(
         }
         val label =
             if (state.canSend) {
-                pluralStringResource(Res.plurals.send_button, state.selectedCount, state.selectedCount, sizeText(state.selectedBytes))
+                val button = if (state.target is PickerTarget.Transfer) Res.plurals.add_button else Res.plurals.send_button
+                pluralStringResource(button, state.selectedCount, state.selectedCount, sizeText(state.selectedBytes))
             } else {
                 stringResource(Res.string.send_button_empty)
             }
@@ -166,8 +180,19 @@ private fun PhotosTab(
         }
 
         else -> {
+            val grid = rememberLazyGridState()
+            // Paging: ask for older media when the last rows come into view (F‑C1: hundreds of photos).
+            val onLoadMore by rememberUpdatedState(callbacks.onLoadMore)
+            LaunchedEffect(grid) {
+                snapshotFlow {
+                    val info = grid.layoutInfo
+                    val last = info.visibleItemsInfo.lastOrNull()?.index ?: -1
+                    info.totalItemsCount > 0 && last >= info.totalItemsCount - LOAD_MORE_AHEAD
+                }.distinctUntilChanged().filter { it }.collect { onLoadMore() }
+            }
             LazyVerticalGrid(
                 columns = GridCells.Fixed(3),
+                state = grid,
                 horizontalArrangement = Arrangement.spacedBy(4.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
                 modifier = Modifier.fillMaxSize(),
@@ -177,6 +202,9 @@ private fun PhotosTab(
         }
     }
 }
+
+/** How many items before the end of the grid the next page is asked for (four rows). */
+private const val LOAD_MORE_AHEAD = 12
 
 @Composable
 private fun PhotoTile(

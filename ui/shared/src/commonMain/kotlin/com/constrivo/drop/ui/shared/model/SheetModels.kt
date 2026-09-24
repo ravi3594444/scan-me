@@ -83,11 +83,29 @@ data class PickableUi(
     val selected: Boolean get() = selectionIndex > 0
 }
 
+/** What the file picker picks for (design §4.1, F‑C5, N15). */
+@Immutable
+sealed interface PickerTarget {
+    /** A bubble on the radar: Send starts a transfer to it. */
+    data class Device(
+        val key: String,
+        val name: String?,
+    ) : PickerTarget
+
+    /** A running transfer (the Live tab's "Add files", F‑C5): the files are queued into it. */
+    data class Transfer(
+        val transferId: String,
+        val peerName: String,
+    ) : PickerTarget
+
+    /** The browser receive page for a computer without the app (N15). */
+    data object Browser : PickerTarget
+}
+
 /** The file picker sheet (design §4.1, F‑C1). */
 @Immutable
 data class FilePickerUi(
-    val targetKey: String,
-    val targetName: String?,
+    val target: PickerTarget,
     val tabs: List<PickerTab>,
     val tab: PickerTab,
     val photos: List<PickableUi>,
@@ -98,6 +116,18 @@ data class FilePickerUi(
     val selectedBytes: Long,
 ) {
     val canSend: Boolean get() = selectedCount > 0
+
+    /** The bubble the sheet is for, when it is for a device. */
+    val targetKey: String? get() = (target as? PickerTarget.Device)?.key
+
+    /** The name in the sheet's title, when there is one. */
+    val targetName: String?
+        get() =
+            when (target) {
+                is PickerTarget.Device -> target.name
+                is PickerTarget.Transfer -> target.peerName
+                PickerTarget.Browser -> null
+            }
 }
 
 /** Credentials and address for the browser receive path (design §4.4 footer with N15: the real values). */
@@ -107,7 +137,30 @@ data class BrowserShareHint(
     val password: String,
     /** The full address, `http://drop.local:<port>/t/<token>/`. */
     val url: String,
+    /**
+     * The same page by IP address, `http://192.168.49.1:<port>/t/<token>/` (design §10: "the IP shown as fallback",
+     * web-receive's `ReceiveServer.ipUrl()`), for computers that do not resolve `drop.local`.
+     */
+    val ipUrl: String? = null,
 )
+
+/** Where the browser receive path stands (architecture §10.3), as the app layer reports it. */
+@Immutable
+sealed interface BrowserShareState {
+    /** Not running. */
+    data object Idle : BrowserShareState
+
+    /** The hotspot or group and the server are starting. */
+    data object Starting : BrowserShareState
+
+    /** Running: the page is served at [hint]. */
+    data class Ready(
+        val hint: BrowserShareHint,
+    ) : BrowserShareState
+
+    /** It could not start (no hotspot or group, no free port); the sheet offers to try again. */
+    data object Failed : BrowserShareState
+}
 
 /** The "Show my code" sheet (design §4.4, F‑B5). */
 @Immutable
@@ -120,6 +173,20 @@ data class ShowQrUi(
     val browserHint: BrowserShareHint?,
     /** The browser path is being prepared (hotspot or group starting). */
     val browserStarting: Boolean,
+    /** The browser path could not start. */
+    val browserFailed: Boolean = false,
+    /** A QR code of the page's address, once the browser path runs (a phone or tablet without the app can scan it). */
+    val browserMatrix: QrMatrix? = null,
+    /** The sheet shows [browserMatrix] instead of the app's code. */
+    val showingBrowserCode: Boolean = false,
+)
+
+/** "This is an app installer" (F‑D5), shown before a received installer or executable is opened. */
+@Immutable
+data class InstallerWarningUi(
+    val fileName: String,
+    /** Who sent it, or null when unknown. */
+    val senderName: String?,
 )
 
 /** The scanner's chrome state (design §4.4); the camera preview itself is a platform slot. */

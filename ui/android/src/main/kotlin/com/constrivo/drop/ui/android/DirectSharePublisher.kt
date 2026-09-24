@@ -98,6 +98,7 @@ internal class DirectSharePublisher(
 
     private fun shortcut(target: ShareTarget): ShortcutInfoCompat {
         val id = ids.idFor(target.key)
+        ids.rememberName(target.key, target.name)
         return ShortcutInfoCompat
             .Builder(context, id)
             .setShortLabel(target.name)

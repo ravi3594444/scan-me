@@ -54,6 +54,17 @@ internal class UriReader(
         declaredMime: String? = null,
     ): List<PickedItem> = SharedFiles.toItems(uris.mapNotNull { facts(it, declaredMime) }, untitled)
 
+    /** [items] for URIs given as strings (the share's [SharedFiles.grantedStreams]). */
+    fun itemsOf(
+        uris: List<String>,
+        declaredMime: String? = null,
+    ): List<PickedItem> = items(uris.map(Uri::parse), declaredMime)
+
+    /**
+     * What the provider says about [uri], or null to leave the URI out. The provider belongs to another app, which may
+     * be hostile or buggy: anything it throws across binder, or a cursor with the wrong column types (a BLOB where the
+     * size should be, which makes `getLong` throw `SQLiteException`), leaves this one URI out instead of crashing.
+     */
     private fun facts(
         uri: Uri,
         declaredMime: String?,
@@ -76,12 +87,16 @@ internal class UriReader(
                 // A provider that does not know OpenableColumns: keep the URI with what the rest says.
             } catch (_: UnsupportedOperationException) {
                 // Same, for providers that do not support queries at all.
+            } catch (_: RuntimeException) {
+                // SQLiteException from a mistyped column, or whatever the provider threw: leave this URI out.
+                return null
             }
         }
         val type =
             try {
                 resolver.getType(uri)
-            } catch (_: SecurityException) {
+            } catch (_: RuntimeException) {
+                // SecurityException, or a provider failing: the type falls back to the sender's and the extension's.
                 null
             }
         val extension = SharedFiles.cleanName(name ?: uri.lastPathSegment)?.substringAfterLast('.', "")?.lowercase()
@@ -102,9 +117,13 @@ internal class UriReader(
     }
 }
 
-/** The parts of a share intent (design §4.3): the streams and, from a direct-share target, its shortcut id (F‑C3). */
+/**
+ * The parts of a share intent (design §4.3): its streams (with where each came from, for [SharedFiles.grantedStreams]),
+ * whether it grants read access, and, from a direct-share target, its shortcut id (F‑C3).
+ */
 internal class ShareIntent(
-    val streams: List<Uri>,
+    val streams: List<SharedFiles.Stream>,
+    val readGranted: Boolean,
     val declaredMime: String?,
     val shortcutId: String?,
 ) {
@@ -118,22 +137,63 @@ internal class ShareIntent(
         fun read(intent: Intent): ShareIntent? {
             if (!isShare(intent)) return null
             return try {
-                val streams = LinkedHashSet<Uri>()
+                val extra = LinkedHashSet<Uri>()
                 if (intent.action == Intent.ACTION_SEND) {
-                    IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)?.let(streams::add)
+                    IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)?.let(extra::add)
                 } else {
                     IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)?.let { list ->
-                        list.filterNotNull().forEach(streams::add)
+                        list.filterNotNull().forEach(extra::add)
                     }
                 }
-                intent.clipData?.let { clip -> for (i in 0 until clip.itemCount) clip.getItemAt(i)?.uri?.let(streams::add) }
-                ShareIntent(streams.toList(), intent.type, intent.getStringExtra(Intent.EXTRA_SHORTCUT_ID))
+                val clip = LinkedHashSet<Uri>()
+                intent.clipData?.let { data -> for (i in 0 until data.itemCount) data.getItemAt(i)?.uri?.let(clip::add) }
+                val streams = (clip + extra).map { SharedFiles.Stream(it.toString(), it.authority, it in clip) }
+                val granted = (intent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0
+                ShareIntent(streams, granted, intent.type, intent.getStringExtra(Intent.EXTRA_SHORTCUT_ID))
             } catch (_: RuntimeException) {
                 // BadParcelableException, ClassCastException and friends from a malformed Intent.
                 null
             }
         }
     }
+}
+
+/**
+ * What a recreated [MainActivity] does with the share it handled before (design §4.3): the files must be attached
+ * once, survive a rotation, and come back after the process died while they were still waiting (Android keeps the
+ * activity's URI grants across process death, not across its destruction).
+ */
+internal object ShareRestore {
+    enum class Action {
+        /** Read the launch intent's share (a fresh start, or the process died with the share still waiting). */
+        HANDLE,
+
+        /** The controller still holds the share (a configuration change): the new activity owns it now. */
+        ADOPT,
+
+        /** Nothing to do: no share, or its files were already sent or cleared. */
+        SKIP,
+    }
+
+    /**
+     * @param restored the activity is being recreated (it has saved state).
+     * @param savedShareId the share the previous instance handled, if any.
+     * @param savedPending the share was still waiting (attached or being read) when the state was saved.
+     * @param live the process still holds that share (attached or being read).
+     */
+    fun decide(
+        restored: Boolean,
+        savedShareId: String?,
+        savedPending: Boolean,
+        live: Boolean,
+    ): Action =
+        when {
+            !restored -> Action.HANDLE
+            savedShareId == null -> Action.SKIP
+            live -> Action.ADOPT
+            savedPending -> Action.HANDLE
+            else -> Action.SKIP
+        }
 }
 
 /** The avatar from the photo picker: decoded at most [EDGE_PX] on its short side and cropped to a centred square. */

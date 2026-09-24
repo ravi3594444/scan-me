@@ -1,5 +1,6 @@
 package com.constrivo.drop.ui.shared.presenter
 
+import com.constrivo.drop.core.discovery.EphemeralIds
 import com.constrivo.drop.core.discovery.Ring
 import com.constrivo.drop.core.discovery.Visibility
 import com.constrivo.drop.core.ladder.LadderHint
@@ -19,6 +20,7 @@ import com.constrivo.drop.ui.shared.model.TransferStage
 import com.constrivo.drop.ui.shared.model.VisibilityState
 import com.constrivo.drop.ui.shared.theme.DropMotion
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
@@ -27,6 +29,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -265,15 +268,157 @@ class RadarPresenterTest {
             runCurrent()
             s.fake.receivedFiles.emit(ReceivedFile("f1", "tx", "a.jpg", FileKind.IMAGE))
             s.fake.receivedFiles.emit(ReceivedFile("f2", "tx", "b.pdf", FileKind.DOCUMENT))
+            advanceTimeBy(RadarPresenter.TRAY_BATCH_MILLIS + 1)
             runCurrent()
             assertEquals(listOf("f1", "f2"), s.state.tray.map { it.id })
             repeat(RadarPresenter.MAX_TRAY_ITEMS + 5) { s.fake.receivedFiles.emit(ReceivedFile("x$it", "tx", "x", FileKind.OTHER)) }
+            advanceTimeBy(RadarPresenter.TRAY_BATCH_MILLIS + 1)
             runCurrent()
             assertEquals(RadarPresenter.MAX_TRAY_ITEMS, s.state.tray.size)
             assertEquals("x${RadarPresenter.MAX_TRAY_ITEMS + 4}", s.state.tray.last().id)
             s.presenter.clearTray()
             runCurrent()
             assertTrue(s.state.tray.isEmpty())
+        }
+
+    @Test
+    fun fE7_receivedFilesReachTheTrayInBatches() =
+        runTest {
+            val s = Setup(this)
+            runCurrent()
+            val states = ArrayList<Int>()
+            backgroundScope.launch { s.presenter.state.collect { states += it.tray.size } }
+            runCurrent()
+            val before = states.size
+            // 1,000 files arrive within one batch window; the collector only queues them ...
+            repeat(1_000) { i -> s.fake.receivedFiles.emit(ReceivedFile("f$i", "tx", "IMG_$i.jpg", FileKind.IMAGE)) }
+            runCurrent()
+            assertTrue(s.state.tray.isEmpty(), "nothing yet: the tray updates once per window")
+            advanceTimeBy(RadarPresenter.TRAY_BATCH_MILLIS + 1)
+            runCurrent()
+            // ... and the radar recomputes once for all of them, keeping the newest.
+            assertEquals(1, states.size - before, "one radar update for the whole batch")
+            assertEquals(RadarPresenter.MAX_TRAY_ITEMS, s.state.tray.size)
+            assertEquals("f999", s.state.tray.last().id)
+        }
+
+    @Test
+    fun fD5_installersAreMarkedInTheTray() =
+        runTest {
+            val s = Setup(this)
+            runCurrent()
+            s.fake.receivedFiles.emit(ReceivedFile("f1", "tx", "Maps.apk", FileKind.OTHER, senderName = "Dev"))
+            s.fake.receivedFiles.emit(ReceivedFile("f2", "tx", "setup", FileKind.OTHER, mime = "application/x-msdownload"))
+            s.fake.receivedFiles.emit(ReceivedFile("f3", "tx", "IMG_1.jpg", FileKind.IMAGE))
+            advanceTimeBy(RadarPresenter.TRAY_BATCH_MILLIS + 1)
+            runCurrent()
+            assertEquals(listOf(true, true, false), s.state.tray.map { it.installer })
+            assertEquals("Dev", s.state.tray.first().senderName)
+        }
+
+    @Test
+    fun fC3_aDirectShareTargetThatDoesNotAppearStopsWaiting() =
+        runTest {
+            val s = Setup(this)
+            s.presenter.attach(photos, directTarget = "t:rohan", directTargetName = "Rohan")
+            runCurrent()
+            assertEquals("Rohan", s.state.attachment?.waitingFor, "the banner says who the files wait for")
+            advanceTimeBy(RadarPresenter.DIRECT_SHARE_WINDOW_MILLIS + 1)
+            runCurrent()
+            assertNull(s.state.attachment?.waitingFor, "then they wait for a tap like any share")
+            s.fake.devices.value = listOf(Fixtures.device("t:rohan", "Rohan", Ring.INNER, trusted = true))
+            runCurrent()
+            assertTrue(s.fake.calls.isEmpty(), "no send hours later, when the device happens to show up")
+            assertEquals(3, s.state.attachment?.summary?.count)
+            assertEquals(BubbleTapResult.SENT, s.presenter.onBubbleTapped("t:rohan"))
+            assertEquals(listOf("send:t:rohan:3"), s.fake.calls)
+        }
+
+    @Test
+    fun fC3_directShareAndATapSendTheFilesOnce() =
+        runTest {
+            val s = Setup(this)
+            s.fake.devices.value = listOf(Fixtures.device("e:meera", "Meera"))
+            runCurrent()
+            s.presenter.attach(photos, directTarget = "t:rohan")
+            // The tap takes the files first; the target appearing in the same frame must not send them again.
+            assertEquals(BubbleTapResult.SENT, s.presenter.onBubbleTapped("e:meera"))
+            s.fake.devices.value =
+                listOf(Fixtures.device("e:meera", "Meera"), Fixtures.device("t:rohan", "Rohan", Ring.INNER, trusted = true))
+            runCurrent()
+            assertEquals(listOf("send:e:meera:3"), s.fake.calls)
+        }
+
+    @Test
+    fun designSection43_theBannerNamesTheFilesAndAShareCanBeReleased() =
+        runTest {
+            val s = Setup(this)
+            s.presenter.attach(photos, shareId = "share-1")
+            runCurrent()
+            val banner = s.state.attachment!!
+            assertEquals(listOf("IMG_0.jpg", "IMG_1.jpg"), banner.names)
+            assertEquals(1, banner.moreCount)
+            assertTrue(s.presenter.holdsShare("share-1"))
+            s.presenter.releaseShare("share-0")
+            runCurrent()
+            assertNotNull(s.state.attachment, "another share's release leaves these files alone")
+            s.presenter.releaseShare("share-1")
+            runCurrent()
+            assertNull(s.state.attachment, "the grant went with its activity: the files are dropped")
+            assertFalse(s.presenter.holdsShare("share-1"))
+        }
+
+    @Test
+    fun fB3_theSenderCanPutTheCodeAsideWithoutTrusting() =
+        runTest {
+            val s = Setup(this)
+            s.fake.devices.value = listOf(Fixtures.device("e:a", "Dev"))
+            s.fake.transfers.value = listOf(Fixtures.transfer("tx", "e:a", stage = TransferStage.AWAITING_ACCEPT, pairingCode = "042917"))
+            runCurrent()
+            s.presenter.pairLater("tx")
+            runCurrent()
+            assertNull(s.state.senderPairing, "hidden for this transfer")
+            assertTrue(s.fake.calls.isEmpty(), "and nothing trusted")
+            // The code stays reachable: tapping the busy bubble shows it again.
+            assertEquals(BubbleTapResult.BUSY, s.presenter.onBubbleTapped("e:a"))
+            runCurrent()
+            assertEquals("042917", s.state.senderPairing?.code)
+        }
+
+    @Test
+    fun wp1_aStrangersNewRotatingIdReplacesItsBubble() =
+        runTest {
+            val s = Setup(this)
+            // Just before a 15-minute epoch boundary on the wall clock.
+            val intoEpoch = s.clocks.nowMillis() % EphemeralIds.EPOCH_MILLIS
+            advanceTimeBy(EphemeralIds.EPOCH_MILLIS - intoEpoch - 5_000)
+            val t0 = s.clocks.elapsedMillis()
+            s.fake.devices.value = listOf(Fixtures.device("e:old", "Meera", lastSeen = t0))
+            runCurrent()
+            advanceTimeBy(6_000) // across the boundary: the old ID stops, the new one is heard
+            val t1 = s.clocks.elapsedMillis()
+            s.fake.devices.value =
+                listOf(Fixtures.device("e:old", "Meera", lastSeen = t1 - 1_000), Fixtures.device("e:new", "Meera", lastSeen = t1))
+            runCurrent()
+            assertEquals(listOf("e:old"), s.state.bubbles.map { it.key }, "the new ID is held back while it may be the same person")
+            advanceTimeBy(1_000)
+            runCurrent()
+            val bubbles = s.state.bubbles
+            assertEquals(listOf("e:new"), bubbles.map { it.key }, "one bubble, not two")
+            assertEquals("e:old", bubbles.single().replacesKey, "drawn as the old bubble moving")
+
+            // A different device with the same name, still heard, is a second bubble.
+            advanceTimeBy(EphemeralIds.EPOCH_MILLIS - 2_000)
+            repeat(8) {
+                val now = s.clocks.elapsedMillis()
+                s.fake.devices.value =
+                    listOf(Fixtures.device("e:new", "Meera", lastSeen = now), Fixtures.device("e:twin", "Meera", lastSeen = now))
+                runCurrent()
+                advanceTimeBy(500)
+            }
+            runCurrent()
+            assertEquals(listOf("e:new", "e:twin"), s.state.bubbles.map { it.key })
+            assertNull(s.state.bubbles.first { it.key == "e:twin" }.replacesKey)
         }
 
     @Test

@@ -91,6 +91,11 @@ data class BubbleUi(
     val lanOnly: Boolean,
     val rssiDbm: Double? = null,
     val activity: BubbleActivity? = null,
+    /**
+     * The key of the bubble this one replaces: the same stranger under its new rotating ID (15-minute epochs). The view
+     * starts this bubble where that one was and moves it, instead of showing a new device appearing.
+     */
+    val replacesKey: String? = null,
 ) {
     /** Busy bubbles are never collapsed into "+N more" (they rank first in placement). */
     val busy: Boolean get() = activity != null
@@ -144,19 +149,39 @@ sealed interface BubbleActivity {
     ) : BubbleActivity
 }
 
-/** The share-sheet banner "Sending 12 photos · 48 MB — tap a device" (design §4.3). */
+/**
+ * The share-sheet banner "Sending 12 photos · 48 MB — tap a device" (design §4.3).
+ *
+ * @property names the first file names, so the user sees what will be sent; [moreCount] counts the rest.
+ * @property waitingFor the name of a direct-share target (F‑C3) the files go to as soon as it is on the radar; null when
+ *   a tap decides.
+ */
 @Immutable
 data class AttachmentUi(
     val summary: ItemSummary,
     val totalBytes: Long,
-)
+    val names: List<String> = emptyList(),
+    val moreCount: Int = 0,
+    val waitingFor: String? = null,
+) {
+    companion object {
+        /** How many names the banner lists. */
+        const val MAX_NAMES: Int = 2
+    }
+}
 
-/** A thumbnail in the tray (design §5.2), newest last (on the right). */
+/**
+ * A thumbnail in the tray (design §5.2), newest last (on the right).
+ *
+ * @property installer the file installs or runs code ([InstallerFiles]); opening it asks first (F‑D5).
+ */
 @Immutable
 data class TrayItemUi(
     val id: String,
     val name: String,
     val thumb: FileThumb,
+    val installer: Boolean = false,
+    val senderName: String? = null,
 )
 
 /** The confirm sheet for cancelling past 100 MB (design §4.2). */

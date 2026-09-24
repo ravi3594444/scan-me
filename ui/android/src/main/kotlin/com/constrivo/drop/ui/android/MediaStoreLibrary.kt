@@ -25,6 +25,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -34,6 +35,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.update
 import java.io.IOException
 
 /**
@@ -41,9 +43,11 @@ import java.io.IOException
  * no broad storage permission).
  *
  * The gallery is read only while the picker is open ([pickerOpen]) and media access is granted, so nothing is read
- * before the user asks to send (F‑I1) and the thumbnails are released when the sheet closes. It lists the [LIMIT]
- * most recently added photos and videos; older ones are one tap away in the Files tab (the system picker). Rows come
- * first with type glyphs, then thumbnails fill in page by page; the list reloads when the gallery changes. With
+ * before the user asks to send (F‑I1) and the thumbnails are released when the sheet closes. It lists the most
+ * recently added photos and videos, [PAGE] at a time: when the grid scrolls near its end the picker asks for more
+ * ([requestMore]) and the next page is appended, up to [MAX_ITEMS] (older ones are in the Files tab, the system
+ * picker). Rows come first with type glyphs, then thumbnails fill in; a thumbnail is decoded once per open sheet. The
+ * list reloads when the gallery changes. Selected items stay selected in the picker whatever this list shows. With
  * Android 14's partial access the query returns only the photos the user selected, which is what the grid shows.
  *
  * Item ids are `content:` URIs of the MediaStore rows; an app's id is the path of its APK (world-readable, one file:
@@ -59,11 +63,21 @@ internal class MediaStoreLibrary(
     override val mediaAccess: Flow<Boolean> =
         permissions.changes.map { permissions.status(DropPermission.MEDIA).usable }.distinctUntilChanged()
 
+    /** How many pages the open picker wants; back to one each time it opens. */
+    private val pages = MutableStateFlow(1)
+
     @OptIn(ExperimentalCoroutinesApi::class)
     override val media: Flow<List<PickedItem>> =
         combine(pickerOpen, mediaAccess) { open, access -> open && access }
             .distinctUntilChanged()
-            .flatMapLatest { load -> if (load) recentMedia() else flowOf(emptyList()) }
+            .flatMapLatest { load ->
+                pages.value = 1
+                if (load) recentMedia() else flowOf(emptyList())
+            }
+
+    override fun requestMore() {
+        pages.update { if (it * PAGE < MAX_ITEMS) it + 1 else it }
+    }
 
     override val apps: Flow<List<PickedItem>> = flow { emit(installedApps()) }.flowOn(Dispatchers.IO)
 
@@ -78,14 +92,20 @@ internal class MediaStoreLibrary(
 
     @OptIn(ExperimentalCoroutinesApi::class)
     private fun recentMedia(): Flow<List<PickedItem>> =
-        galleryChanges()
-            .flatMapLatest { first ->
-                flow {
-                    // A camera save fires several changes in a row; wait for them to settle before reloading.
-                    if (!first) delay(RELOAD_SETTLE_MILLIS)
-                    emitAll(loadRecent())
-                }
-            }.flowOn(Dispatchers.IO)
+        flow {
+            // Decoded thumbnails, kept while the sheet is open so a new page or a reload does not decode them again.
+            val thumbs = HashMap<Uri, FileThumb>()
+            emitAll(
+                combine(galleryChanges(), pages) { first, n -> first to n }
+                    .flatMapLatest { (first, n) ->
+                        flow {
+                            // A camera save fires several changes in a row; wait for them to settle before reloading.
+                            if (!first) delay(RELOAD_SETTLE_MILLIS)
+                            emitAll(loadRecent(n * PAGE, thumbs))
+                        }
+                    },
+            )
+        }.flowOn(Dispatchers.IO)
 
     /** Emits true once at start, then false on every change to external media. */
     private fun galleryChanges(): Flow<Boolean> =
@@ -101,18 +121,27 @@ internal class MediaStoreLibrary(
             awaitClose { resolver.unregisterContentObserver(observer) }
         }
 
-    private fun loadRecent(): Flow<List<PickedItem>> =
+    private fun loadRecent(
+        limit: Int,
+        thumbs: MutableMap<Uri, FileThumb>,
+    ): Flow<List<PickedItem>> =
         flow {
-            val rows = queryRecent()
-            val items = rows.mapTo(ArrayList(rows.size)) { it.item(null) }
+            val rows = queryRecent(limit)
+            val items = rows.mapTo(ArrayList(rows.size)) { it.item(thumbs[it.uri]) }
             emit(items.toList())
-            for (page in rows.indices.chunked(THUMB_PAGE)) {
-                for (i in page) thumbnail(rows[i])?.let { items[i] = rows[i].item(it) }
+            val missing = rows.indices.filter { rows[it].uri !in thumbs }
+            for (page in missing.chunked(THUMB_PAGE)) {
+                for (i in page) {
+                    thumbnail(rows[i])?.let {
+                        thumbs[rows[i].uri] = it
+                        items[i] = rows[i].item(it)
+                    }
+                }
                 emit(items.toList())
             }
         }
 
-    private fun queryRecent(): List<Row> {
+    private fun queryRecent(limit: Int): List<Row> {
         val collection = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL)
         val projection =
             arrayOf(
@@ -134,7 +163,7 @@ internal class MediaStoreLibrary(
                 )
                 putStringArray(ContentResolver.QUERY_ARG_SORT_COLUMNS, arrayOf(MediaStore.MediaColumns.DATE_ADDED))
                 putInt(ContentResolver.QUERY_ARG_SORT_DIRECTION, ContentResolver.QUERY_SORT_DIRECTION_DESCENDING)
-                putInt(ContentResolver.QUERY_ARG_LIMIT, LIMIT)
+                putInt(ContentResolver.QUERY_ARG_LIMIT, limit)
             }
         val rows = ArrayList<Row>()
         try {
@@ -158,6 +187,8 @@ internal class MediaStoreLibrary(
             // Access was revoked between the check and the query: an empty grid, and mediaAccess catches up.
         } catch (_: IllegalArgumentException) {
             // A provider without one of the columns (never on stock MediaStore): nothing to show.
+        } catch (_: RuntimeException) {
+            // The media provider failed (it runs in another process): an empty grid rather than a crash.
         }
         return rows
     }
@@ -167,7 +198,8 @@ internal class MediaStoreLibrary(
             FileThumb.Picture(resolver.loadThumbnail(row.uri, Size(THUMB_PX, THUMB_PX), null).asImageBitmap(), row.kind)
         } catch (_: IOException) {
             null
-        } catch (_: SecurityException) {
+        } catch (_: RuntimeException) {
+            // SecurityException, or a decoder failing on a broken file: the tile keeps its glyph.
             null
         }
 
@@ -207,8 +239,11 @@ internal class MediaStoreLibrary(
     }
 
     companion object {
-        /** How many recent photos and videos the grid lists. */
-        const val LIMIT: Int = 120
+        /** How many photos and videos the grid lists at first, and adds per [requestMore]. */
+        const val PAGE: Int = 120
+
+        /** The grid's limit; older media are in the Files tab. */
+        const val MAX_ITEMS: Int = 5_000
 
         /** Thumbnail edge in pixels: sharp in a grid cell, about 100 KB each. */
         const val THUMB_PX: Int = 160

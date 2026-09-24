@@ -37,6 +37,7 @@ object Fixtures {
         platform: DevicePlatform = DevicePlatform.PHONE,
         rssi: Double? = -62.0,
         lanOnly: Boolean = false,
+        lastSeen: Long = 0,
     ): NearbyDevice =
         NearbyDevice(
             key = key,
@@ -56,7 +57,7 @@ object Fixtures {
             carrier = null,
             lanEndpoints = emptyList(),
             sources = if (lanOnly) setOf(DiscoverySource.LAN) else setOf(DiscoverySource.BLUETOOTH),
-            lastSeenElapsedMillis = 0,
+            lastSeenElapsedMillis = lastSeen,
         )
 
     fun transfer(

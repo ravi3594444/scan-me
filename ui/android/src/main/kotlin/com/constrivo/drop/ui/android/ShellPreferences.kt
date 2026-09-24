@@ -72,8 +72,8 @@ internal interface KeyValueStore {
 
 /**
  * What the Android shell keeps between launches until the engine's settings repository (core/data, wired by the
- * app-layer work of WP7) takes over: whether onboarding is done, the nickname it chose, and which permissions the user
- * has actively denied before ([PermissionMatrix.status]).
+ * app-layer work of WP7) takes over: whether onboarding is done, the nickname it chose, the in-app language, and which
+ * permissions the user has actively denied before ([PermissionMatrix.status]).
  */
 internal class ShellPreferences(
     private val store: KeyValueStore,
@@ -86,6 +86,11 @@ internal class ShellPreferences(
         get() = store.getString(KEY_NICKNAME)
         set(value) = store.putString(KEY_NICKNAME, value)
 
+    /** Settings → Language as a BCP 47 tag, null for the system's (Android 12 keeps it here; 13+ in `LocaleManager`). */
+    var languageTag: String?
+        get() = store.getString(KEY_LANGUAGE)
+        set(value) = store.putString(KEY_LANGUAGE, value)
+
     fun wasDenied(permission: String): Boolean = store.getBoolean(KEY_DENIED + permission)
 
     fun markDenied(permission: String) = store.putBoolean(KEY_DENIED + permission, true)
@@ -96,6 +101,7 @@ internal class ShellPreferences(
 
         private const val KEY_ONBOARDED = "onboarded"
         private const val KEY_NICKNAME = "nickname"
+        private const val KEY_LANGUAGE = "language"
         private const val KEY_DENIED = "denied."
 
         /** The app-private store behind the shell's preferences (also used by [DirectShareIds]). */

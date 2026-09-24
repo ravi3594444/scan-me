@@ -38,6 +38,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.constrivo.drop.core.discovery.Visibility
 import com.constrivo.drop.ui.shared.TestTags
@@ -57,6 +58,7 @@ import com.constrivo.drop.ui.shared.theme.DropDimens
 import com.constrivo.drop.ui.shared.theme.DropShapes
 import com.constrivo.drop.ui.shared.theme.LocalDropColors
 import com.constrivo.drop.ui.shared.theme.LocalDropTypography
+import org.jetbrains.compose.resources.pluralStringResource
 import org.jetbrains.compose.resources.stringResource
 
 /** Everything the radar can ask for; the host wires these to presenters and navigation. */
@@ -197,13 +199,17 @@ fun VisibilityChip(
     }
 }
 
-/** "Sending 12 photos · 48 MB — tap a device" (design §4.3). */
+/**
+ * "Sending 12 photos · 48 MB — tap a device" (design §4.3), with the first file names below it so the user sees what
+ * will be sent, or "… to Rohan's Pixel as soon as it is nearby" while the files wait for a direct-share target.
+ */
 @Composable
 private fun ShareBanner(
     attachment: AttachmentUi,
     onClear: () -> Unit,
 ) {
     val colors = LocalDropColors.current
+    val type = LocalDropTypography.current
     Row(
         modifier =
             Modifier
@@ -215,15 +221,36 @@ private fun ShareBanner(
                 .testTag(TestTags.RADAR_BANNER),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(
-            stringResource(Res.string.share_banner, summaryText(attachment.summary), sizeText(attachment.totalBytes)),
-            style = LocalDropTypography.current.body,
-            color = colors.text,
-            modifier = Modifier.weight(1f).padding(vertical = 12.dp),
-        )
+        Column(Modifier.weight(1f).padding(vertical = 12.dp)) {
+            val summary = summaryText(attachment.summary)
+            val size = sizeText(attachment.totalBytes)
+            Text(
+                attachment.waitingFor?.let { stringResource(Res.string.share_banner_waiting, summary, size, it) }
+                    ?: stringResource(Res.string.share_banner, summary, size),
+                style = type.body,
+                color = colors.text,
+            )
+            if (attachment.names.isNotEmpty()) {
+                val names = attachment.names.joinToString(NAME_SEPARATOR)
+                Text(
+                    if (attachment.moreCount > 0) {
+                        pluralStringResource(Res.plurals.share_banner_names_more, attachment.moreCount, names, attachment.moreCount)
+                    } else {
+                        names
+                    },
+                    style = type.caption,
+                    color = colors.textMuted,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
         IconAction(DropIcons.Close, stringResource(Res.string.a11y_clear_attachment), onClear, tint = colors.textMuted)
     }
 }
+
+/** Between file names in the banner (English and Hindi both use a comma). */
+private const val NAME_SEPARATOR = ", "
 
 /** The empty and error states of design §8.1, one at a time. */
 @Composable

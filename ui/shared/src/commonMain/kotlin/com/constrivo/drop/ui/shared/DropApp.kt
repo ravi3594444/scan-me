@@ -47,6 +47,7 @@ import com.constrivo.drop.ui.shared.receive.BrowserApprovalCallbacks
 import com.constrivo.drop.ui.shared.receive.BrowserApprovalSheet
 import com.constrivo.drop.ui.shared.receive.IncomingCallbacks
 import com.constrivo.drop.ui.shared.receive.IncomingCard
+import com.constrivo.drop.ui.shared.receive.InstallerWarningSheet
 import com.constrivo.drop.ui.shared.receive.SenderPairingCallbacks
 import com.constrivo.drop.ui.shared.receive.SenderPairingSheet
 import com.constrivo.drop.ui.shared.resources.*
@@ -56,7 +57,9 @@ import com.constrivo.drop.ui.shared.send.ScanQrCallbacks
 import com.constrivo.drop.ui.shared.send.ScanQrScreen
 import com.constrivo.drop.ui.shared.send.ShowQrCallbacks
 import com.constrivo.drop.ui.shared.send.ShowQrSheet
+import com.constrivo.drop.ui.shared.text.LanguageScope
 import com.constrivo.drop.ui.shared.theme.DropTheme
+import kotlinx.coroutines.CoroutineExceptionHandler
 import org.jetbrains.compose.resources.stringResource
 
 /**
@@ -66,7 +69,8 @@ import org.jetbrains.compose.resources.stringResource
  */
 @Composable
 fun DropApp() {
-    val scope = rememberCoroutineScope()
+    // A failure in one port must not end the app (the app layers give their own scopes a handler too).
+    val scope = rememberCoroutineScope { CoroutineExceptionHandler { _, e -> e.printStackTrace() } }
     val controller =
         remember {
             DropAppController(scope, DropDependencies.inMemory(wallClock = SystemWallClock, calendar = DayCalendar.System))
@@ -82,6 +86,8 @@ fun DropApp() {
  * @param camera the scanner's camera preview (platform; CameraX + ZXing on Android).
  * @param reducedMotion the system's reduced-motion setting (design §3.3, §11).
  * @param haptics the platform's haptic hooks (design §4.2, §4.4).
+ * @param applyLanguage apply Settings → Language here ([com.constrivo.drop.ui.shared.text.AppLocale]); false when the
+ *   host applies it through the platform (Android 13+ `LocaleManager`).
  */
 @Composable
 fun DropApp(
@@ -91,20 +97,24 @@ fun DropApp(
     reducedMotion: Boolean = false,
     haptics: DropHaptics = DropHaptics.None,
     fontFamily: FontFamily = FontFamily.Default,
+    applyLanguage: Boolean = true,
     camera: @Composable () -> Unit = {},
 ) {
-    DropTheme(dark = dark, fontFamily = fontFamily, reducedMotion = reducedMotion) {
-        CompositionLocalProvider(LocalDropHaptics provides haptics) {
-            val screen by controller.screen.collectAsState()
-            val globalSheet = globalSheet(controller)
-            val localSheet = if (globalSheet == null) screenSheet(controller, screen) else null
-            val sheet = globalSheet ?: localSheet
-            SheetHost(sheet = sheet, onDismiss = { dismiss(controller, sheet?.key) }, modifier = modifier.fillMaxSize()) {
-                when (screen) {
-                    Screen.ONBOARDING -> OnboardingHost(controller)
-                    Screen.RADAR -> RadarHost(controller)
-                    Screen.DASHBOARD -> DashboardHost(controller)
-                    Screen.SCAN -> ScanHost(controller, camera)
+    val language by controller.language.collectAsState()
+    LanguageScope(if (applyLanguage) language else null) {
+        DropTheme(dark = dark, fontFamily = fontFamily, reducedMotion = reducedMotion) {
+            CompositionLocalProvider(LocalDropHaptics provides haptics) {
+                val screen by controller.screen.collectAsState()
+                val globalSheet = globalSheet(controller)
+                val localSheet = if (globalSheet == null) screenSheet(controller, screen) else null
+                val sheet = globalSheet ?: localSheet
+                SheetHost(sheet = sheet, onDismiss = { dismiss(controller, sheet?.key) }, modifier = modifier.fillMaxSize()) {
+                    when (screen) {
+                        Screen.ONBOARDING -> OnboardingHost(controller)
+                        Screen.RADAR -> RadarHost(controller)
+                        Screen.DASHBOARD -> DashboardHost(controller)
+                        Screen.SCAN -> ScanHost(controller, camera)
+                    }
                 }
             }
         }
@@ -116,6 +126,7 @@ private enum class Sheet {
     PERMISSION,
     BROWSER,
     INCOMING,
+    INSTALLER,
     PAIRING,
     CANCEL,
     PICKER,
@@ -139,13 +150,16 @@ private fun dismiss(
     when (key) {
         Sheet.PERMISSION -> c.permissions.onDismiss()
 
+        // an explicit answer is required; the server withdraws the prompt on its own timeout
         Sheet.BROWSER -> Unit
 
-        // an explicit answer is required; the server withdraws the prompt on its own timeout
+        // the countdown decides; Decline is one tap away
         Sheet.INCOMING -> Unit
 
-        // the countdown decides; Decline is one tap away
-        Sheet.PAIRING -> Unit
+        Sheet.INSTALLER -> c.dismissInstallerWarning()
+
+        // put aside without trusting the device ("Not now"); the bubble brings it back
+        Sheet.PAIRING -> c.radar.state.value.senderPairing?.let { c.pairLater(it.transferId) }
 
         Sheet.CANCEL -> c.radar.dismissCancel()
 
@@ -170,6 +184,7 @@ private fun globalSheet(c: DropAppController): SheetSpec? {
     val browser by c.browserApproval.state.collectAsState()
     val incoming by c.incoming.state.collectAsState()
     val radar by c.radar.state.collectAsState()
+    val installer by c.installerWarning.collectAsState()
     permission?.let { p ->
         return SheetSpec(Sheet.PERMISSION) {
             PermissionSheet(p, PermissionSheetCallbacks(onContinue = c.permissions::onContinue, onDismiss = c.permissions::onDismiss))
@@ -193,13 +208,20 @@ private fun globalSheet(c: DropAppController): SheetSpec? {
             )
         }
     }
+    installer?.let { warning ->
+        return SheetSpec(Sheet.INSTALLER) {
+            InstallerWarningSheet(warning, onOpen = c::confirmOpenInstaller, onCancel = c::dismissInstallerWarning)
+        }
+    }
     radar.senderPairing?.let { pairing ->
         return SheetSpec(Sheet.PAIRING) {
             SenderPairingSheet(
                 pairing,
-                SenderPairingCallbacks(onConfirm = {
-                    c.radar.confirmPairing(pairing.transferId)
-                }, onCancel = { c.radar.onCancelTapped(pairing.transferId) }),
+                SenderPairingCallbacks(
+                    onConfirm = { c.radar.confirmPairing(pairing.transferId) },
+                    onCancel = { c.radar.onCancelTapped(pairing.transferId) },
+                    onLater = { c.pairLater(pairing.transferId) },
+                ),
             )
         }
     }
@@ -221,36 +243,50 @@ private fun screenSheet(
         else -> null
     }
 
+/** The file picker, over the radar (a bubble, the browser page) or the dashboard (the Live tab's "Add files"). */
+@Composable
+private fun pickerSheet(c: DropAppController): SheetSpec? {
+    val picker by c.picker.state.collectAsState()
+    return picker?.let { p ->
+        SheetSpec(Sheet.PICKER, heightFraction = PICKER_HEIGHT) {
+            FilePickerSheet(
+                p,
+                FilePickerCallbacks(
+                    onTab = c.picker::selectTab,
+                    onToggle = c.picker::toggle,
+                    onBrowseFiles = { c.platformBrowseFiles() },
+                    onAllowPhotos = { c.askMediaAgain() },
+                    onSend = c::sendPicked,
+                    onClose = c::closeSheet,
+                    onLoadMore = c.picker::loadMore,
+                ),
+                Modifier.fillMaxSize(),
+            )
+        }
+    }
+}
+
 @Composable
 private fun radarSheet(c: DropAppController): SheetSpec? {
     val sheet by c.radarSheet.collectAsState()
-    val picker by c.picker.state.collectAsState()
     val qr by c.showQr.state.collectAsState()
     val radar by c.radar.state.collectAsState()
     return when (sheet) {
         RadarSheet.PICKER -> {
-            picker?.let { p ->
-                SheetSpec(Sheet.PICKER, heightFraction = PICKER_HEIGHT) {
-                    FilePickerSheet(
-                        p,
-                        FilePickerCallbacks(
-                            onTab = c.picker::selectTab,
-                            onToggle = c.picker::toggle,
-                            onBrowseFiles = { c.platformBrowseFiles() },
-                            onAllowPhotos = { c.askMediaAgain() },
-                            onSend = c::sendPicked,
-                            onClose = c::closeSheet,
-                        ),
-                        Modifier.fillMaxSize(),
-                    )
-                }
-            }
+            pickerSheet(c)
         }
 
         RadarSheet.SHOW_QR -> {
             qr?.let { q ->
                 SheetSpec(Sheet.QR) {
-                    ShowQrSheet(q, ShowQrCallbacks(onStartBrowserShare = c.showQr::startBrowserShare, onClose = c::closeSheet))
+                    ShowQrSheet(
+                        q,
+                        ShowQrCallbacks(
+                            onStartBrowserShare = c::startBrowserShare,
+                            onToggleBrowserCode = c.showQr::toggleBrowserCode,
+                            onClose = c::closeSheet,
+                        ),
+                    )
                 }
             }
         }
@@ -282,6 +318,8 @@ private fun radarSheet(c: DropAppController): SheetSpec? {
 
 @Composable
 private fun dashboardSheet(c: DropAppController): SheetSpec? {
+    val sheet by c.radarSheet.collectAsState()
+    if (sheet == RadarSheet.PICKER) return pickerSheet(c)
     val history by c.dashboard.history.state.collectAsState()
     val devices by c.dashboard.devices.state.collectAsState()
     val confirmPartials by c.dashboard.settings.confirmClear.collectAsState()
@@ -345,7 +383,7 @@ private fun historyCallbacks(c: DropAppController) =
         onOpen = c.dashboard.history::openDetail,
         onClear = c.dashboard.history::askClear,
         onCloseDetail = c.dashboard.history::closeDetail,
-        onOpenFile = c.dashboard.history::openFile,
+        onOpenFile = c::openHistoryFile,
         onResend = c.dashboard.history::resend,
     )
 
@@ -407,8 +445,8 @@ private fun DashboardHost(c: DropAppController) {
                 LiveCallbacks(
                     onPause = d.live::pause,
                     onResume = d.live::resume,
-                    onCancel = d.live::cancel,
-                    onAddFiles = d.live::addFiles,
+                    onCancel = c::cancelTransfer,
+                    onAddFiles = c::openAddFiles,
                 ),
             history = historyCallbacks(c),
             devices =

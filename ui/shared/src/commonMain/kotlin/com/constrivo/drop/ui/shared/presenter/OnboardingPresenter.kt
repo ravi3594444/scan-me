@@ -130,14 +130,23 @@ class PermissionGate(
     /** The explainer on screen, or null. */
     val state: StateFlow<PermissionPromptUi?> = prompt.asStateFlow()
 
-    /** True when [permission] is usable, asking the user first if needed. */
+    /**
+     * True when [permission] is usable, asking the user first if needed.
+     *
+     * The status is read again once the explainer is answered: the platform may only now be able to tell a permanent
+     * denial (Android needs a visible activity to answer "should show rationale"), and the user may have granted it
+     * in Settings meanwhile.
+     */
     suspend fun ensure(permission: DropPermission): Boolean =
         serial.withLock {
             var status = controller.status(permission)
             if (status.usable) return@withLock true
-            if (!explain(permission, blocked = status == PermissionStatus.BLOCKED)) return@withLock false
+            val explainedBlocked = status == PermissionStatus.BLOCKED
+            if (!explain(permission, blocked = explainedBlocked)) return@withLock false
+            status = controller.status(permission)
+            if (status.usable) return@withLock true
             if (status == PermissionStatus.BLOCKED) {
-                controller.openAppSettings()
+                if (explainedBlocked || explain(permission, blocked = true)) controller.openAppSettings()
                 return@withLock false
             }
             status = controller.request(permission)

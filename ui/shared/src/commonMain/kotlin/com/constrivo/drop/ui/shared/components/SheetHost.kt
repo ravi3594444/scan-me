@@ -27,6 +27,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.hideFromAccessibility
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import com.constrivo.drop.ui.shared.theme.DropMotion
 import com.constrivo.drop.ui.shared.theme.LocalDropColors
@@ -63,7 +65,9 @@ fun SheetHost(
     val last = remember { SheetHolder() }
     if (sheet != null) last.spec = sheet
     Box(modifier.fillMaxSize()) {
-        content()
+        // The sheet is modal for screen readers too (design §11): what lies under it is hidden from TalkBack while it
+        // shows, so focus cannot wander to the radar or the dashboard and activate them behind the sheet.
+        Box(if (sheet != null) Modifier.fillMaxSize().semantics { hideFromAccessibility() } else Modifier.fillMaxSize()) { content() }
         AnimatedVisibility(visible = sheet != null, enter = fadeIn(tween(SCRIM_MILLIS)), exit = fadeOut(tween(SCRIM_MILLIS))) {
             Box(
                 Modifier

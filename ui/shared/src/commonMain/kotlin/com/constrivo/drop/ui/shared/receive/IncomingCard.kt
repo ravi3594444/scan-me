@@ -7,6 +7,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -25,10 +26,12 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
-import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.LiveRegionMode
@@ -44,6 +47,7 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.constrivo.drop.ui.shared.TestTags
@@ -53,6 +57,7 @@ import com.constrivo.drop.ui.shared.components.PrimaryButton
 import com.constrivo.drop.ui.shared.components.QuietButton
 import com.constrivo.drop.ui.shared.components.SheetSurface
 import com.constrivo.drop.ui.shared.components.ThumbTile
+import com.constrivo.drop.ui.shared.components.rememberTapGuard
 import com.constrivo.drop.ui.shared.icons.DropIcons
 import com.constrivo.drop.ui.shared.model.Formats
 import com.constrivo.drop.ui.shared.model.IncomingCardUi
@@ -77,7 +82,11 @@ class IncomingCallbacks(
  * The incoming card (F‑D1, design §5.1): sender avatar, "**Dev** wants to send", "12 photos · 48 MB", the 30 s
  * countdown bar under the header, up to six previews and "+N", the trust caption ("Verified device" or "New device —
  * first time"), for a first-time sender the six-digit code with "Same code on both screens?" and "Yes, it matches",
- * then "Always accept from Dev", Accept and Decline. The content scrolls at large font sizes instead of clipping.
+ * then "Always accept from Dev", Accept and Decline.
+ *
+ * Accept and Decline are pinned below the content, which scrolls at large font sizes, so both stay on screen at 200%
+ * inside the 30 s countdown (design §11). The card appears unasked, when a sender chooses, so Accept, "Yes, it
+ * matches" and "Always accept" ignore taps for the first moments of each Offer ([TapGuard]).
  */
 @Composable
 fun IncomingCard(
@@ -87,8 +96,14 @@ fun IncomingCard(
 ) {
     val colors = LocalDropColors.current
     val type = LocalDropTypography.current
+    val guard = rememberTapGuard(state.offerId)
+    // The code row can appear after the card (as soon as the handshake result exists): its button arms on its own.
+    val sasGuard = rememberTapGuard(state.offerId, state.sas != null)
     SheetSurface(modifier.testTag(TestTags.INCOMING_CARD)) {
-        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Column(
+            Modifier.fillMaxWidth().weight(1f, fill = false).verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Avatar(
                     state.senderInitials,
@@ -110,12 +125,23 @@ fun IncomingCard(
             CountdownBar(state)
             TrustCaption(state.trusted)
             if (state.previews.isNotEmpty()) PreviewStrip(state)
-            state.sas?.let { SasRow(it, state.sasConfirmed, callbacks.onSasConfirmed) }
-            AlwaysAccept(state, callbacks.onAlwaysAccept)
-            PrimaryButton(stringResource(Res.string.incoming_accept), callbacks.onAccept)
-            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                QuietButton(stringResource(Res.string.incoming_decline), callbacks.onDecline, color = colors.dangerText)
-            }
+            state.sas?.let { SasRow(it, state.sasConfirmed, sasGuard.guard(callbacks.onSasConfirmed)) }
+            AlwaysAccept(state) { checked -> if (guard.allows()) callbacks.onAlwaysAccept(checked) }
+        }
+        Spacer(Modifier.height(12.dp))
+        PrimaryButton(
+            stringResource(Res.string.incoming_accept),
+            guard.guard(callbacks.onAccept),
+            Modifier.testTag(TestTags.INCOMING_ACCEPT),
+        )
+        Spacer(Modifier.height(12.dp))
+        Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+            QuietButton(
+                stringResource(Res.string.incoming_decline),
+                callbacks.onDecline,
+                color = colors.dangerText,
+                modifier = Modifier.testTag(TestTags.INCOMING_DECLINE),
+            )
         }
     }
 }
@@ -140,7 +166,9 @@ private fun boldName(
 @Composable
 private fun CountdownBar(state: IncomingCardUi) {
     val colors = LocalDropColors.current
-    val fraction by animateFloatAsState(state.remainingFraction, tween(1_000, easing = LinearEasing))
+    val accent = colors.accent
+    // Read only while drawing, so the 30 s animation redraws the bar without recomposing or re-laying out the card.
+    val fraction = animateFloatAsState(state.remainingFraction, tween(1_000, easing = LinearEasing))
     val seconds = ((state.remainingMillis + 999) / 1000).toInt()
     val description = pluralStringResource(Res.plurals.a11y_incoming_seconds, seconds, seconds)
     Box(
@@ -149,10 +177,13 @@ private fun CountdownBar(state: IncomingCardUi) {
             .height(4.dp)
             .clip(RoundedCornerShape(2.dp))
             .background(colors.outline)
-            .semantics { contentDescription = description },
-    ) {
-        Box(Modifier.fillMaxWidth(fraction).height(4.dp).background(colors.accent))
-    }
+            .drawBehind {
+                val width = size.width * fraction.value.coerceIn(0f, 1f)
+                // The bar empties towards the start edge, as a start-aligned fill would in either layout direction.
+                val left = if (layoutDirection == LayoutDirection.Rtl) size.width - width else 0f
+                drawRect(accent, topLeft = Offset(left, 0f), size = Size(width, size.height))
+            }.semantics { contentDescription = description },
+    )
 }
 
 @Composable
@@ -262,9 +293,15 @@ private const val SAS_MAX_SCALE = 1.3f
 class SenderPairingCallbacks(
     val onConfirm: () -> Unit = {},
     val onCancel: () -> Unit = {},
+    /** Hides the sheet for this transfer without trusting the device; tapping the bubble shows it again. */
+    val onLater: () -> Unit = {},
 )
 
-/** The sender's side of first-time pairing (design §5.1: the code shows on both screens). */
+/**
+ * The sender's side of first-time pairing (design §5.1: the code shows on both screens). "Yes, it matches" stores the
+ * trust (and ignores taps for the first moments, [TapGuard]); "Not now" only hides the sheet, so a one-off send to a
+ * stranger does not have to trust them; Cancel stops the transfer.
+ */
 @Composable
 fun SenderPairingSheet(
     state: SenderPairingUi,
@@ -273,9 +310,10 @@ fun SenderPairingSheet(
 ) {
     val colors = LocalDropColors.current
     val type = LocalDropTypography.current
+    val guard = rememberTapGuard(state.transferId)
     SheetSurface(modifier.testTag(TestTags.SHEET)) {
         Column(
-            Modifier.fillMaxWidth(),
+            Modifier.fillMaxWidth().weight(1f, fill = false).verticalScroll(rememberScrollState()),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
@@ -288,7 +326,12 @@ fun SenderPairingSheet(
             )
             Text(stringResource(Res.string.pair_code), style = type.body, color = colors.textMuted, textAlign = TextAlign.Center)
             Text(Formats.sas(state.code), style = sasStyle(36.dp), color = colors.text, maxLines = 1, softWrap = false)
-            PrimaryButton(stringResource(Res.string.pair_confirm), callbacks.onConfirm)
+        }
+        Spacer(Modifier.height(12.dp))
+        PrimaryButton(stringResource(Res.string.pair_confirm), guard.guard(callbacks.onConfirm))
+        Spacer(Modifier.height(4.dp))
+        FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+            QuietButton(stringResource(Res.string.pair_later), callbacks.onLater, color = colors.textMuted)
             QuietButton(stringResource(Res.string.common_cancel), callbacks.onCancel, color = colors.dangerText)
         }
     }

@@ -135,6 +135,9 @@ internal fun SettingsTab(
                         color = colors.successText,
                     )
                 }
+                if (state.clearFailed) {
+                    Text(stringResource(Res.string.settings_clear_partials_failed), style = type.caption, color = colors.dangerText)
+                }
             }
         }
         Section(stringResource(Res.string.settings_profile)) {
