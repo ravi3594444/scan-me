@@ -11,9 +11,13 @@ import kotlin.concurrent.withLock
  * (backpressure), an empty one blocks the reader, closing the write end gives the reader end of stream after the
  * buffered bytes, and closing the read end makes a blocked read or write fail with an [IOException] (as
  * `BluetoothSocket.close()` does). Unlike `PipedInputStream` it does not care which threads read and write.
+ *
+ * The end of stream is −1, as an LE L2CAP `BluetoothSocket` returns it; with [rfcomm] it is
+ * `IOException("bt socket closed, read return: -1")`, as an RFCOMM `BluetoothSocket` throws it.
  */
 internal class BlockingPipe(
     capacity: Int = 4096,
+    private val rfcomm: Boolean = false,
 ) {
     private val lock = ReentrantLock()
     private val changed = lock.newCondition()
@@ -44,7 +48,10 @@ internal class BlockingPipe(
                 lock.withLock {
                     while (count == 0) {
                         if (readerClosed) throw IOException("socket closed")
-                        if (writerClosed) return -1
+                        if (writerClosed) {
+                            if (rfcomm) throw IOException("bt socket closed, read return: -1")
+                            return -1
+                        }
                         changed.await()
                     }
                     if (readerClosed) throw IOException("socket closed")
@@ -126,9 +133,13 @@ internal class PipeSocket(
     }
 
     companion object {
-        fun pair(capacity: Int = 4096): Pair<PipeSocket, PipeSocket> {
-            val ab = BlockingPipe(capacity)
-            val ba = BlockingPipe(capacity)
+        /** Two connected ends; [rfcomm] makes each report the end of stream the way an RFCOMM socket does. */
+        fun pair(
+            capacity: Int = 4096,
+            rfcomm: Boolean = false,
+        ): Pair<PipeSocket, PipeSocket> {
+            val ab = BlockingPipe(capacity, rfcomm)
+            val ba = BlockingPipe(capacity, rfcomm)
             return PipeSocket(ba, ab) to PipeSocket(ab, ba)
         }
     }

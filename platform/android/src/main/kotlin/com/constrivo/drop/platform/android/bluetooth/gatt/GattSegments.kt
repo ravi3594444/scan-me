@@ -90,6 +90,9 @@ object GattSegments {
     const val RESET_TIMEOUT: Int = 4
     const val RESET_OVERFLOW: Int = 5
 
+    /** The server cannot take another stream (all sessions in use, or its owner's queue is full); sent instead of `OPEN_ACK`. */
+    const val RESET_REFUSED: Int = 6
+
     private const val OPEN_BODY = 5
 
     fun encode(segment: GattSegment): ByteArray =

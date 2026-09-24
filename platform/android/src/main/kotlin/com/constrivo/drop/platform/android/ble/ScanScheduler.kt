@@ -13,6 +13,12 @@ import com.constrivo.drop.core.discovery.RadioMode
  *   results other apps' scans produce; the scheduler restarts it before that.
  * @property stopGraceMillis a scan nobody wants any more is stopped only after this grace, so a collector that switches
  *   mode (cancel, then collect again) costs one restart instead of a stop and a start.
+ * @property downgradeDelayMillis a foreground scan that is no longer needed while a background one still is (the radar
+ *   closed, the service runs on) keeps running this long before it is restarted in background mode, so closing and
+ *   reopening the radar costs no start; a foreground scan serves a background collector meanwhile.
+ * @property downgradeReserveStarts a downgrade uses a start only when this many more stay available in the window
+ *   afterwards, so the next radar open always finds one (F-A2: on the radar within 1 s of opening it). Upgrades and
+ *   first starts use every start there is.
  * @property firstRetryMillis / [maxRetryMillis]: back-off after `onScanFailed`, doubling per consecutive failure.
  */
 data class ScanThrottleConfig(
@@ -21,12 +27,15 @@ data class ScanThrottleConfig(
     val marginMillis: Long = 1_000,
     val maxScanMillis: Long = 25 * 60_000L,
     val stopGraceMillis: Long = 500,
+    val downgradeDelayMillis: Long = 15_000,
+    val downgradeReserveStarts: Int = 1,
     val firstRetryMillis: Long = 1_000,
     val maxRetryMillis: Long = 60_000,
 ) {
     init {
         require(maxStarts >= 1) { "at least one start per window" }
         require(windowMillis > 0 && marginMillis >= 0 && maxScanMillis > 0 && stopGraceMillis >= 0) { "durations must be positive" }
+        require(downgradeDelayMillis >= 0 && downgradeReserveStarts >= 0) { "the downgrade hysteresis cannot be negative" }
         require(firstRetryMillis > 0 && maxRetryMillis >= firstRetryMillis) { "retry back-off must be positive" }
     }
 }
@@ -65,7 +74,10 @@ data class ScanSchedule(
  * Decides when to start, restart and stop the Bluetooth LE scan (F-A2) within Android's limits ([ScanThrottleConfig]):
  * at most five starts per 30 s, a restart before the 30-minute opportunistic downgrade, a short grace before stopping,
  * and back-off after failures. Mode changes while throttled are conflated: the scan keeps running in its old mode until
- * a start is allowed, then restarts in the latest wanted mode.
+ * a start is allowed, then restarts in the latest wanted mode. Starts are scarce, so they are kept for what the user
+ * sees: a downgrade from foreground to background waits ([ScanThrottleConfig.downgradeDelayMillis]) and never takes the
+ * window's last starts ([ScanThrottleConfig.downgradeReserveStarts]), while an upgrade (the radar opens) starts as soon
+ * as the window allows.
  *
  * Pure and single-threaded (the driver calls it under its lock); time is milliseconds on a monotonic clock
  * (`SystemClock.elapsedRealtime()` on a device), passed into every call.
@@ -183,25 +195,41 @@ class ScanScheduler(
         }
         val restartAt = runningSince + config.maxScanMillis
         if (current == want && nowMillis < restartAt) return ScanAction.Wait(restartAt)
-        val allowedAt = maxOf(retryAt ?: nowMillis, throttleAllowedAt())
+        // A foreground scan serves a background collector too, so a downgrade can wait: for the radar to open again
+        // (then nothing restarts at all), and until the window keeps a start in reserve for that open. The 25-minute
+        // restart is not delayed.
+        val downgrade = current == RadioMode.FOREGROUND && want == RadioMode.BACKGROUND && nowMillis < restartAt && !staleScan
+        val earliest =
+            if (downgrade) {
+                maxOf(desiredChangedAt + config.downgradeDelayMillis, throttleAllowedAt(config.downgradeReserveStarts))
+            } else {
+                throttleAllowedAt(reserve = 0)
+            }
+        val allowedAt = maxOf(retryAt ?: nowMillis, earliest)
         if (allowedAt > nowMillis) return ScanAction.Wait(allowedAt)
         return ScanAction.Start(want, stopFirst = current != null || staleScan)
     }
 
     /** The scheduler's state at [nowMillis], for diagnostics. */
     fun schedule(nowMillis: Long): ScanSchedule {
+        // A running foreground scan satisfies a background desire; only a scan that is missing or too weak is blocked.
+        val satisfied = running == desired || (running == RadioMode.FOREGROUND && desired == RadioMode.BACKGROUND)
         val blocked =
             when (val action = next(nowMillis)) {
-                is ScanAction.Wait -> action.atMillis.takeIf { desired != null && (running == null || running != desired) }
+                is ScanAction.Wait -> action.atMillis.takeIf { desired != null && !satisfied }
                 else -> null
             }
         return ScanSchedule(desired, running, blocked, lastFailure, unsupported)
     }
 
-    /** When the next start fits the throttle window: the oldest of the last [ScanThrottleConfig.maxStarts] starts must have aged out. */
-    private fun throttleAllowedAt(): Long {
-        if (starts.size < config.maxStarts) return Long.MIN_VALUE
-        return starts.first() + config.windowMillis + config.marginMillis
+    /**
+     * When a start fits the throttle window and still leaves [reserve] more starts in it: no more than
+     * `maxStarts − 1 − reserve` of the recorded starts may lie within the window before it.
+     */
+    private fun throttleAllowedAt(reserve: Int): Long {
+        val allowedBefore = (config.maxStarts - 1 - reserve).coerceAtLeast(0)
+        if (starts.size <= allowedBefore) return Long.MIN_VALUE
+        return starts[starts.size - allowedBefore - 1] + config.windowMillis + config.marginMillis
     }
 
     companion object {

@@ -3,6 +3,7 @@ package com.constrivo.drop.platform.android.bluetooth
 import com.constrivo.drop.core.protocol.LinkKind
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asExecutor
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
@@ -19,6 +20,7 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /** The L2CAP and RFCOMM adapter ([SocketStreamChannel]) over in-memory blocking sockets: `DataChannel` semantics. */
@@ -142,28 +144,124 @@ class SocketStreamChannelTest {
             b.close()
         }
 
+    /** A socket whose every read fails with [message] and every write with "broken pipe". */
+    private fun failing(message: String) =
+        object : StreamSocket {
+            override val input: InputStream =
+                object : InputStream() {
+                    override fun read(): Int = throw IOException(message)
+                }
+            override val output: OutputStream =
+                object : OutputStream() {
+                    override fun write(b: Int) = throw IOException("broken pipe")
+                }
+            override val remoteAddress: String? = null
+
+            override fun close() = Unit
+        }
+
     @Test
     fun anIoErrorFromTheStackIsRethrownWhileOpen() =
         runBlocking {
-            val failing =
-                object : StreamSocket {
-                    override val input: InputStream =
-                        object : InputStream() {
-                            override fun read(): Int = throw IOException("bt socket closed, read return: -1")
-                        }
-                    override val output: OutputStream =
-                        object : OutputStream() {
-                            override fun write(b: Int) = throw IOException("broken pipe")
-                        }
-                    override val remoteAddress: String? = null
-
-                    override fun close() = Unit
-                }
-            val channel = SocketStreamChannel(failing, BluetoothTransport.RFCOMM, Dispatchers.IO)
+            val channel = SocketStreamChannel(failing("Software caused connection abort"), BluetoothTransport.RFCOMM, Dispatchers.IO)
             assertFailsWith<IOException> { channel.read(ByteArray(4)) }
             assertFailsWith<IOException> { channel.write(ByteArray(4)) }
             channel.close()
             assertEquals(-1, channel.read(ByteArray(4)))
+            // Only RFCOMM reports its end of stream as an exception: on L2CAP the same text is an error.
+            val l2cap = SocketStreamChannel(failing("bt socket closed, read return: -1"), BluetoothTransport.L2CAP, Dispatchers.IO)
+            assertFailsWith<IOException> { l2cap.read(ByteArray(4)) }
+        }
+
+    @Test
+    fun rfcommReportsThePeersCloseAsEndOfStreamToo() =
+        runBlocking {
+            // An RFCOMM BluetoothSocket throws "bt socket closed, read return: -1" where L2CAP returns -1.
+            val (x, y) = PipeSocket.pair(rfcomm = true)
+            val a = SocketStreamChannel(x, BluetoothTransport.RFCOMM, Dispatchers.IO)
+            val b = SocketStreamChannel(y, BluetoothTransport.RFCOMM, Dispatchers.IO)
+            withTimeout(5_000) {
+                a.write(byteArrayOf(1, 2, 3))
+                a.close()
+                val buffer = ByteArray(10)
+                assertEquals(3, b.read(buffer))
+                assertEquals(-1, b.read(buffer))
+                assertEquals(-1, b.read(buffer))
+            }
+            assertFalse(b.isClosed, "the end of the stream is not a local close")
+            b.close()
+            assertTrue(SocketStreamChannel.isRfcommEndOfStream(IOException("bt socket closed, read return: -1")))
+            assertFalse(SocketStreamChannel.isRfcommEndOfStream(IOException("Software caused connection abort")))
+            assertFalse(SocketStreamChannel.isRfcommEndOfStream(IOException()))
+        }
+
+    @Test
+    fun aCancelledReadReturnsOnlyOnceTheBlockedCallHasEnded() =
+        runBlocking {
+            // Closing the socket unblocks the read only after a while, and the read still writes into the buffer: that
+            // must happen before the cancelled read returns, since the engine hands its buffers back to a pool.
+            val closed = CountDownLatch(1)
+            val socket =
+                object : StreamSocket {
+                    override val input: InputStream =
+                        object : InputStream() {
+                            override fun read(): Int = throw UnsupportedOperationException()
+
+                            override fun read(
+                                b: ByteArray,
+                                off: Int,
+                                len: Int,
+                            ): Int {
+                                closed.await(5, TimeUnit.SECONDS)
+                                Thread.sleep(200)
+                                b.fill(7, off, off + len)
+                                throw IOException("socket closed")
+                            }
+                        }
+                    override val output: OutputStream =
+                        object : OutputStream() {
+                            override fun write(b: Int) = Unit
+                        }
+                    override val remoteAddress: String? = null
+
+                    override fun close() {
+                        closed.countDown()
+                    }
+                }
+            val channel = SocketStreamChannel(socket, BluetoothTransport.L2CAP, Dispatchers.IO)
+            val buffer = ByteArray(16)
+            withTimeout(5_000) {
+                val reading = launch { channel.read(buffer) }
+                delay(100)
+                reading.cancelAndJoin()
+            }
+            val atReturn = buffer.copyOf()
+            delay(500)
+            assertContentEquals(atReturn, buffer, "nothing is written into the buffer after the cancelled read returned")
+            assertTrue(atReturn.all { it == 7.toByte() }, "the blocked read had ended before the cancelled read returned")
+            assertTrue(channel.isClosed)
+        }
+
+    @Test
+    fun aResultThatArrivesAfterTheCancellationIsDiscardedNotLost() =
+        runBlocking {
+            // accept() returns a connection just as the accept loop is cancelled: it must be closed, not leak.
+            val cancelled = CountDownLatch(1)
+            val discarded = CompletableDeferred<String>()
+            val blocking = CancellableBlocking(Dispatchers.IO.asExecutor()) { cancelled.countDown() }
+            withTimeout(5_000) {
+                val accepting =
+                    launch {
+                        blocking.call<String>(discard = { discarded.complete(it) }) {
+                            cancelled.await(5, TimeUnit.SECONDS)
+                            "accepted socket"
+                        }
+                    }
+                delay(100)
+                accepting.cancelAndJoin()
+                assertTrue(discarded.isCompleted, "discarded before the cancelled call returned")
+                assertEquals("accepted socket", discarded.await())
+            }
         }
 
     @Test
@@ -180,18 +278,26 @@ class SocketStreamChannelTest {
     @Test
     fun connectTimesOutAndClosesTheSocket() =
         runBlocking {
-            val (socket, _) = PipeSocket.pair()
+            val (pipe, _) = PipeSocket.pair()
             val block = CountDownLatch(1)
+            // A connect the stack never answers; closing the socket is what aborts it, on a device as here.
+            val socket =
+                object : StreamSocket by pipe {
+                    override fun close() {
+                        block.countDown()
+                        pipe.close()
+                    }
+                }
+            val started = System.nanoTime()
             val e =
                 assertFailsWith<IOException> {
                     SocketStreamChannel.connect(socket, BluetoothTransport.L2CAP, timeoutMillis = 200, io = Dispatchers.IO) {
-                        // A connect the stack never answers; closing the socket is what unblocks it on a device.
                         block.await(5, TimeUnit.SECONDS)
                     }
                 }
-            block.countDown()
             assertTrue(e.message!!.contains("timed out"))
-            assertTrue(socket.closes >= 1)
+            assertTrue(pipe.closes >= 1)
+            assertTrue(System.nanoTime() - started < TimeUnit.SECONDS.toNanos(3), "the close aborted the connect")
         }
 
     @Test

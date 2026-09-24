@@ -12,9 +12,10 @@ internal enum class Fault { NONE, DROP, DUPLICATE, FAIL }
 
 /**
  * An in-memory GATT connection for [GattStreamChannel] tests: each direction delivers segments in order on its own
- * coroutine, like ATT on one bearer, and plays the part of [GattServerHost] on the server side (a fresh `OPEN` creates the
- * server channel). Faults can be injected per sent segment; [linkDown] cuts the connection for both sides after what is
- * already in flight.
+ * coroutine, like ATT on one bearer, and the server side routes the client's segments exactly as [GattServerHost] does
+ * ([GattServerRouting]): a fresh `OPEN` starts a session whose channel is offered to [onIncoming] before the `OPEN` is
+ * answered, a repeated `OPEN` goes to the current session, and only the registered session owns the connection. Faults
+ * can be injected per sent segment; [linkDown] cuts the connection for both sides after what is already in flight.
  */
 internal class GattLinkPair(
     private val scope: CoroutineScope,
@@ -23,6 +24,10 @@ internal class GattLinkPair(
     clientConfig: GattStreamConfig = GattStreamConfig(),
     private val serverConfig: GattStreamConfig = GattStreamConfig(),
     serverMaxSegment: Int = maxSegment,
+    /** Sessions the server takes at once ([GattServerHost]'s `maxServerSessions`); 0 refuses every stream. */
+    private val maxSessions: Int = 1,
+    /** The server owner's answer to a new stream ([GattServerHost]'s `onIncoming`). */
+    private val onIncoming: (GattStreamChannel) -> Boolean = { true },
 ) {
     private object Lost
 
@@ -67,6 +72,23 @@ internal class GattLinkPair(
         fun sentTypes(): List<Int> = synchronized(sent) { sent.map { it[0].toInt() and 0xFF } }
     }
 
+    /** One server session, like [GattServerHost]'s: it notifies over the server link; only a registered one owns the link. */
+    private inner class ServerSession : GattSegmentTransport {
+        val channel: GattStreamChannel = GattStreamChannel.server(this, context, serverConfig, "server")
+
+        override val maxSegmentSize: Int get() = serverLink.maxSegmentSize
+
+        override suspend fun send(segment: ByteArray) = serverLink.send(segment)
+
+        override fun disconnect() {
+            val registered =
+                synchronized(this@GattLinkPair) {
+                    (current === this).also { if (it) current = null }
+                }
+            if (registered) serverLink.disconnect()
+        }
+    }
+
     @Volatile var down = false
         private set
 
@@ -74,27 +96,29 @@ internal class GattLinkPair(
     val serverLink = Link(serverMaxSegment)
     val client: GattStreamChannel = GattStreamChannel.client(clientLink, context, clientConfig, "client")
 
+    /** The registered session (routing). */
+    @Volatile private var current: ServerSession? = null
+
+    /** The newest session's channel, kept after it ends for assertions. */
     @Volatile var server: GattStreamChannel? = null
         private set
+
+    /** Sessions started for fresh `OPEN`s (a repeated `OPEN` starts none). */
+    val sessionsStarted = AtomicInteger()
+
+    /** Streams refused because every session was in use. */
+    val refusedForCapacity = AtomicInteger()
 
     /** Starts delivery in both directions. */
     fun start(): GattLinkPair {
         scope.launch {
             for (item in clientLink.outbox) {
                 if (item === Lost) {
-                    server?.onTransportClosed(IOException("GATT link lost"))
+                    val gone = synchronized(this@GattLinkPair) { current.also { current = null } }
+                    gone?.channel?.onTransportClosed(IOException("GATT link lost"))
                     continue
                 }
-                val bytes = item as ByteArray
-                val current = server
-                val fresh = bytes.size >= 3 && bytes[0].toInt() == GattSegments.TYPE_OPEN && bytes[1].toInt() == 0 && bytes[2].toInt() == 0
-                if (current == null && fresh) {
-                    val created = GattStreamChannel.server(serverLink, context, serverConfig, "server")
-                    server = created
-                    created.accept(bytes)
-                } else {
-                    current?.onSegment(bytes)
-                }
+                route(item as ByteArray)
             }
         }
         scope.launch {
@@ -107,6 +131,33 @@ internal class GattLinkPair(
             }
         }
         return this
+    }
+
+    private fun route(bytes: ByteArray) {
+        val existing = current
+        when (GattServerRouting.route(bytes, existing?.channel, if (existing == null) 0 else 1, maxSessions)) {
+            GattServerRouting.Route.EXISTING -> {
+                existing?.channel?.onSegment(bytes)
+            }
+
+            GattServerRouting.Route.DROP -> {
+                Unit
+            }
+
+            GattServerRouting.Route.REFUSE -> {
+                refusedForCapacity.incrementAndGet()
+                ServerSession().channel.refuse(bytes)
+            }
+
+            GattServerRouting.Route.NEW -> {
+                val session = ServerSession()
+                synchronized(this) { current = session }
+                server = session.channel
+                sessionsStarted.incrementAndGet()
+                existing?.channel?.onTransportClosed(IOException("client opened a new stream"))
+                GattServerRouting.start(session.channel, bytes, onIncoming)
+            }
+        }
     }
 
     /** Cuts the connection: both sides learn it after the segments already in flight. */

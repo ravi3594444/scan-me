@@ -19,9 +19,15 @@ import androidx.core.content.ContextCompat
 import com.constrivo.drop.core.crypto.CryptoProvider
 import com.constrivo.drop.platform.android.ble.BluetoothPower
 import com.constrivo.drop.platform.android.ble.BluetoothPowerMonitor
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -35,6 +41,13 @@ import java.util.concurrent.ConcurrentHashMap
  * `LinkProperties`, neither of which needs location permission (N6). Every platform call is guarded: a missing
  * permission or a vendor quirk leaves the affected bit clear instead of failing.
  *
+ * Detection runs on one background coroutine ([ConflatedRefresh] on [io]): the callbacks and receivers only signal it,
+ * so the main and connectivity threads never wait for the binder calls (some of which the Wi-Fi service answers on its
+ * own thread, slowly while Wi-Fi changes state), and detections never overlap, so one that read the networks before an
+ * `onLost` cannot publish after the one that followed it. The hardware answers (bands, standards, Wi-Fi Direct,
+ * concurrency, the Bluetooth features, the save volume) are read again only after a Wi-Fi or Bluetooth state broadcast,
+ * [start] or [setSaveVolume]; a network callback, RSSI updates included, only re-reads the station.
+ *
  * Needs `ACCESS_NETWORK_STATE` and `ACCESS_WIFI_STATE` (declared by this module). Call [start] when the radio session
  * starts and [stop] when it ends; both are idempotent.
  */
@@ -42,6 +55,7 @@ class AndroidCapabilityDetector(
     context: Context,
     private val crypto: CryptoProvider,
     private val power: BluetoothPowerMonitor = BluetoothPowerMonitor(context),
+    private val io: CoroutineDispatcher = Dispatchers.IO,
 ) {
     private val appContext = context.applicationContext
     private val wifiManager: WifiManager? = appContext.getSystemService(WifiManager::class.java)
@@ -53,6 +67,15 @@ class AndroidCapabilityDetector(
     private val networks = ConcurrentHashMap<Long, WifiNetworkSnapshot>()
     private val mutable = MutableStateFlow(LocalRadioFacts.UNKNOWN)
     private var started = false
+    private var scope: CoroutineScope? = null
+
+    @Volatile private var refresher: ConflatedRefresh? = null
+
+    /** Everything but the station, from the last hardware read; used by the detection worker only. */
+    private var hardware: CapabilityInputs? = null
+
+    /** A state broadcast (or [start], [setSaveVolume]) changed what the hardware answers: read it again. */
+    @Volatile private var hardwareStale = true
 
     @Volatile private var verifiedP2p5Ghz = false
 
@@ -104,16 +127,30 @@ class AndroidCapabilityDetector(
                 context: Context,
                 intent: Intent,
             ) {
+                // Wi-Fi or Bluetooth changed state: some builds answer the feature questions differently now.
+                hardwareStale = true
                 refresh()
             }
         }
 
-    /** Registers the callbacks and publishes a first detection. */
+    /** Registers the callbacks and starts a first detection (published on [facts] shortly after). */
     fun start() {
         synchronized(lock) {
             if (started) return
             started = true
+            hardwareStale = true
+            val worker = CoroutineScope(SupervisorJob() + io)
+            scope = worker
+            refresher = ConflatedRefresh(worker, ::detectAndPublish)
             power.start()
+            // The power monitor's own receiver may run after ours: follow its state too, so the Bluetooth bits and the
+            // Bluetooth-enabled fact never lag a toggle.
+            worker.launch {
+                power.state.collect {
+                    hardwareStale = true
+                    refresh()
+                }
+            }
             val request =
                 NetworkRequest
                     .Builder()
@@ -144,6 +181,9 @@ class AndroidCapabilityDetector(
             runCatching { appContext.unregisterReceiver(receiver) }
             networks.clear()
             power.stop()
+            refresher = null
+            scope?.cancel()
+            scope = null
         }
     }
 
@@ -156,17 +196,48 @@ class AndroidCapabilityDetector(
     /** The MediaStore volume received files go to (`MediaStore.VOLUME_EXTERNAL_PRIMARY` when null), for bit 10. */
     fun setSaveVolume(mediaStoreVolumeName: String?) {
         saveVolumeName = mediaStoreVolumeName
+        hardwareStale = true
         refresh()
     }
 
-    /** Detects again now and publishes the result. Cheap; safe from any thread. */
+    /**
+     * Asks for a detection; it runs on the background worker after any detection in progress and publishes on [facts].
+     * Returns at once; safe from any thread. Does nothing before [start] (the settings above are kept for it).
+     */
     fun refresh() {
-        val inputs = readInputs()
-        mutable.value = CapabilityMapping.facts(inputs, crypto)
+        refresher?.request()
     }
 
-    /** The raw inputs of the current detection, for the diagnostics log and the lab's F-A4 comparison. */
-    fun readInputs(): CapabilityInputs {
+    /** The worker's detection: the hardware answers when they may have changed, the station every time. */
+    private fun detectAndPublish() {
+        val known = hardware
+        val base =
+            if (hardwareStale || known == null) {
+                hardwareStale = false
+                readHardware().also { hardware = it }
+            } else {
+                known
+            }
+        mutable.value = CapabilityMapping.facts(withStation(base), crypto)
+    }
+
+    /**
+     * The raw inputs of a detection made now, on the caller's thread, for the diagnostics log and the lab's F-A4
+     * comparison. It makes a dozen binder calls: not for the main thread.
+     */
+    fun readInputs(): CapabilityInputs = withStation(readHardware())
+
+    private fun withStation(hardware: CapabilityInputs): CapabilityInputs =
+        hardware.copy(station = readStation(hardware.hasWifi), verifiedP2p5GhzHost = verifiedP2p5Ghz)
+
+    private fun readStation(hasWifi: Boolean): StationFacts? {
+        if (!hasWifi) return null
+        val default = runCatching { connectivity?.activeNetwork?.networkHandle }.getOrNull()
+        return NetworkLinkExtraction.stationFacts(NetworkLinkExtraction.chooseStation(networks.values.toList(), default))
+    }
+
+    /** Everything but the station ([CapabilityInputs.station] is null here). */
+    private fun readHardware(): CapabilityInputs {
         val wifi = wifiManager?.takeIf { packages.hasSystemFeature(PackageManager.FEATURE_WIFI) }
         val hasWifi = wifi != null
 
@@ -178,13 +249,6 @@ class AndroidCapabilityDetector(
             lastCodedPhy = guard { adapter.isLeCodedPhySupported }
             last2mPhy = guard { adapter.isLe2MPhySupported }
         }
-        val station =
-            if (hasWifi) {
-                val default = runCatching { connectivity?.activeNetwork?.networkHandle }.getOrNull()
-                NetworkLinkExtraction.stationFacts(NetworkLinkExtraction.chooseStation(networks.values.toList(), default))
-            } else {
-                null
-            }
         return CapabilityInputs(
             hasWifi = hasWifi,
             wifiEnabled = wifiFlag { it.isWifiEnabled },
@@ -205,8 +269,6 @@ class AndroidCapabilityDetector(
             leCodedPhy = lastCodedPhy,
             le2mPhy = last2mPhy,
             saveLocationRemovable = saveVolumeRemovable(),
-            verifiedP2p5GhzHost = verifiedP2p5Ghz,
-            station = station,
             staApConcurrency = wifiFlag { it.isStaApConcurrencySupported },
             dualBandSimultaneous =
                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && wifiFlag { it.isDualBandSimultaneousSupported },

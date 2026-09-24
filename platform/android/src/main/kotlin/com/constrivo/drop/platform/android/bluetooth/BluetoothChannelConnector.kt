@@ -55,9 +55,12 @@ internal class BluetoothStreamSocket(
  * 1. **RFCOMM** first when the peer published a usable Classic address (a desktop, S10):
  *    `createInsecureRfcommSocketToServiceRecord` with [DropBluetoothProfile.RFCOMM_SERVICE_UUID].
  * 2. Otherwise, or when that fails, each LE address in turn (at most [BluetoothChannelConfig.maxLeAttempts]): connect
- *    GATT, discover the drop service, negotiate the MTU and read [ChannelInfo]. With a published PSM, an **LE L2CAP**
- *    channel (`createInsecureL2capChannel`) is the primary Android↔Android channel; the GATT client is then released.
- *    Where L2CAP fails or no PSM is published, the **GATT stream** runs over the connection already open.
+ *    GATT, ask for a fast connection interval and the 2M PHY, discover the drop service and read [ChannelInfo]. With a
+ *    published PSM, an **LE L2CAP** channel (`createInsecureL2capChannel`) is the primary Android↔Android channel; the
+ *    GATT client is then released. Where L2CAP fails, no PSM is published, or the channel info cannot be read or parsed
+ *    (a failed read, a future or broken value), the **GATT stream** runs over the connection already open, after the
+ *    MTU exchange it needs. Those failures are kept in the attempts of a [BluetoothChannelException] when every path
+ *    fails.
  *
  * Android apps cannot learn a phone's Classic address, so phone to phone is always LE. Every path is "insecure": no
  * pairing dialog and no bonding; the session handshake (§6) authenticates the peer. The returned channel's
@@ -78,6 +81,10 @@ class BluetoothChannelConnector(
     private val manager: BluetoothManager? = appContext.getSystemService(BluetoothManager::class.java)
     private val thread = HandlerThread("drop-gatt-client").apply { start() }
     private val handler = Handler(thread.looper)
+
+    // The GATT callback thread serves every GATT link this connector made, including those under GATT-stream channels
+    // it returned; it quits only after close() and the release of the last link.
+    private val callbackThread = SharedResource<GattClientLink> { thread.quitSafely() }
 
     private val adapter: BluetoothAdapter get() = manager?.adapter ?: throw IOException("this device has no Bluetooth")
 
@@ -100,7 +107,7 @@ class BluetoothChannelConnector(
         }
         for (address in target.leAddresses.distinct().take(config.maxLeAttempts)) {
             try {
-                return connectLe(address)
+                return connectLe(address, attempts)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -131,15 +138,20 @@ class BluetoothChannelConnector(
     }
 
     /** GATT to [address], then L2CAP when the peer publishes a PSM, else the GATT stream over the same connection. */
-    suspend fun connectLe(address: String): BluetoothDataChannel {
+    suspend fun connectLe(address: String): BluetoothDataChannel = connectLe(address, ArrayList())
+
+    /** [connectLe], noting in [notes] what failed on the way to the GATT stream fallback. */
+    private suspend fun connectLe(
+        address: String,
+        notes: MutableList<Throwable>,
+    ): BluetoothDataChannel {
         val device = leDevice(address)
-        val link = GattClientLink(appContext, device, handler, config)
+        val link = newLink(device)
         try {
             link.connect()
+            link.speedUp(le2m = runCatching { adapter.isLe2MPhySupported }.getOrDefault(false))
             link.discover()
-            link.tune(le2m = runCatching { adapter.isLe2MPhySupported }.getOrDefault(false))
-            val info = link.readChannelInfo()
-            val psm = info.l2capPsm
+            val psm = psmOrNull(address, notes) { link.readChannelInfo() }
             if (config.preferL2cap && psm != null) {
                 try {
                     val channel = connectL2cap(device, psm)
@@ -150,8 +162,10 @@ class BluetoothChannelConnector(
                     throw e
                 } catch (e: Exception) {
                     // Fall back to the GATT stream on the connection that is already up.
+                    notes += e
                 }
             }
+            link.requestLargestMtu()
             link.enableNotifications()
             val channel = GattStreamChannel.client(link, io, config.gatt, device.address)
             link.onSegment = channel::onSegment
@@ -174,6 +188,12 @@ class BluetoothChannelConnector(
         }
     }
 
+    private fun newLink(device: BluetoothDevice): GattClientLink {
+        val link = GattClientLink(appContext, device, handler, config, onReleased = callbackThread::done)
+        if (!callbackThread.acquire(link)) throw IOException("the Bluetooth connector is closed")
+        return link
+    }
+
     private fun leDevice(address: String): BluetoothDevice {
         deviceLookup(address)?.let { return it }
         return try {
@@ -194,8 +214,30 @@ class BluetoothChannelConnector(
             throw IOException("BLUETOOTH_CONNECT is not granted", e)
         }
 
-    /** Releases the GATT callback thread. Channels already returned stay open. */
+    /**
+     * Stops making connections. Channels already returned stay open: the GATT callback thread, which GATT-stream
+     * channels need for every write confirmation, notification and disconnect, quits once the last of them has closed.
+     */
     override fun close() {
-        thread.quitSafely()
+        callbackThread.close()
+    }
+
+    internal companion object {
+        /**
+         * The PSM that [read] finds in the peer's channel info, or null when there is none to use: the GATT stream needs
+         * no channel info, so a read that fails or a value that does not parse (a future or broken peer) only rules
+         * out L2CAP, and is noted in [notes] for the attempts of a [BluetoothChannelException].
+         */
+        suspend fun psmOrNull(
+            address: String,
+            notes: MutableList<Throwable>,
+            read: suspend () -> ChannelInfo,
+        ): Int? =
+            try {
+                read().l2capPsm
+            } catch (e: IOException) {
+                notes += IOException("channel info of $address unusable, trying the GATT stream", e)
+                null
+            }
     }
 }

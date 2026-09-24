@@ -112,7 +112,32 @@ object AdvertisingPlan {
     /** The legacy payload limit, the same for advertising data and scan response. */
     const val LEGACY_LIMIT: Int = AdvertisingFormat.LEGACY_PAYLOAD_MAX
 
+    /** The longest `startAdvertisingSet` duration: 65 535 × 10 ms = 655.35 s. */
+    const val MAX_DURATION_UNITS: Int = 65_535
+
+    /** Milliseconds per `startAdvertisingSet` duration unit. */
+    const val DURATION_UNIT_MILLIS: Long = 10
+
     fun interval(mode: RadioMode): Int = if (mode == RadioMode.FOREGROUND) INTERVAL_FOREGROUND else INTERVAL_BACKGROUND
+
+    /**
+     * The `startAdvertisingSet` duration (10 ms units) that ends a set when its advertisement expires at
+     * [validUntilMillis] (the epoch boundary, N4), or null when it has already expired and must not go on air.
+     *
+     * The controller, or the Bluetooth stack's own wake-up timer, enforces the duration, so the old ephemeral ID leaves
+     * the air at the boundary even while the application processor sleeps and the owner's epoch timer (a coroutine
+     * delay, which stops in deep sleep) cannot run. The duration is capped at [MAX_DURATION_UNITS] (655 s, shorter than
+     * an epoch); a set that ends early is restarted for the rest of its epoch.
+     */
+    fun durationUnits(
+        validUntilMillis: Long,
+        nowMillis: Long,
+    ): Int? {
+        val remaining = validUntilMillis - nowMillis
+        if (remaining <= 0) return null
+        val units = (remaining + DURATION_UNIT_MILLIS - 1) / DURATION_UNIT_MILLIS
+        return units.coerceAtMost(MAX_DURATION_UNITS.toLong()).toInt()
+    }
 
     /**
      * The sets for [advertisement] in [mode]: always the legacy set; the extended set as well when [config] allows it,

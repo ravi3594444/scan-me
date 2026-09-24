@@ -5,6 +5,9 @@ import androidx.test.platform.app.InstrumentationRegistry
 import com.constrivo.drop.core.discovery.Capabilities
 import com.constrivo.drop.platform.android.crypto.AndroidCryptoProvider
 import com.constrivo.drop.platform.android.permission.RadioPermissions
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Test
 import org.junit.runner.RunWith
 import kotlin.test.assertFalse
@@ -26,7 +29,9 @@ class CapabilityDetectionInstrumentedTest {
             val inputs = detector.readInputs()
             val capabilities = CapabilityMapping.capabilities(inputs)
             assertFalse(Capabilities.Flag.DESKTOP_WITHOUT_BLUETOOTH in capabilities)
-            assertNotSame(LocalRadioFacts.UNKNOWN, detector.facts.value)
+            // Detection runs on a background worker: the first result arrives shortly after start().
+            val facts = runBlocking { withTimeout(10_000) { detector.facts.first { it !== LocalRadioFacts.UNKNOWN } } }
+            assertNotSame(LocalRadioFacts.UNKNOWN, facts)
             println("drop-lab: inputs $inputs")
             println("drop-lab: $capabilities, facts ${detector.facts.value}")
             println("drop-lab: permissions ${RadioPermissions.read(context)}")

@@ -22,6 +22,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -35,18 +36,22 @@ import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.retryWhen
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Tunables of [AndroidDiscoveryController].
  *
  * @property carrier how this device's beacon body travels ([AndroidPlatform.beaconCarrier]: service data on Android).
  * @property pauseScanDuringTransfer N13: scanning pauses while a transfer streams.
- * @property wallClockSliceMillis the epoch timer re-reads the wall clock at least this often, so a clock correction or a
- *   CPU that slept through the boundary (coroutine delays stop in deep sleep) is noticed within one slice.
+ * @property wallClockSliceMillis the epoch timer re-reads the wall clock at least this often while the processor is
+ *   awake, so a clock correction is noticed within one slice. It does not help in deep sleep, where coroutine delays
+ *   stop: there the radio's per-set duration ends the old ID at the boundary, and the next wake-up
+ *   ([AndroidDiscoveryController.wakeUp], a sighting) starts the new one.
  * @property retryMillis back-off after the radio or the advertisement builder failed.
  */
 data class DiscoveryControllerConfig(
@@ -68,7 +73,11 @@ data class DiscoveryControllerConfig(
  * - **Advertising** is rebuilt from [beaconState] with this device's `k_adv` whenever the state, the mode or the secret
  *   ([refreshAdvertisement]) changes, and at every epoch boundary ([BeaconAdvertisement.validUntilMillis], 15 min): the
  *   radio then restarts its advertising set, so the ephemeral ID and the radio address rotate together (N4). A
- *   `HIDDEN` visibility never advertises.
+ *   `HIDDEN` visibility never advertises. The boundary timer is a coroutine delay, which does not run while the
+ *   processor sleeps; the Android radio bounds each set to its epoch, so the old ID goes off the air at the boundary
+ *   anyway, and the new one goes on air at the next wake-up: the timer itself, a scan result that arrives after the
+ *   boundary, or [wakeUp], which the foreground service calls from an inexact wake-up alarm armed at
+ *   [advertisement]'s `validUntilMillis` (WP7e).
  * - **Scanning** follows the plan's scan mode; a mode change resubscribes to [BeaconRadio.scan], and the Android radio
  *   conflates rapid changes under its scan throttle.
  * - **The radar model** runs while the radar or the service is up; [devices] is empty otherwise.
@@ -108,6 +117,9 @@ class AndroidDiscoveryController(
     private val errorState = MutableStateFlow<String?>(null)
     private val advertisedState = MutableStateFlow<BeaconAdvertisement?>(null)
 
+    /** Makes the epoch timer read the wall clock now instead of at the end of its slice. */
+    private val clockCheck = Channel<Unit>(Channel.CONFLATED)
+
     /** Nearby devices for the radar (empty while discovery is idle). */
     val devices: StateFlow<List<NearbyDevice>> get() = nearby.devices
 
@@ -138,6 +150,15 @@ class AndroidDiscoveryController(
     /** Rebuilds the advertisement now, e.g. after `AdvertisingSecretStore.rotate()` ("Forget", "Reset identity"). */
     fun refreshAdvertisement() {
         refresh.update { it + 1 }
+    }
+
+    /**
+     * The processor woke up (the foreground service's wake-up alarm at [advertisement]'s `validUntilMillis`, WP7e, or
+     * any other event the service sees, such as a Bluetooth power change or the screen turning on): reads the wall clock
+     * now and, when the advertisement's epoch is over, advertises the new epoch's ID. Cheap; any thread.
+     */
+    fun wakeUp() {
+        clockCheck.trySend(Unit)
     }
 
     /** Starts [run] in [scope]. */
@@ -217,13 +238,22 @@ class AndroidDiscoveryController(
         }
     }
 
-    /** Suspends until the wall clock reaches [unixMillis], re-reading it at least every slice. */
+    /**
+     * Suspends until the wall clock reaches [unixMillis], re-reading it at least every slice and whenever [clockCheck]
+     * fires ([wakeUp], a sighting after the boundary): delays do not run in deep sleep.
+     */
     private suspend fun awaitWallClock(unixMillis: Long) {
         while (true) {
             val remaining = unixMillis - wallClock.nowMillis()
             if (remaining <= 0) return
-            delay(minOf(remaining, config.wallClockSliceMillis))
+            withTimeoutOrNull(minOf(remaining, config.wallClockSliceMillis)) { clockCheck.receive() }
         }
+    }
+
+    /** A scan result woke the processor: if the epoch on air is over, the timer (which slept) must look now. */
+    private fun onSighting() {
+        val validUntil = advertisedState.value?.validUntilMillis ?: return
+        if (wallClock.nowMillis() >= validUntil) clockCheck.trySend(Unit)
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -235,6 +265,7 @@ class AndroidDiscoveryController(
                     .map { it.scanMode }
                     .distinctUntilChanged()
                     .flatMapLatest { mode -> if (mode == null) emptyFlow() else radio.scan(mode) }
+                    .onEach { onSighting() }
                     .retryWhen { cause, _ ->
                         if (cause is CancellationException) return@retryWhen false
                         errorState.value = "scanning failed: ${cause.message}"

@@ -7,10 +7,13 @@ import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
-/** F-A2 within Android's scan limits: five starts per 30 s, the 30-minute downgrade, grace, back-off. */
+/** F-A2 within Android's scan limits: five starts per 30 s, the 30-minute downgrade, grace, back-off, hysteresis. */
 class ScanSchedulerTest {
     private val config = ScanThrottleConfig()
     private val window = config.windowMillis + config.marginMillis
+
+    /** Every mode change restarts at once: the throttle alone decides. */
+    private val noHysteresis = ScanThrottleConfig(downgradeDelayMillis = 0, downgradeReserveStarts = 0)
 
     /** A scheduler with the radio on, driven like the Android driver drives it. */
     private class Driver(
@@ -57,10 +60,10 @@ class ScanSchedulerTest {
 
     @Test
     fun atMostFiveStartsFitIn30Seconds() {
-        val d = Driver()
-        var mode = RadioMode.FOREGROUND
-        // Flip the mode every second: each flip wants a restart. The last flip (9 s, background) differs from the mode
-        // that is still running (the fifth start, foreground).
+        val d = Driver(noHysteresis)
+        var mode = RadioMode.BACKGROUND
+        // Flip the mode every second: each flip wants a restart. The last flip (9 s, foreground) differs from the mode
+        // that is still running (the fifth start, background), and a background scan does not serve it.
         for (t in 0L..9_000L step 1_000L) {
             d.scheduler.desire(mode, t)
             d.step(t)
@@ -74,30 +77,32 @@ class ScanSchedulerTest {
         assertIs<ScanAction.Wait>(next)
         assertEquals(6, d.starts.size)
         // The conflated restart uses the latest wanted mode.
-        assertEquals(RadioMode.BACKGROUND, d.scheduler.schedule(window).desired)
-        assertEquals(RadioMode.BACKGROUND, d.starts.last().second)
+        assertEquals(RadioMode.FOREGROUND, d.scheduler.schedule(window).desired)
+        assertEquals(RadioMode.FOREGROUND, d.starts.last().second)
     }
 
     @Test
     fun anySlidingWindowHoldsAtMostFiveStarts() {
-        val d = Driver()
-        var mode = RadioMode.FOREGROUND
-        for (t in 0L..300_000L step 700L) {
-            mode = if (mode == RadioMode.FOREGROUND) RadioMode.BACKGROUND else RadioMode.FOREGROUND
-            d.scheduler.desire(mode, t)
-            d.step(t)
+        for (throttle in listOf(noHysteresis, config)) {
+            val d = Driver(throttle)
+            var mode = RadioMode.FOREGROUND
+            for (t in 0L..300_000L step 700L) {
+                mode = if (mode == RadioMode.FOREGROUND) RadioMode.BACKGROUND else RadioMode.FOREGROUND
+                d.scheduler.desire(mode, t)
+                d.step(t)
+            }
+            val times = d.starts.map { it.first }
+            for (i in times.indices) {
+                val inWindow = times.count { it >= times[i] && it < times[i] + config.windowMillis }
+                assertTrue(inWindow <= config.maxStarts, "window at ${times[i]} holds $inWindow starts")
+            }
+            if (throttle == noHysteresis) assertTrue(times.size >= 40, "the scheduler keeps making progress (${times.size} starts)")
         }
-        val times = d.starts.map { it.first }
-        for (i in times.indices) {
-            val inWindow = times.count { it >= times[i] && it < times[i] + config.windowMillis }
-            assertTrue(inWindow <= config.maxStarts, "window at ${times[i]} holds $inWindow starts")
-        }
-        assertTrue(times.size >= 40, "the scheduler keeps making progress (${times.size} starts)")
     }
 
     @Test
     fun keepsTheOldModeRunningWhileAStartIsThrottled() {
-        val d = Driver()
+        val d = Driver(noHysteresis)
         for (t in 0L until 5L) {
             d.scheduler.desire(if (t % 2 == 0L) RadioMode.FOREGROUND else RadioMode.BACKGROUND, t)
             d.step(t)
@@ -206,9 +211,108 @@ class ScanSchedulerTest {
     }
 
     @Test
+    fun radarOpenAndCloseCyclesNeverStarveTheNextOpen() {
+        // The service keeps a background scan while the user opens and closes the radar again and again; each open must
+        // scan in the foreground at once (F-A2: on the radar within a second of opening).
+        val d = Driver()
+        d.scheduler.desire(RadioMode.BACKGROUND, 0)
+        d.step(0)
+        val pauses = listOf(1_000L, 16_000L, 3_000L, 20_000L, 500L, 40_000L, 15_500L, 2_000L)
+        var now = 0L
+        var opens = 0
+        while (now < 900_000L) {
+            val openAt = now + pauses[opens % pauses.size]
+            d.runUntil(now, openAt)
+            d.scheduler.desire(RadioMode.FOREGROUND, openAt)
+            d.step(openAt)
+            assertEquals(RadioMode.FOREGROUND, d.scheduler.schedule(openAt).running, "radar opened at $openAt")
+            opens++
+            val closeAt = openAt + 2_000
+            d.runUntil(openAt, closeAt)
+            d.scheduler.desire(RadioMode.BACKGROUND, closeAt)
+            d.step(closeAt)
+            now = closeAt
+        }
+        val times = d.starts.map { it.first }
+        for (i in times.indices) {
+            val inWindow = times.count { it >= times[i] && it < times[i] + config.windowMillis }
+            assertTrue(inWindow <= config.maxStarts, "window at ${times[i]} holds $inWindow starts")
+        }
+        assertTrue(times.size < 2 * opens, "reopening within the delay costs no start (${times.size} starts, $opens opens)")
+    }
+
+    /** Runs the scan loop from [from] to [to]: every action as it falls due, like the driver's timed wait. */
+    private fun Driver.runUntil(
+        from: Long,
+        to: Long,
+    ) {
+        var now = from
+        while (true) {
+            val next = (step(now) as? ScanAction.Wait)?.atMillis ?: return
+            if (next > to) return
+            now = next
+        }
+    }
+
+    @Test
+    fun aDowngradeWaitsSoAQuicklyReopenedRadarCostsNothing() {
+        val d = Driver()
+        d.scheduler.desire(RadioMode.BACKGROUND, 0)
+        d.step(0)
+        d.scheduler.desire(RadioMode.FOREGROUND, 1_000)
+        d.step(1_000)
+        assertEquals(2, d.starts.size)
+        // The radar closes: the foreground scan keeps serving the background collector for the delay.
+        d.scheduler.desire(RadioMode.BACKGROUND, 5_000)
+        val wait = assertIs<ScanAction.Wait>(d.step(5_000))
+        assertEquals(5_000 + config.downgradeDelayMillis, wait.atMillis)
+        assertNull(d.scheduler.schedule(5_000).blockedUntilMillis, "a foreground scan satisfies a background collector")
+        // Reopened within the delay: no restart at all.
+        d.scheduler.desire(RadioMode.FOREGROUND, 9_000)
+        d.step(9_000)
+        assertEquals(2, d.starts.size)
+        // Closed for good: downgraded once the delay has passed.
+        d.scheduler.desire(RadioMode.BACKGROUND, 10_000)
+        d.step(10_000 + config.downgradeDelayMillis - 1)
+        assertEquals(2, d.starts.size)
+        d.step(10_000 + config.downgradeDelayMillis)
+        assertEquals(3, d.starts.size)
+        assertEquals(RadioMode.BACKGROUND, d.starts.last().second)
+    }
+
+    @Test
+    fun aDowngradeLeavesAStartForTheNextOpen() {
+        val d = Driver(ScanThrottleConfig(downgradeDelayMillis = 0))
+        // Four starts in quick succession (upgrades and first starts use every start there is).
+        for ((t, mode) in listOf(0L to RadioMode.BACKGROUND, 1L to RadioMode.FOREGROUND)) {
+            d.scheduler.desire(mode, t)
+            d.step(t)
+        }
+        d.scheduler.desire(RadioMode.BACKGROUND, 2) // downgrade 3
+        d.step(2)
+        d.scheduler.desire(RadioMode.FOREGROUND, 3) // upgrade 4
+        d.step(3)
+        assertEquals(4, d.starts.size)
+        // A fifth start now would leave none for the next open: the downgrade waits until the first start ages out,
+        // and the foreground scan serves the background collector meanwhile.
+        d.scheduler.desire(RadioMode.BACKGROUND, 4)
+        assertEquals(ScanAction.Wait(window), d.step(4))
+        assertEquals(RadioMode.FOREGROUND, d.scheduler.schedule(4).running)
+        d.step(window)
+        assertEquals(RadioMode.BACKGROUND, d.scheduler.schedule(window).running)
+        assertEquals(5, d.starts.size)
+        // The start it left is the next radar open's, at once.
+        d.scheduler.desire(RadioMode.FOREGROUND, window + 1)
+        d.step(window + 1)
+        assertEquals(RadioMode.FOREGROUND, d.scheduler.schedule(window + 1).running)
+        assertEquals(6, d.starts.size)
+    }
+
+    @Test
     fun rejectsNonsenseConfigurations() {
         kotlin.test.assertFailsWith<IllegalArgumentException> { ScanThrottleConfig(maxStarts = 0) }
         kotlin.test.assertFailsWith<IllegalArgumentException> { ScanThrottleConfig(windowMillis = 0) }
         kotlin.test.assertFailsWith<IllegalArgumentException> { ScanThrottleConfig(firstRetryMillis = 10, maxRetryMillis = 5) }
+        kotlin.test.assertFailsWith<IllegalArgumentException> { ScanThrottleConfig(downgradeDelayMillis = -1) }
     }
 }

@@ -16,6 +16,9 @@ import java.io.IOException
  * @property maxLeAttempts LE addresses of one peer tried in turn (`NearbyDevice.radioAddresses`, newest first).
  * @property maxServerSessions GATT stream sessions the server accepts at once; more are refused.
  * @property incomingQueue accepted channels waiting for the owner; when full, new ones are closed at once.
+ * @property listenRetryMillis the wait before a listener that failed (a server socket that did not open or stopped
+ *   accepting, the GATT server) is opened again.
+ * @property listenMaxRetryMillis the GATT server's retry back-off doubles from [listenRetryMillis] up to this.
  */
 data class BluetoothChannelConfig(
     val preferL2cap: Boolean = true,
@@ -31,6 +34,7 @@ data class BluetoothChannelConfig(
     val busyRetryMillis: Long = 10,
     val busyRetries: Int = 200,
     val listenRetryMillis: Long = 2_000,
+    val listenMaxRetryMillis: Long = 30_000,
     val gatt: GattStreamConfig = GattStreamConfig(),
 ) {
     init {
@@ -38,6 +42,7 @@ data class BluetoothChannelConfig(
         require(l2capConnectTimeoutMillis > 0 && rfcommConnectTimeoutMillis > 0) { "socket timeouts must be positive" }
         require(maxLeAttempts >= 1 && maxServerSessions >= 1 && incomingQueue >= 1) { "limits must be positive" }
         require(busyRetryMillis > 0 && busyRetries >= 1 && listenRetryMillis > 0) { "retries must be positive" }
+        require(listenMaxRetryMillis >= listenRetryMillis) { "the listen back-off cannot end below where it starts" }
     }
 }
 

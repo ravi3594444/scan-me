@@ -24,7 +24,6 @@ import com.constrivo.drop.core.discovery.MonotonicClock
 import com.constrivo.drop.core.discovery.RadioMode
 import com.constrivo.drop.core.discovery.WallClock
 import com.constrivo.drop.platform.android.AndroidClocks
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -79,6 +78,13 @@ data class BeaconRadioConfig(
  * [startAdvertising] stops the running sets and starts new ones, and a new set gets a new random address, so when the
  * owner replaces the advertisement at [BeaconAdvertisement.validUntilMillis] the radio address rotates together with
  * the ephemeral ID (N4). Intervals are 100 ms in [RadioMode.FOREGROUND] and 1 s in [RadioMode.BACKGROUND].
+ *
+ * Each set is started with a duration that ends it at [BeaconAdvertisement.validUntilMillis]
+ * ([AdvertisingPlan.durationUnits]), so the controller takes an ID off the air at its epoch boundary even while this
+ * process sleeps and the owner's timer cannot run; a set that ends before its epoch does (the 655 s cap) is restarted,
+ * and an advertisement whose epoch is over is never put on air again ([AdvertisingStatus.Expired]). Sets are tracked by
+ * [AdvertisingSets] from before the platform hears of them, so a start whose caller is cancelled, a failure and a
+ * time-out never leave one on air.
  *
  * **Scanning** uses one `BluetoothLeScanner` scan shared by all collectors of [scan], in the most demanding mode any
  * of them asks for, with two filters: our service UUID (the service-data carrier) and our company identifier followed by
@@ -135,10 +141,23 @@ class AndroidBeaconRadio(
 
     private val advertiseMutex = Mutex()
 
+    /** Every set on air or starting; nothing reaches the air without being tracked here. */
+    private val sets = AdvertisingSets(config.advertiseStartTimeoutMillis)
+
     @Volatile private var desiredAdvertisement: Pair<BeaconAdvertisement, RadioMode>? = null
-    private val activeSets = ArrayList<AdvertisingSetCallback>()
+
+    @Volatile private var closed = false
+
+    // --- guarded by advertiseMutex ---
     private var retryJob: Job? = null
     private var advertiseFailures = 0
+
+    /** Restarts sets whose duration was capped before their epoch ends, for stacks that do not report the end. */
+    private var capRestartJob: Job? = null
+
+    /** Counts applications of the desired advertisement: a set's end matters only while its generation is current. */
+    private var generation = 0L
+    // ----------------------------------
 
     override suspend fun startAdvertising(
         advertisement: BeaconAdvertisement,
@@ -154,54 +173,100 @@ class AndroidBeaconRadio(
     }
 
     private suspend fun applyAdvertising(fromRetry: Boolean) {
-        advertiseMutex.withLock {
-            if (!fromRetry) {
-                retryJob?.cancel()
-                advertiseFailures = 0
-            }
-            retryJob = null
-            stopSetsLocked()
-            val (advertisement, mode) =
-                desiredAdvertisement ?: run {
-                    setAdvertising(AdvertisingStatus.Off)
-                    return
-                }
-            val adapter = adapter
-            val advertiser = if (power.state.value == BluetoothPower.ON) guarded { adapter?.bluetoothLeAdvertiser } else null
-            if (adapter == null || advertiser == null) {
-                // Bluetooth is off: onPower applies the advertisement again when it comes on.
-                setAdvertising(AdvertisingStatus.WaitingForBluetooth)
-                return
-            }
-            val capabilities =
-                AdvertiserCapabilities(
-                    extendedAdvertising = guarded { adapter.isLeExtendedAdvertisingSupported } ?: false,
-                    le2mPhy = guarded { adapter.isLe2MPhySupported } ?: false,
-                    maxAdvertisingDataLength = guarded { adapter.leMaximumAdvertisingDataLength } ?: AdvertisingPlan.LEGACY_LIMIT,
-                )
-            val specs =
-                try {
-                    AdvertisingPlan.sets(advertisement, mode, capabilities, config.advertising)
-                } catch (e: IllegalStateException) {
-                    setAdvertising(AdvertisingStatus.Failed(AdvertisingStatus.ADVERTISE_FAILED_DATA_TOO_LARGE, retrying = false))
-                    return
-                }
-            var extendedRunning = false
-            for (spec in specs) {
-                val status = startSet(advertiser, spec)
-                if (status == AdvertisingSetCallback.ADVERTISE_SUCCESS) {
-                    if (spec.kind == AdvertisingSetKind.EXTENDED) extendedRunning = true
-                    continue
-                }
-                if (spec.kind == AdvertisingSetKind.EXTENDED) continue // optional: the legacy set carries the beacon
-                stopSetsLocked()
-                val retrying = AdvertisingStatus.isRetryable(status)
-                setAdvertising(AdvertisingStatus.Failed(status, retrying))
-                if (retrying) scheduleRetryLocked()
-                return
-            }
+        advertiseMutex.withLock { applyLocked(fromRetry) }
+    }
+
+    /**
+     * Stops every set on air (or starting) and starts the desired advertisement's sets, each bounded to the
+     * advertisement's epoch. Cancellation-safe: a set whose caller is cancelled while it starts is stopped
+     * ([AdvertisingSets]), and the next application stops the sets that did start. Call under [advertiseMutex].
+     */
+    private suspend fun applyLocked(fromRetry: Boolean) {
+        if (!fromRetry) {
+            retryJob?.cancel()
             advertiseFailures = 0
-            setAdvertising(AdvertisingStatus.Advertising(mode, extendedRunning, advertisement.validUntilMillis))
+        }
+        retryJob = null
+        capRestartJob?.cancel()
+        capRestartJob = null
+        val current = ++generation
+        sets.stopAll()
+        val (advertisement, mode) =
+            desiredAdvertisement?.takeIf { !closed } ?: run {
+                setAdvertising(AdvertisingStatus.Off)
+                return
+            }
+        val duration = AdvertisingPlan.durationUnits(advertisement.validUntilMillis, wallClock.nowMillis())
+        if (duration == null) {
+            // The owner slept through the epoch boundary and has not replaced the advertisement yet: an old ID never
+            // goes back on air (N4). The owner's next wake-up starts the new epoch's advertisement.
+            setAdvertising(AdvertisingStatus.Expired(advertisement.validUntilMillis))
+            return
+        }
+        val adapter = adapter
+        val advertiser = if (power.state.value == BluetoothPower.ON) guarded { adapter?.bluetoothLeAdvertiser } else null
+        if (adapter == null || advertiser == null) {
+            // Bluetooth is off: onPower applies the advertisement again when it comes on.
+            setAdvertising(AdvertisingStatus.WaitingForBluetooth)
+            return
+        }
+        val capabilities =
+            AdvertiserCapabilities(
+                extendedAdvertising = guarded { adapter.isLeExtendedAdvertisingSupported } ?: false,
+                le2mPhy = guarded { adapter.isLe2MPhySupported } ?: false,
+                maxAdvertisingDataLength = guarded { adapter.leMaximumAdvertisingDataLength } ?: AdvertisingPlan.LEGACY_LIMIT,
+            )
+        val specs =
+            try {
+                AdvertisingPlan.sets(advertisement, mode, capabilities, config.advertising)
+            } catch (e: IllegalStateException) {
+                setAdvertising(AdvertisingStatus.Failed(AdvertisingStatus.ADVERTISE_FAILED_DATA_TOO_LARGE, retrying = false))
+                return
+            }
+        var extendedRunning = false
+        for (spec in specs) {
+            val status = sets.start(AndroidAdvertisingSet(advertiser, spec, duration)) { onSetEnded(current) }
+            if (status == AdvertisingSets.ADVERTISE_SUCCESS) {
+                if (spec.kind == AdvertisingSetKind.EXTENDED) extendedRunning = true
+                continue
+            }
+            if (spec.kind == AdvertisingSetKind.EXTENDED) continue // optional: the legacy set carries the beacon
+            sets.stopAll()
+            val retrying = AdvertisingStatus.isRetryable(status) && !closed
+            setAdvertising(AdvertisingStatus.Failed(status, retrying))
+            if (retrying) scheduleRetryLocked()
+            return
+        }
+        advertiseFailures = 0
+        setAdvertising(AdvertisingStatus.Advertising(mode, extendedRunning, advertisement.validUntilMillis))
+        if (duration == AdvertisingPlan.MAX_DURATION_UNITS) {
+            // Capped before the epoch ends: the stack's end report restarts the sets (onSetEnded); this timer does it on
+            // stacks that do not report it, whenever the processor is awake.
+            capRestartJob =
+                scope.launch {
+                    delay(duration * AdvertisingPlan.DURATION_UNIT_MILLIS)
+                    advertiseMutex.withLock {
+                        if (current == generation) {
+                            // Cleared first, so applyLocked does not cancel the job it runs in.
+                            capRestartJob = null
+                            applyLocked(fromRetry = false)
+                        }
+                    }
+                }
+        }
+    }
+
+    /**
+     * A set of [ofGeneration] left the air by itself: its duration ran out, at the epoch boundary or at the 655 s cap.
+     * The advertisement is applied again: restarted for the rest of its epoch (a new address, the same ID), or reported
+     * [AdvertisingStatus.Expired] once its epoch is over.
+     */
+    private fun onSetEnded(ofGeneration: Long) {
+        scope.launch {
+            advertiseMutex.withLock {
+                // Nothing to do when a newer application replaced it (or the other set of the pair ended first).
+                if (ofGeneration == generation) applyLocked(fromRetry = false)
+            }
         }
     }
 
@@ -216,60 +281,85 @@ class AndroidBeaconRadio(
             }
     }
 
-    /** Starts one set and waits for `onAdvertisingSetStarted`; returns its status or one of the extra codes. */
-    private suspend fun startSet(
-        advertiser: BluetoothLeAdvertiser,
-        spec: AdvertisingSetSpec,
-    ): Int {
-        val started = CompletableDeferred<Int>()
-        val callback =
+    /**
+     * One `BluetoothLeAdvertiser` advertising set for [spec], bounded to [durationUnits] × 10 ms so that the controller
+     * (or the stack's wake-up timer) ends it at the epoch boundary even while this process sleeps.
+     */
+    private inner class AndroidAdvertisingSet(
+        private val advertiser: BluetoothLeAdvertiser,
+        private val spec: AdvertisingSetSpec,
+        private val durationUnits: Int,
+    ) : PlatformAdvertisingSet {
+        @Volatile private var stopped = false
+
+        @Volatile private var started: ((Int) -> Unit)? = null
+
+        @Volatile private var ended: (() -> Unit)? = null
+
+        private val callback =
             object : AdvertisingSetCallback() {
                 override fun onAdvertisingSetStarted(
                     advertisingSet: AdvertisingSet?,
                     txPower: Int,
                     status: Int,
                 ) {
-                    started.complete(status)
+                    if (stopped) {
+                        // Given up while it started. Android frees such a set itself; stop it again for stacks that do not.
+                        if (status == AdvertisingSets.ADVERTISE_SUCCESS) guarded { advertiser.stopAdvertisingSet(this) }
+                        return
+                    }
+                    started?.invoke(status)
+                }
+
+                override fun onAdvertisingEnabled(
+                    advertisingSet: AdvertisingSet?,
+                    enable: Boolean,
+                    status: Int,
+                ) {
+                    // Nothing here calls enableAdvertising, so a set reported disabled is one whose duration ran out.
+                    if (!enable && !stopped) ended?.invoke()
                 }
             }
-        try {
-            advertiser.startAdvertisingSet(
-                parameters(spec),
-                advertiseData(spec),
-                spec.scanResponseManufacturerData?.let {
-                    AdvertiseData.Builder().addManufacturerData(AdvertisingFormat.COMPANY_ID, it).build()
-                },
-                null,
-                null,
-                0,
-                0,
-                callback,
-                handler,
-            )
-            advertisingStarts.incrementAndGet()
-        } catch (e: SecurityException) {
-            return AdvertisingStatus.CODE_PERMISSION
-        } catch (e: IllegalArgumentException) {
-            // The platform refuses data that does not fit the set type.
-            return AdvertisingStatus.ADVERTISE_FAILED_DATA_TOO_LARGE
-        } catch (e: IllegalStateException) {
-            return AdvertisingStatus.CODE_NOT_AVAILABLE
+
+        override fun start(
+            onStarted: (status: Int) -> Unit,
+            onEnded: () -> Unit,
+        ): Int? {
+            started = onStarted
+            ended = onEnded
+            return try {
+                advertiser.startAdvertisingSet(
+                    parameters(spec),
+                    advertiseData(spec),
+                    spec.scanResponseManufacturerData?.let {
+                        AdvertiseData.Builder().addManufacturerData(AdvertisingFormat.COMPANY_ID, it).build()
+                    },
+                    null,
+                    null,
+                    durationUnits,
+                    0,
+                    callback,
+                    handler,
+                )
+                advertisingStarts.incrementAndGet()
+                null
+            } catch (e: SecurityException) {
+                AdvertisingStatus.CODE_PERMISSION
+            } catch (e: IllegalArgumentException) {
+                // The platform refuses data that does not fit the set type.
+                AdvertisingStatus.ADVERTISE_FAILED_DATA_TOO_LARGE
+            } catch (e: IllegalStateException) {
+                AdvertisingStatus.CODE_NOT_AVAILABLE
+            } catch (e: NullPointerException) {
+                // Some stacks throw from inside the binder proxy while the adapter turns off.
+                AdvertisingStatus.CODE_NOT_AVAILABLE
+            }
         }
-        val status = withTimeoutOrNull(config.advertiseStartTimeoutMillis) { started.await() } ?: AdvertisingStatus.CODE_TIMEOUT
-        if (status == AdvertisingSetCallback.ADVERTISE_SUCCESS) {
-            activeSets += callback
-        } else {
-            // A late start after a time-out must not leave an orphan set on air.
+
+        override fun stop() {
+            stopped = true
             guarded { advertiser.stopAdvertisingSet(callback) }
         }
-        return status
-    }
-
-    private fun stopSetsLocked() {
-        if (activeSets.isEmpty()) return
-        val advertiser = guarded { adapter?.bluetoothLeAdvertiser }
-        for (callback in activeSets) guarded { advertiser?.stopAdvertisingSet(callback) }
-        activeSets.clear()
     }
 
     private fun parameters(spec: AdvertisingSetSpec): AdvertisingSetParameters {
@@ -546,25 +636,30 @@ class AndroidBeaconRadio(
         mutableState.update { it.copy(power = value) }
         synchronized(scanLock) { scheduler.radioAvailable(value == BluetoothPower.ON, monotonic.elapsedMillis()) }
         wake.trySend(Unit)
-        if (value != BluetoothPower.ON) {
-            // The stack dropped every set with the adapter; forget them without calling into a dead advertiser.
-            advertiseMutex.withLock {
-                activeSets.clear()
+        advertiseMutex.withLock {
+            if (value != BluetoothPower.ON) {
+                // The stack drops its sets with the adapter. Stopping them as well is harmless (every call is guarded)
+                // and covers a stack that keeps a set through a BLE-only state.
+                generation++
+                sets.stopAll()
                 retryJob?.cancel()
                 retryJob = null
+                capRestartJob?.cancel()
+                capRestartJob = null
                 if (desiredAdvertisement != null) setAdvertising(AdvertisingStatus.WaitingForBluetooth)
+            } else if (desiredAdvertisement != null) {
+                applyLocked(fromRetry = false)
             }
-        } else if (desiredAdvertisement != null) {
-            applyAdvertising(fromRetry = false)
         }
     }
 
     /** Stops advertising and scanning and releases the callback thread. The radio cannot be used afterwards. */
     override fun close() {
+        closed = true
         synchronized(scanLock) { subscribers.values.forEach { it.channel.close() } }
         osStopScan()
-        val advertiser = guarded { adapter?.bluetoothLeAdvertiser }
-        for (callback in activeSets.toList()) guarded { advertiser?.stopAdvertisingSet(callback) }
+        // Every set on air or still starting; a start in progress gives up and stops its own set as well.
+        sets.stopAll()
         scope.cancel()
         raw.close()
         power.stop()

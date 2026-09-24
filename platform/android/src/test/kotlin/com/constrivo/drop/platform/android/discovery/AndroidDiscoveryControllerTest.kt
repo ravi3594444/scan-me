@@ -89,10 +89,13 @@ class AndroidDiscoveryControllerTest {
         val permissions: MutableStateFlow<RadioPermissionState>,
         val secret: MutableStateFlow<ByteArray>,
         val wall: () -> Long,
+        /** Deep sleep: the wall clock moves on by the given milliseconds while no coroutine delay runs. */
+        val sleep: (Long) -> Unit,
     )
 
     private fun TestScope.harness(visibility: Visibility = Visibility.EVERYONE): Harness {
-        val wall = { start + testScheduler.currentTime }
+        var slept = 0L
+        val wall = { start + slept + testScheduler.currentTime }
         val radio = FakeRadio().also { it.clock = wall }
         val state =
             MutableStateFlow(
@@ -121,7 +124,7 @@ class AndroidDiscoveryControllerTest {
             )
         backgroundScope.launch { controller.run() }
         runCurrent()
-        return Harness(controller, radio, state, permissions, secret, wall)
+        return Harness(controller, radio, state, permissions, secret, wall) { slept += it }
     }
 
     @Test
@@ -163,6 +166,53 @@ class AndroidDiscoveryControllerTest {
             runCurrent()
             assertEquals(3, h.radio.advertised.size)
             assertEquals(EphemeralIds.derive(crypto, ownSecret, 2_000_001), h.radio.advertised[2].second.body.ephemeralId)
+        }
+
+    @Test
+    fun aProcessorThatSleptThroughTheBoundaryRotatesAtTheNextSighting() =
+        runTest {
+            val h = harness()
+            h.controller.setForegroundService(true)
+            runCurrent()
+            val first = h.radio.advertised.single().second
+            // The screen is off and the processor sleeps for 20 minutes: the wall clock moves on, delays do not.
+            h.sleep(20 * 60_000L)
+            runCurrent()
+            assertEquals(1, h.radio.advertised.size, "the epoch timer slept too")
+            // A filtered scan result wakes the processor (the radio already took the old ID off the air at the
+            // boundary): the new epoch's ID goes on air at once, not a timer slice later.
+            val peer =
+                BeaconAdvertisement.create(
+                    crypto,
+                    ByteArray(32) { 9 },
+                    LocalBeaconState(Visibility.EVERYONE, DevicePlatform.LAPTOP, Capabilities.NONE, NetworkHint.NONE, "Ben"),
+                    BeaconCarrier.MANUFACTURER_DATA,
+                    h.wall(),
+                )
+            h.radio.air.emit(BeaconSighting.fromAdvertisingData(peer.advertisingData(), -60, "AA:BB:CC:00:11:44", h.wall())!!)
+            runCurrent()
+            assertEquals(2, h.radio.advertised.size)
+            val second = h.radio.advertised.last().second
+            assertEquals(EphemeralIds.at(crypto, ownSecret, h.wall()), second.body.ephemeralId)
+            assertNotEquals(first.body.ephemeralId, second.body.ephemeralId)
+            assertTrue(second.validUntilMillis > h.wall())
+        }
+
+    @Test
+    fun theServicesWakeUpAlarmRotatesAnAdvertisementWhoseEpochIsOver() =
+        runTest {
+            val h = harness()
+            h.controller.setForegroundService(true)
+            runCurrent()
+            // A wake-up within the epoch changes nothing.
+            h.controller.wakeUp()
+            runCurrent()
+            assertEquals(1, h.radio.advertised.size)
+            h.sleep(16 * 60_000L)
+            h.controller.wakeUp()
+            runCurrent()
+            assertEquals(2, h.radio.advertised.size)
+            assertEquals(EphemeralIds.at(crypto, ownSecret, h.wall()), h.radio.advertised.last().second.body.ephemeralId)
         }
 
     @Test

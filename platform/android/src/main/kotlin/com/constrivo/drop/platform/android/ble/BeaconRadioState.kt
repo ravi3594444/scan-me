@@ -21,6 +21,15 @@ sealed interface AdvertisingStatus {
     ) : AdvertisingStatus
 
     /**
+     * The advertisement's epoch ended at [validUntilMillis] before the owner replaced it (the application processor
+     * slept through the boundary): nothing is on air until the owner starts the new epoch's advertisement, because an
+     * ephemeral ID must never outlive its epoch (N4).
+     */
+    data class Expired(
+        val validUntilMillis: Long,
+    ) : AdvertisingStatus
+
+    /**
      * The legacy set did not start. [code] is `AdvertisingSetCallback.ADVERTISE_FAILED_*`, or [CODE_PERMISSION],
      * [CODE_NOT_AVAILABLE] or [CODE_TIMEOUT]; a retry is scheduled unless [retrying] is false (a permanent failure such
      * as unsupported hardware or oversized data).
@@ -34,7 +43,7 @@ sealed interface AdvertisingStatus {
         /** `BLUETOOTH_ADVERTISE` is missing. */
         const val CODE_PERMISSION: Int = -1
 
-        /** No advertiser (Bluetooth off under us, or no LE hardware). */
+        /** No advertiser (Bluetooth off under us, or no LE hardware), or the set was stopped while it started. */
         const val CODE_NOT_AVAILABLE: Int = -2
 
         /** The stack did not answer `startAdvertisingSet` in time. */

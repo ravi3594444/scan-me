@@ -83,12 +83,15 @@ data class GattStreamConfig(
  * `DataChannel` semantics: [read] returns buffered bytes, `-1` after the peer's `CLOSE` once everything before it was
  * read and after [close]; it throws [GattStreamException] after a reset or when the link is lost (bytes that arrived
  * before a lost link are still read first). [write] returns once every segment was handed to the stack, suspending on
- * credits, which is the backpressure. A cancelled write resets the stream (the peer cannot tell where it stopped); a
- * cancelled read loses nothing. One reader and one writer may run at once; concurrent reads, or writes, are serialised.
- * [close] is idempotent.
+ * credits, which is the backpressure, and it always ends: when the stream breaks or is torn down, a write whose segment
+ * is still with the stack (a notification never confirmed, a busy-retry pause) fails with the stream's error instead of
+ * waiting for a transport that may never answer. A cancelled write resets the stream (the peer cannot tell where it
+ * stopped); a cancelled read loses nothing. One reader and one writer may run at once; concurrent reads, or writes, are
+ * serialised. [close] is idempotent.
  *
- * Create with [client] (then call [open]) or [server] (then call [accept] with the first segment); route every received
- * segment to [onSegment] and a lost link to [onTransportClosed].
+ * Create with [client] (then call [open]) or [server] (then call [accept] with the first segment, or [refuse] it); route
+ * every received segment to [onSegment] and a lost link to [onTransportClosed]. A server channel may be handed to its
+ * owner before [accept]: its reads and writes wait until the stream is open.
  */
 class GattStreamChannel private constructor(
     private val link: GattSegmentTransport,
@@ -142,6 +145,15 @@ class GattStreamChannel private constructor(
     private var resetQueued: Int? = null
     private var handshakeQueued: ((Int) -> GattSegment)? = null
     private var duplicates = 0L
+
+    /** What a writer waits for on the `DATA` segment the pump is handing to the link right now, if anything. */
+    private var inFlight: CompletableDeferred<Unit>? = null
+
+    /** Segments accepted in order (the `OPEN` included), for [isRepeatedOpen]. */
+    private var receivedSegments = 0L
+
+    /** Server: the client's `OPEN` as received, for [isRepeatedOpen]. */
+    private var openBytes: ByteArray? = null
     // -----------------------
 
     private val readSignal = Channel<Unit>(Channel.CONFLATED)
@@ -190,15 +202,49 @@ class GattStreamChannel private constructor(
         }
     }
 
-    /** Server: processes the client's first segment (its `OPEN`) and answers `OPEN_ACK`. */
+    /**
+     * Server: processes the client's first segment (its `OPEN`) and answers `OPEN_ACK`. Does nothing when the owner
+     * already closed the channel (it may be handed out before this call).
+     */
     fun accept(openSegment: ByteArray) {
         synchronized(lock) {
-            check(role == Role.SERVER && phase == Phase.NEW) { "accept() is for a new server channel" }
+            check(role == Role.SERVER) { "accept() is for a server channel" }
+            if (phase == Phase.CLOSED || failure != null) return
+            check(phase == Phase.NEW) { "accept() was already called" }
             phase = Phase.OPENING
+            openBytes = openSegment.copyOf()
         }
         scope.launch { pump() }
         onSegment(openSegment)
     }
+
+    /**
+     * Server: refuses the client's `OPEN` ([openSegment]) with `RESET(reason)` instead of `OPEN_ACK`, so the client fails
+     * at once instead of waiting for its open timeout, then ends the channel. A repeat of the same `OPEN` is dropped.
+     */
+    fun refuse(
+        openSegment: ByteArray,
+        reason: Int = GattSegments.RESET_REFUSED,
+    ) {
+        synchronized(lock) {
+            check(role == Role.SERVER && phase == Phase.NEW) { "refuse() is for a new server channel" }
+            phase = Phase.OPENING
+            openBytes = openSegment.copyOf()
+            // The OPEN counts as received, so the RESET carries sequence number 0 and a repeat of the OPEN is a duplicate.
+            receivedSegments = 1
+            expectedInSeq = 1
+        }
+        scope.launch { pump() }
+        fail(GattStreamException("the incoming GATT stream was refused"), reason)
+    }
+
+    /**
+     * Server: whether [value] repeats, byte for byte, the `OPEN` this channel started with while nothing else has arrived:
+     * a write the client's stack reported as not sent although it was, then retried. Such a repeat belongs to this
+     * channel (where its sequence number drops it), not to a new stream.
+     */
+    internal fun isRepeatedOpen(value: ByteArray): Boolean =
+        synchronized(lock) { role == Role.SERVER && receivedSegments == 1L && openBytes?.contentEquals(value) == true }
 
     /** One segment from the peer, in arrival order. Called on the Bluetooth callback thread; never blocks. */
     fun onSegment(value: ByteArray) {
@@ -255,6 +301,7 @@ class GattStreamChannel private constructor(
             return protocolError("segment ${segment.seq} arrived while $expectedInSeq was expected: segments were lost")
         }
         expectedInSeq = (expectedInSeq + 1) and 0xFFFF
+        receivedSegments++
         return when (segment) {
             is GattSegment.Open -> {
                 if (role != Role.SERVER || phase != Phase.OPENING) return protocolError("unexpected OPEN")
@@ -389,7 +436,8 @@ class GattStreamChannel private constructor(
         synchronized(lock) { writableError()?.let { throw it } }
         if (length == 0) return
         writeMutex.withLock {
-            if (role == Role.CLIENT) opened.await()
+            // A client waits for OPEN_ACK; a server handed out before accept() waits for the client's OPEN.
+            opened.await()
             var from = offset
             val end = offset + length
             while (from < end) {
@@ -467,6 +515,11 @@ class GattStreamChannel private constructor(
                     try {
                         link.send(next.bytes)
                     } catch (e: CancellationException) {
+                        // Torn down while the link still held the segment (a notification never confirmed, a busy-retry
+                        // pause): its writer must not wait for a send that will never return. teardown() fails it too;
+                        // this covers a scope cancelled from outside.
+                        next.done?.completeExceptionally(closedError())
+                        if (next.final) finalSent.complete(Unit)
                         throw e
                     } catch (e: Exception) {
                         val failure = e as? GattStreamException ?: GattStreamException("GATT write failed", e)
@@ -475,6 +528,7 @@ class GattStreamChannel private constructor(
                         fail(failure, resetReason = null)
                         return
                     }
+                    synchronized(lock) { if (inFlight === next.done) inFlight = null }
                     next.done?.complete(Unit)
                     if (next.final) {
                         finalSent.complete(Unit)
@@ -486,6 +540,9 @@ class GattStreamChannel private constructor(
     }
 
     private fun takeSeq(): Int = nextOutSeq.also { nextOutSeq = (nextOutSeq + 1) and 0xFFFF }
+
+    /** The error a writer sees once the stream is gone. */
+    private fun closedError(): IOException = synchronized(lock) { failure } ?: GattStreamException("the GATT stream is closed")
 
     /** The next segment to send, [Next.Stop] when the pump is done, or null to wait. Call under [lock]. */
     private fun nextLocked(): Next? {
@@ -508,6 +565,8 @@ class GattStreamChannel private constructor(
         if (outbound.isNotEmpty() && peerCredits > 0 && !remoteClosed) {
             val o = outbound.removeFirst()
             peerCredits--
+            // Out of the queue but not yet sent: fail() and teardown() must still reach its writer.
+            inFlight = o.done
             return Next.Send(GattSegments.data(takeSeq(), o.source, o.offset, o.length), o.done, final = false)
         }
         if (closeQueued && outbound.isEmpty()) {
@@ -524,6 +583,7 @@ class GattStreamChannel private constructor(
         discard: Boolean = false,
     ) {
         val pending: List<Outgoing>
+        val flying: CompletableDeferred<Unit>?
         val sendReset: Boolean
         synchronized(lock) {
             if (failure != null || phase == Phase.CLOSED) return
@@ -534,10 +594,13 @@ class GattStreamChannel private constructor(
             }
             pending = outbound.toList()
             outbound.clear()
+            flying = inFlight
+            inFlight = null
             sendReset = resetReason != null && phase != Phase.NEW
             if (sendReset) resetQueued = resetReason
         }
         pending.forEach { it.done?.completeExceptionally(error) }
+        flying?.completeExceptionally(error)
         opened.completeExceptionally(error)
         readSignal.trySend(Unit)
         if (sendReset) {
@@ -551,18 +614,25 @@ class GattStreamChannel private constructor(
         }
     }
 
-    /** Ends everything: fails what is still pending, disconnects the link, stops the pump. Idempotent. */
+    /**
+     * Ends everything: fails what is still pending, the segment in flight included (the link may never finish sending
+     * it), disconnects the link, stops the pump. Idempotent.
+     */
     private fun teardown() {
         if (!tornDown.compareAndSet(false, true)) return
         val pending: List<Outgoing>
+        val flying: CompletableDeferred<Unit>?
         val error: IOException
         synchronized(lock) {
             error = failure ?: GattStreamException("the GATT stream is closed").also { failure = it }
             phase = Phase.CLOSED
             pending = outbound.toList()
             outbound.clear()
+            flying = inFlight
+            inFlight = null
         }
         pending.forEach { it.done?.completeExceptionally(error) }
+        flying?.completeExceptionally(error)
         opened.completeExceptionally(error)
         finalSent.complete(Unit)
         readSignal.trySend(Unit)

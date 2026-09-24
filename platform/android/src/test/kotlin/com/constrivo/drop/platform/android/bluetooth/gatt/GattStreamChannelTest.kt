@@ -4,9 +4,11 @@ import com.constrivo.drop.core.protocol.LinkKind
 import com.constrivo.drop.platform.android.bluetooth.BluetoothTransport
 import com.constrivo.drop.platform.android.bluetooth.EngineOverBluetooth
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
@@ -14,6 +16,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -26,6 +29,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 /**
@@ -48,11 +52,22 @@ class GattStreamChannelTest {
         clientConfig: GattStreamConfig = GattStreamConfig(),
         serverConfig: GattStreamConfig = GattStreamConfig(),
         serverMaxSegment: Int = maxSegment,
+        maxSessions: Int = 1,
+        onIncoming: (GattStreamChannel) -> Boolean = { true },
     ): GattLinkPair {
         val dispatcher = StandardTestDispatcher(testScheduler)
         // Delivery runs as foreground work, so advanceUntilIdle() waits for segments in flight; the loops only ever
         // suspend on their queues, so they need no cancellation.
-        return GattLinkPair(CoroutineScope(dispatcher), dispatcher, maxSegment, clientConfig, serverConfig, serverMaxSegment).start()
+        return GattLinkPair(
+            CoroutineScope(dispatcher),
+            dispatcher,
+            maxSegment,
+            clientConfig,
+            serverConfig,
+            serverMaxSegment,
+            maxSessions,
+            onIncoming,
+        ).start()
     }
 
     private suspend fun GattLinkPair.open(): Pair<GattStreamChannel, GattStreamChannel> {
@@ -381,5 +396,192 @@ class GattStreamChannelTest {
             assertEquals(0, client.read(ByteArray(4), 4, 0))
             client.write(ByteArray(4), 4, 0)
             client.flush()
+        }
+
+    // --- A segment stuck in the link: a notification the stack never confirms, a write in its busy-retry pause ---
+
+    /**
+     * A link whose sends can hang until the pump is cancelled, like `GattServerHost`'s notify waiting for an
+     * `onNotificationSent` that never comes, or `GattClientLink.send` in its busy-retry `delay`.
+     */
+    private class StuckLink : GattSegmentTransport {
+        override val maxSegmentSize: Int = 509
+        val sent = Channel<ByteArray>(Channel.UNLIMITED)
+
+        @Volatile var hang = false
+
+        @Volatile var disconnects = 0
+
+        override suspend fun send(segment: ByteArray) {
+            sent.send(segment)
+            if (hang) awaitCancellation()
+        }
+
+        override fun disconnect() {
+            disconnects++
+        }
+    }
+
+    private val open = GattSegments.encode(GattSegment.Open(0, 1, 8, 509))
+
+    /** A server channel over a [StuckLink], opened, whose next segment will hang; and a write stuck in it. */
+    private fun TestScope.serverWithAStuckWrite(): Triple<GattStreamChannel, StuckLink, Deferred<Result<Unit>>> {
+        val link = StuckLink()
+        val server = GattStreamChannel.server(link, StandardTestDispatcher(testScheduler), small)
+        server.accept(open)
+        advanceUntilIdle()
+        assertIs<GattSegment.OpenAck>(GattSegments.decode(assertNotNull(link.sent.tryReceive().getOrNull())))
+        link.hang = true
+        // A one-segment write: its segment carries the completion the writer waits for (as acks and control frames do).
+        // Background work runs with runCurrent(); advanceUntilIdle() only waits for foreground work.
+        val writing = backgroundScope.async { runCatching { server.write(byteArrayOf(1, 2, 3)) } }
+        runCurrent()
+        assertIs<GattSegment.Data>(GattSegments.decode(assertNotNull(link.sent.tryReceive().getOrNull())))
+        assertFalse(writing.isCompleted, "the segment is with the link")
+        return Triple(server, link, writing)
+    }
+
+    @Test
+    fun aPeerResetFailsAWriteWhoseSegmentIsStuckInTheLink() =
+        runTest {
+            val (server, link, writing) = serverWithAStuckWrite()
+            server.onSegment(GattSegments.encode(GattSegment.Reset(1, GattSegments.RESET_CANCELLED)))
+            runCurrent()
+            assertTrue(writing.isCompleted, "a write must never wait for a send that cannot return")
+            assertIs<GattStreamException>(writing.await().exceptionOrNull())
+            assertEquals(1, link.disconnects)
+        }
+
+    @Test
+    fun aLostLinkOrAClosingServerFailsAWriteStuckInTheLink() =
+        runTest {
+            // GattServerHost.close() and a disconnect both end the session's channel while its notification may still
+            // be pending.
+            val (server, _, writing) = serverWithAStuckWrite()
+            server.onTransportClosed(IOException("GATT server closed"))
+            runCurrent()
+            assertTrue(writing.isCompleted)
+            assertIs<GattStreamException>(writing.await().exceptionOrNull())
+            assertFailsWith<GattStreamException> { server.write(byteArrayOf(4)) }
+        }
+
+    @Test
+    fun closeFailsAWriteStuckInTheLinkWhenItsLingerEnds() =
+        runTest {
+            val (server, _, writing) = serverWithAStuckWrite()
+            val closing = backgroundScope.launch { server.close() }
+            advanceTimeBy(small.closeLingerMillis - 1)
+            runCurrent()
+            // Still waiting for the CLOSE to go out behind the stuck segment.
+            assertFalse(closing.isCompleted)
+            advanceTimeBy(2)
+            runCurrent()
+            assertTrue(closing.isCompleted)
+            assertTrue(writing.isCompleted)
+            assertIs<IOException>(writing.await().exceptionOrNull())
+        }
+
+    @Test
+    fun aClientInItsBusyRetryPauseFailsWhenThePeerResets() =
+        runTest {
+            val link = StuckLink()
+            val client = GattStreamChannel.client(link, StandardTestDispatcher(testScheduler), small)
+            val opening = backgroundScope.async { runCatching { client.open() } }
+            runCurrent()
+            assertIs<GattSegment.Open>(GattSegments.decode(assertNotNull(link.sent.tryReceive().getOrNull())))
+            client.onSegment(GattSegments.encode(GattSegment.OpenAck(0, 1, 8, 509)))
+            runCurrent()
+            assertTrue(opening.await().isSuccess)
+            link.hang = true
+            val writing = backgroundScope.async { runCatching { client.write(ByteArray(100)) } }
+            runCurrent()
+            assertIs<GattSegment.Data>(GattSegments.decode(assertNotNull(link.sent.tryReceive().getOrNull())))
+            assertFalse(writing.isCompleted)
+            client.onSegment(GattSegments.encode(GattSegment.Reset(1, GattSegments.RESET_PROTOCOL)))
+            runCurrent()
+            assertTrue(writing.isCompleted)
+            assertIs<GattStreamException>(writing.await().exceptionOrNull())
+        }
+
+    // --- The server's session lifecycle (the routing GattServerHost uses) ---
+
+    @Test
+    fun aRepeatedOpenIsDroppedByTheSessionItRepeats() =
+        runTest {
+            val link = pair(maxSegment = 20)
+            // The client's stack reported its OPEN as not sent although it was, and the client sent it again.
+            link.clientLink.fault = { index, _ -> if (index == 0) Fault.DUPLICATE else Fault.NONE }
+            val (client, server) = link.open()
+            val data = Random(8).nextBytes(300)
+            client.write(data)
+            assertContentEquals(data, readFully(server, data.size))
+            advanceUntilIdle()
+            assertEquals(1, link.sessionsStarted.get(), "the repeat did not replace the session")
+            assertEquals(1L, server.duplicateSegments)
+            assertEquals(1, link.serverLink.sentTypes().count { it == GattSegments.TYPE_OPEN_ACK })
+            assertTrue(server.isOpen && client.isOpen)
+        }
+
+    @Test
+    fun aStreamNobodyTakesIsRefusedAtOnce() =
+        runTest {
+            val offered = ArrayList<GattStreamChannel>()
+            val link =
+                pair(onIncoming = {
+                    offered += it
+                    false
+                })
+            val e = assertFailsWith<GattStreamException> { link.client.open() }
+            assertTrue(e.message!!.contains("reset"), e.message)
+            // No wait for the open timeout, and no OPEN_ACK before the RESET.
+            assertTrue(testScheduler.currentTime < GattStreamConfig().openTimeoutMillis)
+            advanceUntilIdle()
+            val reset = assertIs<GattSegment.Reset>(GattSegments.decode(link.serverLink.sent.single()))
+            assertEquals(GattSegments.RESET_REFUSED, reset.reason)
+            assertEquals(0, reset.seq)
+            // The offered channel never opened, and the refused session ended the connection it owned.
+            assertFalse(offered.single().isOpen)
+            assertEquals(1, link.serverLink.disconnects.get())
+        }
+
+    @Test
+    fun aServerWithEverySessionInUseRefusesANewStream() =
+        runTest {
+            val link = pair(maxSessions = 0)
+            assertFailsWith<GattStreamException> { link.client.open() }
+            assertTrue(testScheduler.currentTime < GattStreamConfig().openTimeoutMillis)
+            advanceUntilIdle()
+            assertEquals(1, link.refusedForCapacity.get())
+            assertEquals(listOf(GattSegments.TYPE_RESET), link.serverLink.sentTypes())
+            // A refused session that was never registered leaves the connection to the client.
+            assertEquals(0, link.serverLink.disconnects.get())
+        }
+
+    @Test
+    fun aServerChannelHandedOutBeforeAcceptWaitsForTheOpen() =
+        runTest {
+            val rogue = Rogue()
+            val server = GattStreamChannel.server(rogue, StandardTestDispatcher(testScheduler), small)
+            val writing = backgroundScope.async { runCatching { server.write(byteArrayOf(7)) } }
+            runCurrent()
+            assertFalse(writing.isCompleted, "waiting for the OPEN")
+            server.accept(open)
+            runCurrent()
+            assertTrue(writing.await().isSuccess)
+            assertIs<GattSegment.OpenAck>(GattSegments.decode(rogue.sent.receive()))
+            assertContentEquals(byteArrayOf(7), assertIs<GattSegment.Data>(GattSegments.decode(rogue.sent.receive())).payload)
+        }
+
+    @Test
+    fun anOwnerThatClosesBeforeAcceptMakesAcceptANoOp() =
+        runTest {
+            val rogue = Rogue()
+            val server = GattStreamChannel.server(rogue, StandardTestDispatcher(testScheduler), small)
+            server.close()
+            server.accept(open)
+            advanceUntilIdle()
+            assertTrue(rogue.sent.tryReceive().isFailure, "nothing is sent for a closed channel")
+            assertEquals(-1, server.read(ByteArray(4)))
+            assertFailsWith<IOException> { server.write(byteArrayOf(1)) }
         }
 }

@@ -35,6 +35,20 @@ class AdvertisingPlanTest {
     }
 
     @Test
+    fun aSetEndsAtItsEpochBoundaryAndAnExpiredOneNeverStarts() {
+        val boundary = 1_800_000_000_000L
+        // Ten seconds before the boundary: 1000 units of 10 ms, rounded up so the ID never ends early by a unit.
+        assertEquals(1_000, AdvertisingPlan.durationUnits(boundary, boundary - 10_000))
+        assertEquals(1, AdvertisingPlan.durationUnits(boundary, boundary - 1))
+        assertEquals(2, AdvertisingPlan.durationUnits(boundary, boundary - 11))
+        // Longer than the controller allows (655.35 s): capped, and restarted within the epoch.
+        assertEquals(AdvertisingPlan.MAX_DURATION_UNITS, AdvertisingPlan.durationUnits(boundary, boundary - 15 * 60_000L))
+        // At or past the boundary the advertisement has expired.
+        assertNull(AdvertisingPlan.durationUnits(boundary, boundary))
+        assertNull(AdvertisingPlan.durationUnits(boundary, boundary + 60_000))
+    }
+
+    @Test
     fun intervalsFollowTheRadioMode() {
         val ad = advertisement()
         assertEquals(160, AdvertisingPlan.legacy(ad, RadioMode.FOREGROUND).interval) // 100 ms

@@ -27,13 +27,17 @@ import kotlin.coroutines.CoroutineContext
 
 /**
  * The drop GATT server (architecture §6.1 note): publishes [channelInfo] (this device's L2CAP PSM) for reading and
- * carries the server end of one [GattStreamChannel] per connected client. A client's first segment must be an `OPEN`
- * with sequence number 0; it creates the session, which is handed to [onIncoming] once accepted (a `false` answer closes
- * it again). A new `OPEN` from the same device replaces its session; disconnection ends it.
+ * carries the server end of one [GattStreamChannel] per connected client. Segments are routed by [GattServerRouting]: a
+ * client's first segment must be an `OPEN` with sequence number 0; it creates the session, whose channel is offered to
+ * [onIncoming] before the `OPEN` is answered. A channel nobody takes (a `false` answer), or an `OPEN` beyond
+ * [BluetoothChannelConfig.maxServerSessions], is answered with `RESET(refused)`, so the client fails at once. A new
+ * `OPEN` from the same device replaces its session, except a byte-identical repeat of the session's own `OPEN` (a retried
+ * write), which the session drops; disconnection ends it.
  *
  * Notifications are serialised across all clients and each waits for `onNotificationSent`, so the stack never holds more
- * than one; a busy stack is retried. Characteristics need no encryption, so no client is ever asked to pair. Callbacks
- * run on binder threads and only hand segments over. Needs `BLUETOOTH_CONNECT`.
+ * than one; a busy stack is retried. A notification still waiting when its session ends or the server closes fails at
+ * once. Characteristics need no encryption, so no client is ever asked to pair. Callbacks run on binder threads and only
+ * hand segments over. Needs `BLUETOOTH_CONNECT`.
  */
 @SuppressLint("MissingPermission")
 internal class GattServerHost(
@@ -56,7 +60,15 @@ internal class GattServerHost(
     private val mtus = ConcurrentHashMap<String, Int>()
     private val notifyLock = Mutex()
 
-    @Volatile private var pendingNotify: Pair<String, CompletableDeferred<Int>>? = null
+    /** The one notification the stack holds: whose it is, and what `onNotificationSent` completes. */
+    private class PendingNotify(
+        val session: Session,
+        val done: CompletableDeferred<Int>,
+    ) {
+        val address: String get() = session.device.address
+    }
+
+    @Volatile private var pendingNotify: PendingNotify? = null
 
     /** Clients with an open stream, for diagnostics. */
     val sessionCount: Int get() = sessions.size
@@ -69,10 +81,13 @@ internal class GattServerHost(
         override val maxSegmentSize: Int
             get() = DropBluetoothProfile.segmentSize(mtus[device.address] ?: DropBluetoothProfile.DEFAULT_ATT_MTU)
 
-        override suspend fun send(segment: ByteArray) = notify(device, segment)
+        override suspend fun send(segment: ByteArray) = notify(this, segment)
 
         override fun disconnect() {
-            // Only a session still registered owns the connection; a replaced one leaves the link to its successor.
+            // The stream is gone: a notification of this session still waiting for the stack must not hold its sender.
+            failPendingNotify(IOException("the GATT stream to ${device.address} ended")) { it.session === this }
+            // Only a session still registered owns the connection; a replaced one, or one refused because every session
+            // was in use, leaves the link alone.
             if (sessions.remove(device.address, this)) {
                 try {
                     server?.cancelConnection(device)
@@ -81,6 +96,13 @@ internal class GattServerHost(
                 }
             }
         }
+    }
+
+    private fun failPendingNotify(
+        error: IOException,
+        which: (PendingNotify) -> Boolean,
+    ) {
+        pendingNotify?.let { if (which(it)) it.done.completeExceptionally(error) }
     }
 
     private val callback =
@@ -100,9 +122,7 @@ internal class GattServerHost(
                 if (newState != BluetoothProfile.STATE_DISCONNECTED) return
                 val address = device.address
                 mtus.remove(address)
-                pendingNotify?.let { (target, done) ->
-                    if (target == address) done.completeExceptionally(IOException("client $address disconnected"))
-                }
+                failPendingNotify(IOException("client $address disconnected")) { it.address == address }
                 sessions.remove(address)?.channel?.onTransportClosed(IOException("GATT client disconnected (status $status)"))
             }
 
@@ -197,7 +217,8 @@ internal class GattServerHost(
                 device: BluetoothDevice,
                 status: Int,
             ) {
-                pendingNotify?.let { (target, done) -> if (target == device.address) done.complete(status) }
+                // Notifications are serialised, so the address names the one pending.
+                pendingNotify?.let { if (it.address == device.address) it.done.complete(status) }
             }
         }
 
@@ -263,10 +284,11 @@ internal class GattServerHost(
         val s = server
         server = null
         serverToClient = null
+        // First release the notification the stack holds, so no sender waits on a server that is going away.
+        failPendingNotify(IOException("GATT server closed")) { true }
         val closing = sessions.values.toList()
         sessions.clear()
         closing.forEach { it.channel.onTransportClosed(IOException("GATT server closed")) }
-        pendingNotify?.second?.completeExceptionally(IOException("GATT server closed"))
         try {
             s?.close()
         } catch (e: RuntimeException) {
@@ -279,42 +301,43 @@ internal class GattServerHost(
         value: ByteArray,
     ) {
         val address = device.address
-        val fresh = isFreshOpen(value)
         val existing = sessions[address]
-        if (existing != null && !fresh) {
-            existing.channel.onSegment(value)
-            return
-        }
-        // A segment without a session belongs to a stream this server no longer has: the client times out.
-        if (!fresh) return
-        if (existing == null && sessions.size >= config.maxServerSessions) return
-        val session = Session(device)
-        sessions[address] = session
-        existing?.channel?.onTransportClosed(IOException("client opened a new stream"))
-        session.channel.accept(value)
-        if (!onIncoming(session.channel)) {
-            sessions.remove(address, session)
-            session.channel.onTransportClosed(IOException("no room for another incoming channel"))
+        when (GattServerRouting.route(value, existing?.channel, sessions.size, config.maxServerSessions)) {
+            GattServerRouting.Route.EXISTING -> {
+                existing?.channel?.onSegment(value)
+            }
+
+            GattServerRouting.Route.DROP -> {
+                // A stream this server no longer has; the client's own timeouts end it.
+            }
+
+            GattServerRouting.Route.REFUSE -> {
+                // Not registered: it only sends the RESET and leaves the connection alone.
+                Session(device).channel.refuse(value)
+            }
+
+            GattServerRouting.Route.NEW -> {
+                val session = Session(device)
+                sessions[address] = session
+                existing?.channel?.onTransportClosed(IOException("client opened a new stream"))
+                // A refused session stays registered until its RESET is out, then ends the connection.
+                GattServerRouting.start(session.channel, value, onIncoming)
+            }
         }
     }
 
-    private fun isFreshOpen(value: ByteArray): Boolean =
-        value.size >= GattSegments.HEADER_SIZE &&
-            (value[0].toInt() and 0xFF) == GattSegments.TYPE_OPEN &&
-            value[1].toInt() == 0 &&
-            value[2].toInt() == 0
-
     private suspend fun notify(
-        device: BluetoothDevice,
+        session: Session,
         value: ByteArray,
     ) {
+        val device = session.device
         notifyLock.withLock {
             var attempts = 0
             while (true) {
                 val s = server ?: throw IOException("GATT server closed")
                 val characteristic = serverToClient ?: throw IOException("GATT server closed")
                 val done = CompletableDeferred<Int>()
-                pendingNotify = device.address to done
+                pendingNotify = PendingNotify(session, done)
                 try {
                     val issued =
                         try {

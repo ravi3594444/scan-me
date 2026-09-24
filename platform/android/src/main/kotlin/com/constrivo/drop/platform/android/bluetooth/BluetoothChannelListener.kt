@@ -19,7 +19,6 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -34,6 +33,8 @@ import java.io.IOException
 data class ListenerState(
     val power: BluetoothPower = BluetoothPower.OFF,
     val gattServer: Boolean = false,
+    /** Failed attempts to open the GATT server since serving started; it is retried until it opens (0 once open). */
+    val gattServerFailures: Int = 0,
     /** The PSM published in [ChannelInfo], or null while no L2CAP channel listens. */
     val l2capPsm: Int? = null,
     val rfcomm: Boolean = false,
@@ -52,11 +53,14 @@ data class ListenerState(
  * - optionally an **RFCOMM** server socket ([BluetoothChannelConfig.listenRfcomm]).
  *
  * Every accepted connection is delivered on [incoming] as a [BluetoothDataChannel]; the transfer service (WP7e) runs the
- * responder handshake on it. When [incoming] is full a new channel is closed at once. Servers are closed when Bluetooth
- * turns off and reopened when it comes back; an accept loop that fails is restarted after
- * [BluetoothChannelConfig.listenRetryMillis] (with a new PSM, republished). Nothing asks for pairing.
+ * responder handshake on it. When [incoming] is full a new channel is closed at once (a GATT stream is refused with a
+ * `RESET`). Servers are closed when Bluetooth turns off and reopened when it comes back. Whatever does not open is
+ * retried: an accept loop after [BluetoothChannelConfig.listenRetryMillis] (with a new PSM, republished), the GATT server
+ * with a back-off up to [BluetoothChannelConfig.listenMaxRetryMillis], since opening it can fail right after Bluetooth
+ * turns on or while `BLUETOOTH_CONNECT` is missing, and without it no peer can learn the PSM. [refresh] retries
+ * everything at once. Nothing asks for pairing.
  *
- * Needs `BLUETOOTH_CONNECT`; without it the servers stay closed and [state] says why.
+ * Needs `BLUETOOTH_CONNECT`; without it the servers stay closed and [state] says why; call [refresh] once it is granted.
  */
 @SuppressLint("MissingPermission")
 class BluetoothChannelListener(
@@ -69,6 +73,7 @@ class BluetoothChannelListener(
     private val manager: BluetoothManager? = appContext.getSystemService(BluetoothManager::class.java)
     private val channels = Channel<BluetoothDataChannel>(config.incomingQueue)
     private val mutableState = MutableStateFlow(ListenerState())
+    private val retryNow = MutableStateFlow(0L)
 
     /** Accepted channels, in arrival order. */
     val incoming: ReceiveChannel<BluetoothDataChannel> get() = channels
@@ -94,15 +99,22 @@ class BluetoothChannelListener(
     /** Starts [run] in [scope]. */
     fun launchIn(scope: CoroutineScope): Job = scope.launch { run() }
 
+    /**
+     * Retries at once every server that is not open (the GATT server, an L2CAP or RFCOMM listener), without touching
+     * those that are: call it when `BLUETOOTH_CONNECT` was granted, or anything else changed that may let them open.
+     */
+    fun refresh() {
+        retryNow.update { it + 1 }
+    }
+
     private suspend fun serve() {
         val manager = manager ?: return
         val gatt = GattServerHost(appContext, manager, config, io) { deliver(it) }
         try {
             coroutineScope {
-                val gattOpen = gatt.open()
-                mutableState.update {
-                    it.copy(gattServer = gattOpen, lastError = if (gattOpen) it.lastError else "GATT server did not open")
-                }
+                // The L2CAP PSM is published only through the GATT server, so a server that did not open is retried
+                // (right after Bluetooth turns on, or before BLUETOOTH_CONNECT is granted, it may not).
+                launch { openGattServer(gatt) }
                 launch {
                     acceptLoop(
                         transport = BluetoothTransport.L2CAP,
@@ -137,7 +149,31 @@ class BluetoothChannelListener(
             }
         } finally {
             gatt.close()
-            mutableState.update { it.copy(gattServer = false) }
+            mutableState.update { it.copy(gattServer = false, gattServerFailures = 0) }
+        }
+    }
+
+    /** Opens [gatt], retrying with back-off until it opens or serving ends. */
+    private suspend fun openGattServer(gatt: GattServerHost) {
+        retryWithBackoff(config.listenRetryMillis, config.listenMaxRetryMillis, retryNow) { attempt ->
+            val opened =
+                try {
+                    gatt.open()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: RuntimeException) {
+                    // A stack that throws while Bluetooth settles: retried like a refusal.
+                    gatt.close()
+                    false
+                }
+            mutableState.update {
+                if (opened) {
+                    it.copy(gattServer = true, gattServerFailures = 0)
+                } else {
+                    it.copy(gattServer = false, gattServerFailures = attempt, lastError = "GATT server did not open (attempt $attempt)")
+                }
+            }
+            opened
         }
     }
 
@@ -151,6 +187,7 @@ class BluetoothChannelListener(
         onClose: () -> Unit,
     ) {
         while (currentCoroutineContext().isActive) {
+            var seen = retryNow.value
             val server =
                 try {
                     open()
@@ -166,7 +203,8 @@ class BluetoothChannelListener(
                 val blocking = CancellableBlocking(io.asExecutor()) { runCatching { server.close() } }
                 try {
                     while (currentCoroutineContext().isActive) {
-                        val socket = blocking.call { server.accept() }
+                        // A connection accepted just as the loop is cancelled is closed, not left holding the link.
+                        val socket = blocking.call(discard = { runCatching { it.close() } }) { server.accept() }
                         val channel = SocketStreamChannel(BluetoothStreamSocket(socket), transport, io)
                         deliver(channel)
                     }
@@ -178,8 +216,9 @@ class BluetoothChannelListener(
                     onClose()
                     withContext(NonCancellable) { runCatching { server.close() } }
                 }
+                seen = retryNow.value
             }
-            delay(config.listenRetryMillis)
+            awaitRetry(config.listenRetryMillis, retryNow, seen)
         }
     }
 

@@ -23,9 +23,10 @@ import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * The GATT client side of the handshake channel (architecture §6.1 note): connects to a peer's LE address, finds the
- * drop service, negotiates the MTU, reads [ChannelInfo], and carries the client end of a [GattStreamChannel] (writes
- * without response to the client-to-server characteristic, notifications from the server-to-client one).
+ * The GATT client side of the handshake channel (architecture §6.1 note): connects to a peer's LE address, asks for a
+ * fast link, finds the drop service, reads [ChannelInfo], and for the GATT stream negotiates the MTU and carries the
+ * client end of a [GattStreamChannel] (writes without response to the client-to-server characteristic, notifications
+ * from the server-to-client one).
  *
  * Android allows one outstanding GATT operation per connection, so every operation waits for its callback under one
  * mutex; a start the stack refuses as busy is retried after a short pause, and a write-without-response the stack
@@ -39,6 +40,8 @@ internal class GattClientLink(
     private val device: BluetoothDevice,
     private val handler: Handler,
     private val config: BluetoothChannelConfig,
+    /** Told once when the link is released (disconnected or lost): [handler]'s thread is no longer needed for it. */
+    private val onReleased: (GattClientLink) -> Unit = {},
 ) : GattSegmentTransport {
     private enum class Op { DISCOVER, MTU, READ, WRITE_DESCRIPTOR, WRITE }
 
@@ -180,6 +183,7 @@ internal class GattClientLink(
                 // Releasing the client interface is best effort.
             }
             onLost?.invoke(error)
+            onReleased(this)
         }
     }
 
@@ -216,11 +220,11 @@ internal class GattClientLink(
     }
 
     /**
-     * Asks for the largest MTU and a fast connection interval (and 2M PHY when [le2m]); a refusal keeps the defaults,
-     * since the stream adapts to any MTU.
+     * Asks for a fast connection interval (and the 2M PHY when [le2m]). Neither is a GATT operation, so call it right
+     * after [connect]: service discovery and the channel-info read are round trips of the 400 ms handshake budget (F-B2)
+     * and then run at the fast interval. A refusal keeps the defaults.
      */
-    suspend fun tune(le2m: Boolean) {
-        runCatching { operation(Op.MTU) { if (it.requestMtu(DropBluetoothProfile.PREFERRED_ATT_MTU)) ISSUED else BUSY } }
+    fun speedUp(le2m: Boolean) {
         try {
             gatt?.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
             if (le2m) {
@@ -232,6 +236,18 @@ internal class GattClientLink(
             }
         } catch (e: SecurityException) {
             throw IOException("BLUETOOTH_CONNECT is not granted", e)
+        }
+    }
+
+    /**
+     * Asks for the largest ATT MTU, for the GATT stream only (an L2CAP channel does not use it). A refusal keeps the
+     * default, since the stream adapts to any MTU.
+     */
+    suspend fun requestLargestMtu() {
+        try {
+            operation(Op.MTU) { if (it.requestMtu(DropBluetoothProfile.PREFERRED_ATT_MTU)) ISSUED else BUSY }
+        } catch (e: IOException) {
+            // Refused or timed out: the default MTU carries the stream too, in smaller segments.
         }
     }
 
@@ -303,6 +319,7 @@ internal class GattClientLink(
         val error = IOException("GATT link closed")
         connected.completeExceptionally(error)
         pending?.result?.completeExceptionally(error)
+        onReleased(this)
     }
 
     /**
