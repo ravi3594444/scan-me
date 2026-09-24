@@ -68,6 +68,15 @@ internal class TransferServiceClient(
     /** An activity started: bind (creating the service when needed) and say the UI is in front. */
     fun onUiStarted() {
         uiVisible = true
+        // Started as well as bound: a rotation, a picker or a system screen unbinds for a moment, and a service that is
+        // only bound would be destroyed with its node each time; started, it keeps the node and lingers when idle.
+        try {
+            context.startService(TransferService.bindIntent(context))
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "cannot start the transfer service", e)
+        } catch (e: SecurityException) {
+            Log.w(TAG, "cannot start the transfer service", e)
+        }
         if (!bound) {
             bound =
                 try {

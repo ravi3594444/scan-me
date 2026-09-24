@@ -375,10 +375,14 @@ class AndroidNode(
         check(started.compareAndSet(false, true)) { "an AndroidNode starts once" }
         withContext(config.io) {
             dataRef = config.openDatabase()
-            identity = SoftwareIdentityKeyStore(config.secrets, crypto).loadOrCreate()
+            // One identity and one advertising secret per install, even if two nodes start at once (a service
+            // destroyed and recreated while the first start still runs): created under one process-wide lock.
+            synchronized(IDENTITY_LOCK) {
+                identity = SoftwareIdentityKeyStore(config.secrets, crypto).loadOrCreate()
+                advertising = AdvertisingSecretStore(config.secrets, crypto)
+                ownSecrets.value = listOf(advertising.current().bytes())
+            }
             selfId = DeviceIds.of(crypto, identity.publicKey)
-            advertising = AdvertisingSecretStore(config.secrets, crypto)
-            ownSecrets.value = listOf(advertising.current().bytes())
             ownGeneration = data.devices.ownAdvertisingGeneration()
             refreshTrust()
             settingsState.value = data.settings.snapshot()
@@ -1755,8 +1759,13 @@ class AndroidNode(
             payload,
             fallback = null,
             issuedAtMillis = nowMillis,
+            // The code names this epoch's beacon ID, which a scanner matches on its radar: the sheet re-signs it when
+            // the ID rotates (every 15 min, §5.3) as well as when the payload's five minutes run out.
             expiresAtMillis =
-                (nowSeconds + QrPayload.ONE_TIME_VALIDITY_SECONDS) * 1000,
+                minOf(
+                    (nowSeconds + QrPayload.ONE_TIME_VALIDITY_SECONDS) * 1000,
+                    nowMillis - nowMillis % EphemeralIds.EPOCH_MILLIS + EphemeralIds.EPOCH_MILLIS,
+                ),
         )
     }
 
@@ -2191,6 +2200,9 @@ class AndroidNode(
     }
 
     companion object {
+        /** Serialises the identity and advertising-secret creation of every node in the process. */
+        private val IDENTITY_LOCK = Any()
+
         /** The key prefix of a device reached only through a scanned code (F-B5). */
         const val CODE_KEY_PREFIX: String = "q:"
 

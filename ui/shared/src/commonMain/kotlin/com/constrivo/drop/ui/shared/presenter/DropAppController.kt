@@ -668,8 +668,18 @@ class DropAppController(
         override fun finish(nickname: String) {
             delegate.finish(nickname)
             screenState.value = Screen.RADAR
-            askNearby()
-            askBatteryOnce()
+            // One after another, each with its one-line reason (§11): Nearby for the radar; Android 12's location for
+            // Wi-Fi Direct, which a phone that only receives would otherwise never be asked for; notifications, so an
+            // offer that arrives while the app is in the background is seen; then the battery exemption.
+            nearbyAsked = true
+            notificationsAsked = true
+            batteryAsked = true
+            scope.launch {
+                permissions.ensure(DropPermission.NEARBY)
+                permissions.ensure(DropPermission.LOCATION_FOR_WIFI_DIRECT)
+                permissions.ensure(DropPermission.NOTIFICATIONS)
+                permissions.ensure(DropPermission.BATTERY)
+            }
         }
     }
 

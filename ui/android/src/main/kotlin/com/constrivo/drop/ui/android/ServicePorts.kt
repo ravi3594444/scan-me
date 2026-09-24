@@ -221,7 +221,13 @@ internal class ServicePorts(
      * @throws IllegalStateException while no node runs (the sheet shows its retry state).
      */
     override suspend fun current(): MyCode {
-        val code = checkNotNull(node) { "the transfer service is not running yet" }.oneTimeCode()
+        val n = checkNotNull(node) { "the transfer service is not running yet" }
+        // Showing the code is asking to be found: a Trusted-only phone is invisible to the stranger who scans it, so
+        // it becomes visible to everyone for ten minutes (the mode reverts by itself, F-A5).
+        if (n.visibility.value.mode == Visibility.TRUSTED_ONLY) {
+            withContext(io) { n.setVisibility(Visibility.EVERYONE_TEN_MINUTES) }
+        }
+        val code = n.oneTimeCode()
         return MyCode(
             code.payload,
             fallbackCode = code.fallback,

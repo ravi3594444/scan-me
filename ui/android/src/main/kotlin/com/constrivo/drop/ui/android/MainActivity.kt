@@ -69,7 +69,14 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            override fun pickImage() = imageLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+            override fun pickImage() {
+                try {
+                    imageLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                } catch (_: ActivityNotFoundException) {
+                    // Neither the photo picker nor a document provider: the avatar stays as it is.
+                    graph.onImagePicked(null)
+                }
+            }
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {

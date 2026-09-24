@@ -86,6 +86,11 @@ internal class ShellPreferences(
         get() = store.getString(KEY_NICKNAME)
         set(value) = store.putString(KEY_NICKNAME, value)
 
+    /** Onboarding finished and the first "Everyone for 10 min" has not reached the service's node yet. */
+    var firstVisibilityPending: Boolean
+        get() = store.getBoolean(KEY_FIRST_VISIBILITY)
+        set(value) = store.putBoolean(KEY_FIRST_VISIBILITY, value)
+
     /** Settings → Language as a BCP 47 tag, null for the system's (Android 12 keeps it here; 13+ in `LocaleManager`). */
     var languageTag: String?
         get() = store.getString(KEY_LANGUAGE)
@@ -102,6 +107,7 @@ internal class ShellPreferences(
         private const val KEY_ONBOARDED = "onboarded"
         private const val KEY_NICKNAME = "nickname"
         private const val KEY_LANGUAGE = "language"
+        private const val KEY_FIRST_VISIBILITY = "first_visibility_pending"
         private const val KEY_DENIED = "denied."
 
         /** The app-private store behind the shell's preferences (also used by [DirectShareIds]). */

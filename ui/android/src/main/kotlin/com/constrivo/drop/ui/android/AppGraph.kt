@@ -7,6 +7,7 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.util.Log
+import android.widget.Toast
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import com.constrivo.drop.R
@@ -19,6 +20,7 @@ import com.constrivo.drop.platform.android.service.CodeScan
 import com.constrivo.drop.ui.shared.model.AppLanguage
 import com.constrivo.drop.ui.shared.model.AttachedFiles
 import com.constrivo.drop.ui.shared.model.ClearPartialsResult
+import com.constrivo.drop.ui.shared.model.DashboardTab
 import com.constrivo.drop.ui.shared.model.FileThumb
 import com.constrivo.drop.ui.shared.model.ScanStatus
 import com.constrivo.drop.ui.shared.model.SelfProfile
@@ -43,11 +45,13 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.UUID
 
 /**
@@ -185,6 +189,9 @@ internal class AppGraph(
             onFinished = { nickname ->
                 prefs.nickname = nickname
                 ports.setNickname(nickname)
+                // A new phone starts visible to everyone for ten minutes, so the first person it meets can find it;
+                // the default Trusted only returns by itself afterwards (F-A5, plan decision 2).
+                prefs.firstVisibilityPending = true
                 (app as? DropApplication)?.markOnboarded()
                 controller.onboarding
                     ?.state
@@ -239,12 +246,22 @@ internal class AppGraph(
         scope.launch { controller.screen.collect { client.setRadarVisible(startedHosts > 0 && it == Screen.RADAR) } }
         // A permission answered, or changed in Settings: the service reopens what it can (§11).
         scope.launch { permissions.changes.collect { client.refreshPermissions() } }
+        // A node that cannot start (a database of a newer app, an identity that does not open) says so once.
+        scope.launch {
+            client.startFailure.filterNotNull().collect { reason ->
+                Toast.makeText(app, app.getString(R.string.error_service_start, reason), Toast.LENGTH_LONG).show()
+            }
+        }
         // A nickname chosen before the service ran (onboarding) reaches the node once it is up; each node also gets
         // the "Allow this computer?" prompt for its browser page (N15), answered on the main thread by the user.
         scope.launch {
             client.node.filterNotNull().collect { n ->
                 val chosen = prefs.nickname
                 if (!chosen.isNullOrBlank() && n.nickname.value != chosen) ports.setNickname(chosen)
+                if (prefs.firstVisibilityPending) {
+                    prefs.firstVisibilityPending = false
+                    ports.setVisibility(Visibility.EVERYONE_TEN_MINUTES)
+                }
                 n.browserApprover =
                     BrowserApprover { request ->
                         withContext(Dispatchers.Main) {
@@ -283,7 +300,8 @@ internal class AppGraph(
     /** The camera read [text] from a code (design §4.4): a verified device is selected, anything else says why not. */
     fun onScannedText(text: String) {
         scope.launch {
-            val n = client.node.value ?: return@launch
+            // A scan right after the app opened may come before the service's node is up: it waits for it briefly.
+            val n = client.node.value ?: withTimeoutOrNull(NODE_WAIT_MILLIS) { client.node.filterNotNull().first() } ?: return@launch
             when (val result = withContext(Dispatchers.Default) { n.resolveCode(text) }) {
                 is CodeScan.Verified -> controller.onCodeScanned(result.deviceKey)
                 CodeScan.Expired -> controller.onScanProblem(ScanStatus.EXPIRED)
@@ -326,8 +344,28 @@ internal class AppGraph(
             ) {
                 controller.onBubbleTap(key)
             }
+        } else if (NotificationIntents.isNotification(intent)) {
+            openFromNotification(intent)
         }
         return null
+    }
+
+    /**
+     * A notification's tap (design §5): an offer's card already shows above any screen; a finished receive opens its
+     * one file (never an installer, which the notification leaves to the in-app warning, F-D5) or else History.
+     */
+    private fun openFromNotification(intent: Intent) {
+        if (controller.screen.value == Screen.ONBOARDING) return
+        when (intent.action) {
+            NotificationIntents.ACTION_OPEN_RECEIVED -> {
+                val uri = intent.getStringExtra(NotificationIntents.EXTRA_URI) ?: return
+                openUri(uri, intent.getStringExtra(NotificationIntents.EXTRA_MIME))
+            }
+
+            NotificationIntents.ACTION_SHOW_TRANSFER -> {
+                controller.openDashboard(DashboardTab.HISTORY)
+            }
+        }
     }
 
     /** Whether share [id] is still waiting: its files attached, or still being read. */
@@ -445,6 +483,9 @@ internal class AppGraph(
 
         /** Largest preview side decoded (the sender makes them 4 KiB JPEGs, N12). */
         const val MAX_PREVIEW_SIDE = 512
+
+        /** How long a scanned code waits for the service's node to come up. */
+        const val NODE_WAIT_MILLIS = 5_000L
         const val TAG = "Drop"
     }
 }

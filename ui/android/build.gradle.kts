@@ -16,6 +16,17 @@ android {
         versionName = "0.1.0"
     }
 
+    signingConfigs {
+        getByName("debug") {
+            // One debug key for every machine and CI run (not a secret: debug builds only), so a newer debug APK
+            // installs over the one already on the phone instead of asking to uninstall it first.
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildFeatures {
         compose = true
     }
@@ -23,6 +34,13 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    packaging {
+        // The APK is passed phone to phone and downloaded as a file: dex and native libraries are stored compressed,
+        // which halves its size (the install extracts them once).
+        dex.useLegacyPackaging = true
+        jniLibs.useLegacyPackaging = true
     }
 
     testOptions {
