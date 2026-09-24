@@ -1,3 +1,35 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Permissions are declared with the features that need them (architecture §11, WP7). -->
-<manifest />
+<!--
+    Permissions and features of the Bluetooth discovery, handshake channel and capability detection (architecture §11,
+    WP7a/WP7b). They merge into the app manifest; ui/android declares the same runtime permissions for its just-in-time
+    requests, and later WP7 packages add the Wi-Fi Direct, hotspot and foreground-service ones with their code.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+        Scanning for drop beacons only. neverForLocation: the app never derives location from scan results, so no
+        location permission is needed on Android 12+. The system then filters out well-known location beacons
+        (iBeacon, Eddystone) from our results, which drop does not use.
+    -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <!-- The beacon (AdvertisingSet, legacy and extended). -->
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <!-- GATT client and server, LE L2CAP channels and RFCOMM sockets of the handshake and head-start channel. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- Capability detection: Wi-Fi bands and standards, the connected network and its link properties. -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- The app still installs without Bluetooth (QR code and LAN paths); capability detection reports what is there. -->
+    <uses-feature
+        android:name="android.hardware.bluetooth_le"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.bluetooth"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.wifi"
+        android:required="false" />
+</manifest>
