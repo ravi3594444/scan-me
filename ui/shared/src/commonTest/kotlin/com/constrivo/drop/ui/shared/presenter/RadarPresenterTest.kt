@@ -9,6 +9,7 @@ import com.constrivo.drop.ui.shared.VirtualClocks
 import com.constrivo.drop.ui.shared.fake.InMemoryDrop
 import com.constrivo.drop.ui.shared.model.AttachedFiles
 import com.constrivo.drop.ui.shared.model.BubbleActivity
+import com.constrivo.drop.ui.shared.model.Direction
 import com.constrivo.drop.ui.shared.model.FileKind
 import com.constrivo.drop.ui.shared.model.PickedItem
 import com.constrivo.drop.ui.shared.model.RadarNotice
@@ -123,6 +124,27 @@ class RadarPresenterTest {
             assertEquals(LadderHint.band24(), active.hint)
             assertEquals("tx", active.dropToken, "a new send plays the drop animation")
             assertEquals(DropMotion.MAX_FLYERS, active.flyers.size, "at most 8 thumbnails fly")
+            advanceTimeBy(RadarPresenter.DROP_TOKEN_WINDOW_MILLIS + 1)
+            runCurrent()
+            assertNull(assertIs<BubbleActivity.Active>(s.state.bubbles.single().activity).dropToken, "no replay after the window")
+        }
+
+    @Test
+    fun designSection42_aReceiveFliesIntoTheAvatarOnceItsBytesStartMoving() =
+        runTest {
+            val s = Setup(this)
+            s.fake.devices.value = listOf(Fixtures.device("t:rohan", "Rohan", Ring.INNER, trusted = true))
+            // The offer waits on the card for longer than the window: no flight yet, and none used up.
+            s.fake.transfers.value =
+                listOf(
+                    Fixtures.transfer("rx", "t:rohan", stage = TransferStage.AWAITING_ACCEPT, direction = Direction.RECEIVE, bytesDone = 0),
+                )
+            runCurrent()
+            assertNull(assertIs<BubbleActivity.Active>(s.state.bubbles.single().activity).dropToken, "nothing flies before Accept")
+            advanceTimeBy(RadarPresenter.DROP_TOKEN_WINDOW_MILLIS + 1)
+            s.fake.transfers.value = listOf(Fixtures.transfer("rx", "t:rohan", direction = Direction.RECEIVE, bytesDone = 1_000_000))
+            runCurrent()
+            assertEquals("rx", assertIs<BubbleActivity.Active>(s.state.bubbles.single().activity).dropToken, "the first bytes fly in")
             advanceTimeBy(RadarPresenter.DROP_TOKEN_WINDOW_MILLIS + 1)
             runCurrent()
             assertNull(assertIs<BubbleActivity.Active>(s.state.bubbles.single().activity).dropToken, "no replay after the window")

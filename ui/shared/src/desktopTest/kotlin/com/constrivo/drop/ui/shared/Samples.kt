@@ -156,6 +156,43 @@ object Samples {
             visibility = VisibilityUi(Visibility.EVERYONE_TEN_MINUTES, minutesLeft = 7),
         )
 
+    /** Rohan's files coming in: the stream flows into the avatar, which glows. */
+    val receivingRadar =
+        radar(
+            bubbles =
+                listOf(
+                    bubble(
+                        "t:rohan",
+                        "Rohan's Pixel",
+                        Ring.INNER,
+                        trusted = true,
+                        activity = sending(hint = null).copy(direction = Direction.RECEIVE),
+                    ),
+                    bubble("e:0a1b2c3d4e5f", "Meera", Ring.OUTER),
+                ),
+        )
+
+    /** An offer on Meera's screen, not answered yet: the ring circles. */
+    val waitingRadar =
+        radar(
+            bubbles =
+                listOf(
+                    bubble("t:rohan", "Rohan's Pixel", Ring.OUTER, trusted = true),
+                    bubble(
+                        "e:0a1b2c3d4e5f",
+                        "Meera",
+                        Ring.MIDDLE,
+                        activity =
+                            sending(fraction = 0f, hint = null).copy(
+                                stage = TransferStage.AWAITING_ACCEPT,
+                                bytesPerSecond = null,
+                                etaMillis = null,
+                                badge = null,
+                            ),
+                    ),
+                ),
+        )
+
     val bluetoothOff = radar(notice = RadarNotice.BLUETOOTH_OFF)
 
     val shareBanner =

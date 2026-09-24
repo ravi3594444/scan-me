@@ -98,6 +98,8 @@ Footer: "Send 12 items · 48 MB" primary button; disabled at zero selection. Sel
 
 ### 4.2 Sending state (on radar)
 
+> Changed: the transfer states gained AirDrop-like motion (all of it off, or still, under reduced motion). While bytes move, a faint dashed arc joins the avatar and the busy bubble and glowing dots flow along it (out of the avatar for a send, into it for a receive) and a soft glow breathes behind the bubble (and behind your avatar while receiving). While the other side is awaited (connecting, "Waiting for them to accept", reconnecting) a bright head circles the bubble's ring. The flyers travel on upward arcs that fan out, with a small spin that straightens as they land, and a splash ring marks the landing; a receive plays the same flight from the sender's bubble into your avatar when its first bytes arrive. Completion adds a success ring and ten sparks behind the pop. The incoming card's sender avatar ripples while it waits for an answer (§5.1).
+
 - Selected bubble at 1.3× with a 4 dp progress ring (accent) that fills clockwise from 12 o'clock.
 - Under the bubble: `44 MB/s · 45 s left`, then a transport badge chip: `Wi‑Fi Direct · 5 GHz`.
 - Below the badge, an optional hint line (warning colour) when speed is limited (see §8).

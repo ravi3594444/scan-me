@@ -55,8 +55,11 @@ import com.constrivo.drop.core.discovery.Ring
 import com.constrivo.drop.ui.shared.TestTags
 import com.constrivo.drop.ui.shared.components.Avatar
 import com.constrivo.drop.ui.shared.components.BadgeChip
+import com.constrivo.drop.ui.shared.components.CompletionBurst
+import com.constrivo.drop.ui.shared.components.Halo
 import com.constrivo.drop.ui.shared.components.MoreTile
 import com.constrivo.drop.ui.shared.components.ProgressRing
+import com.constrivo.drop.ui.shared.components.SweepRing
 import com.constrivo.drop.ui.shared.components.ThumbTile
 import com.constrivo.drop.ui.shared.components.platformIcon
 import com.constrivo.drop.ui.shared.icons.DropIcons
@@ -127,6 +130,7 @@ internal fun RadarField(
 
     Box(Modifier.fillMaxSize(), contentAlignment = AbsoluteAlignment.TopLeft) {
         Rings(frame, dimmed = state.ringsDimmed)
+        TransferStreams(state.bubbles, frame)
         for (key in order) {
             val bubble = current[key] ?: lastBubbles[key] ?: continue
             val present = key in current
@@ -236,6 +240,13 @@ private fun SelfAvatar(
     center: DpPoint,
 ) {
     val description = stringResource(Res.string.a11y_self, state.self.nickname)
+    // Files coming in: the avatar glows while any receive moves bytes (design §5.2).
+    val receiving =
+        state.bubbles.any { b ->
+            val a = b.activity as? BubbleActivity.Active
+            a != null && a.direction == Direction.RECEIVE && a.stage == TransferStage.TRANSFERRING && !a.paused
+        }
+    if (receiving) Halo(DropDimens.avatar, LocalDropColors.current.accent, Modifier.centeredAt(center, DropDimens.avatar))
     Avatar(
         initials = state.selfInitials,
         hash = state.selfAvatarHash,
@@ -297,9 +308,17 @@ private fun BubbleNode(
             tween(DropMotion.SELECT_MILLIS, easing = DropMotion.Overshoot),
         )
     val pop = remember { Animatable(1f) }
+    val burst = remember { Animatable(0f) }
+    val reduced = LocalReducedMotion.current
     if (activity is BubbleActivity.Completed) {
         LaunchedEffect(activity.token) {
             haptics.confirm()
+            if (!reduced) {
+                launch {
+                    burst.snapTo(0f)
+                    burst.animateTo(1f, tween(DropMotion.BURST_MILLIS, easing = DropMotion.Decelerate))
+                }
+            }
             pop.snapTo(DropMotion.COMPLETION_POP_SCALE)
             pop.animateTo(1f, tween(DropMotion.COMPLETION_POP_MILLIS, easing = DropMotion.Decelerate))
         }
@@ -339,6 +358,9 @@ private fun BubbleNode(
                             },
                     contentAlignment = Alignment.Center,
                 ) {
+                    // Behind the bubble: the glow while files move, the burst when they arrived (design §4.2).
+                    if (activity is BubbleActivity.Active && !activity.paused) Halo(size, colors.accent)
+                    if (completed && !reduced) CompletionBurst({ burst.value }, size, colors.success)
                     Box(
                         modifier =
                             Modifier
@@ -485,7 +507,15 @@ private fun BubbleRing(
             modifier = Modifier.size(size + 10.dp),
         )
     }
+    // Before any byte moves the other side is awaited ("Waiting for Dev…"): a head circles the ring, as on AirDrop.
+    if (activity is BubbleActivity.Active && activity.stage in WAITING_STAGES && !activity.paused) {
+        SweepRing(colors.accent, Modifier.size(size + 10.dp))
+    }
 }
+
+/** The stages in which the ring circles instead of filling. */
+private val WAITING_STAGES =
+    setOf(TransferStage.CONNECTING, TransferStage.AWAITING_ACCEPT, TransferStage.RECONNECTING, TransferStage.WAITING_FOR_PEER)
 
 /** The × at the bubble's bottom-right (design §4.2): a 48 dp target around a small visual. */
 @Composable
@@ -603,8 +633,10 @@ private fun OverflowBubble(
 }
 
 /**
- * The drop animation (design §4.2): up to 8 thumbnails fly from the avatar to the bubble, 60 ms apart, 400 ms each on
- * cubic-bezier(0.2, 0.8, 0.2, 1), shrinking to 0.3; more than 8 items end with a "+N" tile. Skipped under reduced motion.
+ * The drop animation (design §4.2): up to 8 thumbnails fly, 60 ms apart, 400 ms each on cubic-bezier(0.2, 0.8, 0.2,
+ * 1), shrinking to 0.3; more than 8 items end with a "+N" tile. A send flies from the avatar to the bubble, a receive
+ * from the sender's bubble into the avatar once its bytes start moving. Each tile takes its own arc and spin (the tiles
+ * fan out like thrown cards) and a splash ring marks where they land. Skipped under reduced motion.
  */
 @Composable
 private fun DropFlights(
@@ -616,10 +648,18 @@ private fun DropFlights(
     for (bubble in bubbles) {
         val active = bubble.activity as? BubbleActivity.Active ?: continue
         val token = active.dropToken ?: continue
-        val target = frame.bubbles[bubble.key] ?: continue
+        val at = frame.bubbles[bubble.key] ?: continue
         if (token in played) continue
+        val receiving = active.direction == Direction.RECEIVE
+        val bubbleSize = (if (bubble.trusted) DropDimens.bubbleTrusted else DropDimens.bubble) * DropMotion.SELECTED_SCALE
         androidx.compose.runtime.key(token) {
-            Flight(active.flyers, active.fileCount, frame.avatarCenter, target) { played += token }
+            Flight(
+                thumbs = active.flyers,
+                fileCount = active.fileCount,
+                from = if (receiving) at else frame.avatarCenter,
+                to = if (receiving) frame.avatarCenter else at,
+                landing = if (receiving) DropDimens.avatar else bubbleSize,
+            ) { played += token }
         }
     }
 }
@@ -630,10 +670,14 @@ private fun Flight(
     fileCount: Int,
     from: DpPoint,
     to: DpPoint,
+    landing: Dp,
     onDone: () -> Unit,
 ) {
+    val colors = LocalDropColors.current
     val plan = remember(thumbs, fileCount) { FlightPlan.of(thumbs, fileCount) }
+    val paths = remember(plan, from, to) { List(plan.tiles.size) { i -> FlightPath(from, to, DropMotion.FLIGHT_BOW * FAN[i % FAN.size]) } }
     val progress = remember(plan) { List(plan.tiles.size) { Animatable(0f) } }
+    val splash = remember(plan) { Animatable(0f) }
     LaunchedEffect(plan) {
         coroutineScope {
             progress.forEachIndexed { i, anim ->
@@ -644,27 +688,45 @@ private fun Flight(
                     )
                 }
             }
+            // The splash starts as the first tile lands and lasts until the last one is in.
+            launch {
+                val landingSpan = (plan.tiles.size - 1) * DropMotion.FLYER_STAGGER_MILLIS
+                splash.animateTo(
+                    1f,
+                    tween(DropMotion.SPLASH_MILLIS + landingSpan, delayMillis = DropMotion.FLYER_MILLIS, easing = DropMotion.Decelerate),
+                )
+            }
         }
         onDone()
+    }
+    Canvas(Modifier.centeredAt(to, landing).size(landing)) {
+        val p = splash.value
+        if (p <= 0f || p >= 1f) return@Canvas
+        drawCircle(
+            colors.accent.copy(alpha = SPLASH_ALPHA * (1f - p)),
+            radius = size.minDimension / 2 * (SPLASH_START + SPLASH_GROWTH * p),
+            style = Stroke(SPLASH_WIDTH.toPx() * (1f - p) + 0.5f),
+        )
     }
     // Each tile's progress is read only in the layout (offset) and layer lambdas: the flight moves eight tiles every
     // frame without recomposing them.
     val half = DropDimens.flyer / 2
     plan.tiles.forEachIndexed { i, tile ->
         val anim = progress[i]
+        val path = paths[i]
+        val spin = SPIN_DEGREES[i % SPIN_DEGREES.size]
         Box(
             Modifier
                 .absoluteOffset {
-                    val p = anim.value
-                    val cx = from.x + (to.x - from.x) * p
-                    val cy = from.y + (to.y - from.y) * p
-                    IntOffset((cx.toFloat().dp - half).roundToPx(), (cy.toFloat().dp - half).roundToPx())
+                    val point = path.at(anim.value.toDouble())
+                    IntOffset((point.x.toFloat().dp - half).roundToPx(), (point.y.toFloat().dp - half).roundToPx())
                 }.wrapContentSize()
                 .graphicsLayer {
                     val p = anim.value
                     val s = 1f - (1f - DropMotion.FLYER_END_SCALE) * p
                     scaleX = s
                     scaleY = s
+                    rotationZ = spin * (1f - p)
                     alpha =
                         when {
                             p <= 0f || p >= 1f -> 0f
@@ -680,6 +742,17 @@ private fun Flight(
         }
     }
 }
+
+/** Each tile's share of [DropMotion.FLIGHT_BOW], so the tiles fan out rather than follow one another. */
+private val FAN = doubleArrayOf(1.0, 0.55, 1.45, 0.8, 1.25, 0.65, 1.35, 0.9)
+
+/** Each tile's spin at take-off, in degrees; it straightens out as it lands. */
+private val SPIN_DEGREES = floatArrayOf(-14f, 10f, -6f, 16f, -10f, 6f, -16f, 12f)
+
+private const val SPLASH_ALPHA = 0.55f
+private const val SPLASH_START = 0.9f
+private const val SPLASH_GROWTH = 0.8f
+private val SPLASH_WIDTH = 3.dp
 
 /** Which tiles fly (design §4.2): up to 8; with more than 8 items, 7 thumbnails and a "+N" tile for the rest. */
 internal data class FlightPlan(

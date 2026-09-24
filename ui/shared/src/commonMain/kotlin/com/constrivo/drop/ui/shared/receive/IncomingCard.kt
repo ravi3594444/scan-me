@@ -55,6 +55,7 @@ import com.constrivo.drop.ui.shared.components.Avatar
 import com.constrivo.drop.ui.shared.components.MoreTile
 import com.constrivo.drop.ui.shared.components.PrimaryButton
 import com.constrivo.drop.ui.shared.components.QuietButton
+import com.constrivo.drop.ui.shared.components.Ripples
 import com.constrivo.drop.ui.shared.components.SheetSurface
 import com.constrivo.drop.ui.shared.components.ThumbTile
 import com.constrivo.drop.ui.shared.components.rememberTapGuard
@@ -104,14 +105,23 @@ fun IncomingCard(
             Modifier.fillMaxWidth().weight(1f, fill = false).verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Avatar(
-                    state.senderInitials,
-                    state.senderAvatarHash,
-                    DropDimens.avatarSmall,
-                    image = state.senderAvatar,
-                    platform = state.senderPlatform,
-                )
+            // Room above the header for the avatar's ripples, which the scrolling column would otherwise cut off.
+            Row(
+                Modifier.padding(top = RIPPLE_REACH),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                // The sender's avatar ripples while the card waits for an answer, like an AirDrop request.
+                Box(contentAlignment = Alignment.Center) {
+                    Ripples(DropDimens.avatarSmall, reach = RIPPLE_REACH, color = colors.accent)
+                    Avatar(
+                        state.senderInitials,
+                        state.senderAvatarHash,
+                        DropDimens.avatarSmall,
+                        image = state.senderAvatar,
+                        platform = state.senderPlatform,
+                    )
+                }
                 Column(Modifier.weight(1f)) {
                     Text(
                         boldName(stringResource(Res.string.incoming_title, state.senderName), state.senderName),
@@ -336,3 +346,6 @@ fun SenderPairingSheet(
         }
     }
 }
+
+/** How far the sender avatar's ripples reach past it. */
+private val RIPPLE_REACH = 8.dp

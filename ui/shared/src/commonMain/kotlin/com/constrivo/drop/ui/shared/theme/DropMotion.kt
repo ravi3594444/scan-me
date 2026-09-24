@@ -58,6 +58,28 @@ object DropMotion {
     const val TRAY_DAMPING: Float = 0.7f
     const val TRAY_STIFFNESS: Float = 360f
 
+    /** One dot's trip along the arc between the avatar and a busy bubble, [STREAM_DOTS] dots at a time (design §4.2). */
+    const val STREAM_MILLIS: Int = 1_400
+    const val STREAM_DOTS: Int = 6
+
+    /** How far the flyers' and the stream's arcs bow upward, as a share of the straight distance. */
+    const val FLIGHT_BOW: Double = 0.22
+
+    /** The glow behind a busy bubble breathes over this long, between these multiples of the bubble's radius. */
+    const val HALO_MILLIS: Int = 1_600
+    const val HALO_SCALE_MIN: Float = 1.25f
+    const val HALO_SCALE_MAX: Float = 1.55f
+
+    /** One turn of the waiting ring ("Waiting for Dev…", connecting, reconnecting). */
+    const val SWEEP_MILLIS: Int = 1_100
+
+    /** The success burst behind the completion tick, and the splash where the drop flyers land. */
+    const val BURST_MILLIS: Int = 700
+    const val SPLASH_MILLIS: Int = 500
+
+    /** The ripples around the sender's avatar on the incoming card (design §5.1). */
+    const val RIPPLE_MILLIS: Int = 1_800
+
     /** Incoming card countdown (design §5.1, architecture §7.8). */
     const val INCOMING_TIMEOUT_MILLIS: Long = 30_000
 

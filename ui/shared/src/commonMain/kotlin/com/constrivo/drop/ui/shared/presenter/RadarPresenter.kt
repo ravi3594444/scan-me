@@ -88,7 +88,8 @@ enum class BubbleTapResult {
  * - A transfer shows on its peer's bubble while it runs; when it ends the bubble shows the completion tick for
  *   [DropMotion.COMPLETION_HOLD_MILLIS] (1.5 s, design §4.2) or the end caption ("Declined", "No answer") for
  *   [ENDED_HOLD_MILLIS], then returns to idle. Only transfers seen running get either, so an old result never pops.
- * - A send gets a drop-animation token for its first [DROP_TOKEN_WINDOW_MILLIS], so reopening the radar mid-transfer
+ * - A send gets a drop-animation token for its first [DROP_TOKEN_WINDOW_MILLIS], and a receive for as long once its
+ *   bytes start moving (the files fly from the sender's bubble into the avatar), so reopening the radar mid-transfer
  *   does not replay the flight.
  * - The × asks for confirmation only past [CANCEL_CONFIRM_BYTES] (100 MB, design §4.2).
  * - The notice is the most important of design §8.1: missing permission, Bluetooth off, Wi‑Fi off, hidden, no one.
@@ -146,6 +147,9 @@ class RadarPresenter(
     private val seenRunning = HashSet<String>()
     private val endedAt = HashMap<String, Long>()
     private val firstSeen = HashMap<String, Long>()
+
+    /** When each receive first reported [TransferStage.TRANSFERRING] (its drop animation starts then). */
+    private val transferringSince = HashMap<String, Long>()
     private var latestTransfers: List<TransferSnapshot> = emptyList()
     private var latestBubbles: List<BubbleUi> = emptyList()
 
@@ -431,6 +435,9 @@ class RadarPresenter(
         for (t in transfers) {
             ids += t.id
             if (firstSeen.putIfAbsentCompat(t.id, now)) scheduleTick(DROP_TOKEN_WINDOW_MILLIS)
+            if (t.stage == TransferStage.TRANSFERRING && transferringSince.putIfAbsentCompat(t.id, now)) {
+                scheduleTick(DROP_TOKEN_WINDOW_MILLIS)
+            }
             if (!t.stage.isFinal) {
                 seenRunning += t.id
                 endedAt.remove(t.id)
@@ -443,6 +450,7 @@ class RadarPresenter(
         seenRunning.retainAll(ids)
         endedAt.keys.retainAll(ids)
         firstSeen.keys.retainAll(ids)
+        transferringSince.keys.retainAll(ids)
     }
 
     private fun scheduleTick(afterMillis: Long) {
@@ -476,8 +484,11 @@ class RadarPresenter(
         now: Long,
     ): BubbleActivity.Active {
         val fraction = t.fraction
-        val fresh = now - (firstSeen[t.id] ?: now) < DROP_TOKEN_WINDOW_MILLIS
-        val flying = t.direction == Direction.SEND && fresh
+        val flying =
+            when (t.direction) {
+                Direction.SEND -> now - (firstSeen[t.id] ?: now) < DROP_TOKEN_WINDOW_MILLIS
+                Direction.RECEIVE -> transferringSince[t.id]?.let { now - it < DROP_TOKEN_WINDOW_MILLIS } == true
+            }
         return BubbleActivity.Active(
             transferId = t.id,
             direction = t.direction,
@@ -549,7 +560,7 @@ class RadarPresenter(
         /** How long "Declined", "No answer" or a failure stays on the bubble. */
         const val ENDED_HOLD_MILLIS: Long = 3_000
 
-        /** A send plays its drop animation only within this long of first being seen. */
+        /** A send plays its drop animation only within this long of first being seen, a receive of its first bytes. */
         const val DROP_TOKEN_WINDOW_MILLIS: Long = 2_000
 
         const val MAX_TRAY_ITEMS: Int = 50

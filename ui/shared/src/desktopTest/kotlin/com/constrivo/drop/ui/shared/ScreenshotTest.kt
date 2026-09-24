@@ -85,6 +85,12 @@ class ScreenshotTest {
     fun radarSendingDark() = Screenshots.check("radar_sending_dark", dark = true) { Radar(Samples.sendingRadar) }
 
     @Test
+    fun radarReceiving() = Screenshots.check("radar_receiving") { Radar(Samples.receivingRadar) }
+
+    @Test
+    fun radarWaitingForAnAnswer() = Screenshots.check("radar_waiting") { Radar(Samples.waitingRadar) }
+
+    @Test
     fun radarBluetoothOff() = Screenshots.check("radar_bluetooth_off") { Radar(Samples.bluetoothOff) }
 
     @Test

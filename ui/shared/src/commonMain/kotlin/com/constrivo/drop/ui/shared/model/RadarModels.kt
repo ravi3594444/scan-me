@@ -110,7 +110,8 @@ sealed interface BubbleActivity {
     /**
      * Sending or receiving: the 4 dp ring, "44 MB/s · 45 s left", the badge and the hint.
      *
-     * @property dropToken non-null for a send that just started; the drop animation plays once per token.
+     * @property dropToken non-null for a send that just started or a receive whose bytes just started moving; the drop
+     *   animation plays once per token, from the sending side to the receiving one.
      * @property announcedPercent the last 25% step reached, for the accessibility live region (design §11).
      * @property confirmCancel the × asks for confirmation because more than 100 MB have moved (design §4.2).
      */
