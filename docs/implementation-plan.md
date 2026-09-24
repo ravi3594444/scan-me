@@ -265,6 +265,8 @@ Calendar if sessions run back to back with same‑day review: the device‑free 
 | WP9 Browser receive | Done | Single-file page under 30 KB, Ktor server with token path and per-browser "Allow this computer?" approval (N15), streamed STORED zip with ZIP64, Range, uploads, idle shutdown, a small mDNS responder for `drop.local`, Playwright end-to-end script. 156 tests |
 | WP4 Transfer engine core | Done | Secure sessions (handshake, Finished, StreamOpen), Bluetooth head start in 16 KiB blocks and the hop, work-stealing Wi‑Fi streams (4/8/2), batched acks, heartbeats, Resume and reconnects with a fresh handshake (N3), N5 durability order, file-name sanitising, `DirectoryFileStore`, TCP channels, and `LadderTransferBridge` wiring the ladder to the engine. Measured on loopback: about 104 MB/s, about 74 MB extra heap for a 256 MiB transfer. 99 + 3 tests |
 | WP8 Shared UI and Android shell | Done | Radar, send and receive flows, drop animation, tray, dashboard tabs, onboarding, `en` + `hi` strings (Hindi needs native review), accessibility, presenters, screenshot tests; Android share sheet, direct-share shortcuts, just-in-time permissions. 157 + 20 tests. Not built yet: CameraX/ZXing scanning and progress notifications (need WP7's service) |
+| WP10a Desktop shell and LAN path | Done | New `platform/desktop-common` (JmDNS discovery, LAN rung, per-OS folders, file secret storage with an OS-wrap seam, desktop database, the engine's `ResumeStore` adapter and 24 h sweep, `DesktopNode` composition root); `ui/desktop` window, drop zone, tray, notifications, shortcuts, single instance. Two desktops pair with the SAS and send a folder of 1,000 files end to end over loopback. 136 tests |
+| WP7a+b Android Bluetooth, identity, crypto | Done | Advertising sets restarted per epoch (N4), filtered scanning with throttling, capability detection, LE L2CAP channel as the phone-to-phone default with a GATT stream fallback and RFCOMM toward desktops (S10), Keystore-wrapped secret storage (N11) and a crypto provider with BouncyCastle fallbacks. 185 tests; nothing run on a device yet |
 
 ### Carried forward from WP1–WP3
 
@@ -293,3 +295,12 @@ Calendar if sessions run back to back with same‑day review: the device‑free 
 - **Crypto follow-up:** reconnect handshakes with a pinned identity are charged against the pairing-attempt limiter; decide whether a pinned expected identity may skip it.
 - **Engine follow-ups:** control shares the first Wi‑Fi stream with chunks, so a control message can wait behind one 4 MiB write; a bundle of more than about 1,360 tiny files delays first progress to the second Bluetooth block.
 - **Design sign-off:** the AA-contrast colour variants (primary button `#285EE8`), new copy keys, and the 150–200% font layouts.
+
+### Carried forward from WP10a and WP7a+b
+
+- **WP7e** owns the radios built in WP7a+b (beacon radio, capability detector, channel listener and connector, discovery controller), feeds them visibility, nickname and trust, uses `SystemClock.elapsedRealtime` as the discovery clock, supplies the SQLCipher driver keyed from `AndroidSecrets`, and schedules an alarm-backed epoch restart if coroutine timers prove late in deep sleep.
+- **Release build:** enable R8 in `ui/android` before any release; the unminified release APK is 33 MB against the 25 MB budget (BouncyCastle alone is 5.5 MB of dex before shrinking).
+- **Desktops (WP10b–d)** implement the phone's GATT profile and stream protocol; `GattSegments` and `GattStreamChannel` have no Android imports and could move to core/protocol for reuse. Desktops still announce `DESKTOP_WITHOUT_BLUETOOTH` until their radios land.
+- **Engine hooks wanted:** a transfer-id route after the handshake so the desktop receiver can serve engine-level reconnects (N3) safely; a way to keep a transfer's per-drop subfolder across a receiver restart; interface-change watching on desktops.
+- **ui/shared:** `BrowserShareHint` needs a LAN variant without SSID and password; exposing the radar's bubble layout would let the desktop drop targets stop repeating layout constants.
+- **Lab items** from WP7a+b: GATT status 133 retries, connecting to a scanned random address, L2CAP/GATT/RFCOMM throughput, the 400 ms handshake budget, address rotation per advertising-set restart, StrongBox AES support, Conscrypt X25519/Ed25519 per device.
