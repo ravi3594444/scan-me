@@ -14,10 +14,11 @@ import com.constrivo.drop.ui.shared.presenter.Screen
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.runInterruptible
 import java.io.IOException
 import java.io.UncheckedIOException
 import java.nio.file.Path
@@ -39,7 +40,8 @@ data class SendToUi(
  * sent with a bubble tap ([DropAppController.onBubbleTap]) — so a drop behaves exactly like tapping a bubble with
  * shared files, including the pairing code of a first send.
  *
- * Folders are expanded on [io] (F‑C6: a dropped folder of 1,000 files is walked off the UI thread).
+ * Folders are expanded on [io] (F‑C6: a dropped folder of 1,000 files is walked off the UI thread), interruptibly, so a
+ * new drop or Esc stops the walk of a folder dropped by mistake.
  */
 @Stable
 class ShellState(
@@ -106,7 +108,8 @@ class ShellState(
         paths: List<Path>,
         bubbleKey: String?,
     ): Boolean {
-        val decision = DropTargets.decide(controller.screen.value, paths.isNotEmpty(), bubble(bubbleKey))
+        val pickerOpen = controller.radarSheet.value == RadarSheet.PICKER
+        val decision = DropTargets.decide(controller.screen.value, paths.isNotEmpty(), bubble(bubbleKey), pickerOpen)
         onDragEnded()
         if (decision == DropDecision.Ignore) return false
         prepare(paths, decision)
@@ -125,12 +128,18 @@ class ShellState(
     ) {
         preparation?.cancel()
         preparing = true
-        preparation =
-            scope.launch {
+        val job =
+            scope.launch(start = CoroutineStart.LAZY) {
                 try {
-                    val expanded = withContext(io) { expand(paths) }
+                    // Interruptible: Esc or a new drop stops the walk of a folder dropped by mistake (a home folder).
+                    val expanded = runInterruptible(io) { expand(paths) }
                     if (expanded.files.isEmpty()) return@launch
-                    val files = AttachedFiles(PortMappers.pickedItems(expanded.files))
+                    val items = PortMappers.pickedItems(expanded.files)
+                    if (decision == DropDecision.AddToPicker) {
+                        controller.onFilesPicked(items)
+                        return@launch
+                    }
+                    val files = AttachedFiles(items)
                     controller.onShareIntent(files)
                     if (decision is DropDecision.SendTo) {
                         sendTo = null
@@ -147,9 +156,22 @@ class ShellState(
                 } catch (e: SecurityException) {
                     onProblem("the dropped files could not be read", e)
                 } finally {
-                    preparing = false
+                    // A newer drop may have replaced this one; only the current one ends "preparing".
+                    if (preparation === coroutineContext[Job]) {
+                        preparation = null
+                        preparing = false
+                    }
                 }
             }
+        preparation = job
+        job.start()
+    }
+
+    /** Stops walking the folders of a drop or a pick (Esc): nothing is attached. */
+    fun cancelPreparation() {
+        preparation?.cancel()
+        preparation = null
+        preparing = false
     }
 
     /** "Send to…" → a device: the attached files go to it, as a tap on its bubble would send them. */
@@ -201,7 +223,8 @@ class ShellState(
         )
 
     /**
-     * Runs [action] (design §9): Esc closes "Send to…", else whatever Back closes, else lets go of the attached files;
+     * Runs [action] (design §9): Esc stops walking dropped folders, else closes "Send to…", else whatever Back closes, else
+     * lets go of the attached files;
      * Enter sends to the highlighted device or the picker's selection. [pickFiles] opens the file dialog.
      */
     fun perform(
@@ -215,6 +238,7 @@ class ShellState(
 
             ShortcutAction.CANCEL -> {
                 when {
+                    preparing -> cancelPreparation()
                     sendTo != null -> cancelSendTo()
                     controller.back() -> Unit
                     else -> controller.radar.clearAttachment()

@@ -13,7 +13,6 @@ import com.constrivo.drop.core.protocol.InMemoryDataChannel
 import com.constrivo.drop.core.protocol.LinkKind
 import com.constrivo.drop.core.protocol.ProtocolException
 import com.constrivo.drop.core.protocol.TransferPhase
-import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import java.io.EOFException
@@ -21,9 +20,8 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
-import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
-import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 class InboundRouterTest {
@@ -106,31 +104,24 @@ class InboundRouterTest {
         }
 
     @Test
-    fun `reconnects go to the oldest receiver waiting for that identity, others are not taken`() =
-        runBlocking<Unit> {
-            withTimeout(5_000) {
-                val waiters = ReconnectWaiters()
-                val alice = identity().publicKey
-                val (c1, _) = InMemoryDataChannel.pair(LinkKind.LAN)
-                assertFalse(waiters.offer(alice, c1), "nobody waits")
-                assertFalse(waiters.offer(null, c1))
-                val first = async { waiters.sourceFor(alice).next() }
-                val second = async { waiters.sourceFor(alice).next() }
-                while (waiters.size < 2) kotlinx.coroutines.yield()
-                assertFalse(waiters.offer(identity().publicKey, c1), "another identity")
-                assertTrue(waiters.offer(alice, c1))
-                assertSame(c1, first.await())
-                val (c2, _) = InMemoryDataChannel.pair(LinkKind.LAN)
-                assertTrue(waiters.offer(alice, c2))
-                assertSame(c2, second.await())
-                assertEquals(0, waiters.size)
-                val cancelled = async { waiters.sourceFor(alice).next() }
-                while (waiters.size < 1) kotlinx.coroutines.yield()
-                cancelled.cancel()
-                cancelled.join()
-                assertEquals(0, waiters.size, "a cancelled wait leaves no slot behind")
-            }
-        }
+    fun `the gate admits a bounded number of unauthenticated connections, per host and in total`() {
+        val gate = InboundGate(maxTotal = 3, maxPerHost = 2)
+        val a1 = assertNotNull(gate.tryEnter("10.0.0.1"))
+        val a2 = assertNotNull(gate.tryEnter("10.0.0.1"))
+        assertNull(gate.tryEnter("10.0.0.1"), "a third connection from one host waits for a free place")
+        val b1 = assertNotNull(gate.tryEnter("10.0.0.2"))
+        assertNull(gate.tryEnter("10.0.0.3"), "the gate is full")
+        assertEquals(3, gate.size)
+        a1.close()
+        a1.close() // a place is given back once
+        assertEquals(2, gate.size)
+        val a3 = assertNotNull(gate.tryEnter("10.0.0.1"))
+        assertNull(gate.tryEnter(null), "unknown hosts share the limits too")
+        for (t in listOf(a2, a3, b1)) t.close()
+        assertEquals(0, gate.size)
+        assertNotNull(gate.tryEnter(null)).close()
+        assertFailsWith<IllegalArgumentException> { InboundGate(0, 1) }
+    }
 
     @Test
     fun `engine phases map to the stages the UI names`() {

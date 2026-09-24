@@ -26,6 +26,7 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -98,14 +99,35 @@ class DataResumeStoreTest {
         }
 
     @Test
-    fun `creating again replaces the manifests and keeps the listed files`() =
+    fun `creating again replaces the manifests and starts the listed files over`() =
         runBlocking<Unit> {
             receiveRow()
             store.create(id, summary, files, 1_000, peer)
             store.putManifests(listOf(UnitManifest.empty(id, 2, 3, 2_000)))
+            val sha = Sha256Digest(ByteArray(32) { 3 })
+            store.putFileState(id, 0, FileResumeState(FileResumeStatus.DONE, sha, "file:///r/a.jpg"), 3_000)
+            store.putFileState(id, 1, FileResumeState(FileResumeStatus.FAILED), 3_000)
             store.create(id, summary, files, 4_000, peer)
-            assertTrue(assertNotNull(store.load(id)).manifests.isEmpty())
+            val record = assertNotNull(store.load(id))
+            assertTrue(record.manifests.isEmpty())
             assertEquals(3, data.transferFiles.files(id).size)
+            // A done file of the previous attempt is not done in the new one (its layout may differ).
+            assertNotEquals(FileResumeStatus.DONE, record.fileStates[0]?.status)
+            assertNotEquals(FileResumeStatus.FAILED, record.fileStates[1]?.status)
+            assertNull(data.transferFiles.file(id, 0)?.savedUri, "the old saved URI goes with the old attempt")
+            assertTrue(errors.isEmpty(), errors.toString())
+        }
+
+    @Test
+    fun `N3 a record is only made for the peer that started the transfer`() =
+        runBlocking<Unit> {
+            receiveRow()
+            val stranger = crypto.generateEd25519().publicKey
+            store.create(id, summary, files, 1_000, stranger)
+            assertNull(store.load(id), "no record for another identity with the same transfer id")
+            assertTrue(errors.single().contains("belongs to another device"), errors.toString())
+            store.create(id, summary, files, 1_000, peer)
+            assertContentEquals(peer, assertNotNull(store.load(id)).peerIdentityKey)
         }
 
     @Test

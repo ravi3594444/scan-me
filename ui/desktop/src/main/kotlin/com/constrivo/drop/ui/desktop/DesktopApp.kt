@@ -4,6 +4,7 @@ import com.constrivo.drop.core.discovery.EphemeralIds
 import com.constrivo.drop.core.discovery.Visibility
 import com.constrivo.drop.platform.desktop.DesktopPlatformServices
 import com.constrivo.drop.platform.desktop.node.DesktopNode
+import com.constrivo.drop.platform.desktop.node.NodeDirection
 import com.constrivo.drop.platform.desktop.node.NodeEvent
 import com.constrivo.drop.ui.shared.presenter.DropAppController
 import com.constrivo.drop.ui.shared.presenter.OnboardingConfig
@@ -30,6 +31,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.filterIsInstance
+import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
@@ -56,14 +58,15 @@ enum class WindowRequest {
  * tests.
  *
  * Closing the window hides it when a tray icon is there to bring it back; the app ends with tray "Quit" ([shutdown]
- * stops the node, so the ladders tear their links down first, F‑E11).
+ * stops the node, so the ladders tear their links down first, F‑E11). [lanAvailable] says whether the machine is on a
+ * network now (the LAN watcher of `main` moves the node when that changes); the banner follows it.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class DesktopApp(
     val node: DesktopNode,
     private val services: DesktopPlatformServices,
     private val host: DesktopHost,
-    val hasLan: Boolean,
+    val lanAvailable: StateFlow<Boolean>,
     appVersion: String,
     private val main: CoroutineDispatcher,
     private val io: CoroutineDispatcher = Dispatchers.IO,
@@ -103,13 +106,37 @@ class DesktopApp(
     private val clicks = NotificationClicks(node.config.monotonicClock)
     private var tray: SystemTrayController? = null
 
-    /** The banner above the radar (design §9): no network, or no Bluetooth with the static code (refreshed each epoch). */
+    /**
+     * The banner above the radar (design §9): no network while the machine is on none (it follows [lanAvailable]), or no
+     * Bluetooth with the static code (refreshed each epoch).
+     */
     val banner: StateFlow<DesktopBanner?> =
-        when {
-            !hasLan -> flowOf(DesktopBanner.NoNetwork)
-            node.bluetoothAvailable -> flowOf(null)
-            else -> staticCodes().map { DesktopBanner.NoBluetooth(it) }
-        }.stateIn(scope, SharingStarted.Eagerly, if (!hasLan) DesktopBanner.NoNetwork else null)
+        lanAvailable
+            .flatMapLatest { lan ->
+                when {
+                    !lan -> flowOf(DesktopBanner.NoNetwork)
+                    node.bluetoothAvailable -> flowOf(null)
+                    else -> staticCodes().map { DesktopBanner.NoBluetooth(it) }
+                }
+            }.stateIn(scope, SharingStarted.Eagerly, if (!lanAvailable.value) DesktopBanner.NoNetwork else null)
+
+    /** Transfers whose code the user put aside ("Not now" on the shared sheet) while they ran: not asked again after. */
+    private val putAside = MutableStateFlow<Set<String>>(emptySet())
+
+    /**
+     * A finished send's code that still waits for an answer (F‑B3): the shared sheet goes with its transfer, and a small
+     * first send ends before anyone can compare the codes, so the shell asks once more ([DesktopShell]'s prompt).
+     */
+    val finishedPairing: StateFlow<FinishedPairing?> =
+        combine(node.transfers, putAside) { transfers, aside ->
+            transfers
+                .firstOrNull { t -> t.direction == NodeDirection.SEND && t.stage.isFinal && t.pairingCode != null && t.id !in aside }
+                ?.let { t -> FinishedPairing(t.id, t.peerName, checkNotNull(t.pairingCode)) }
+        }.stateIn(scope, SharingStarted.Eagerly, null)
+
+    /** The answers to [finishedPairing]: the node trusts the peer, or lets the code go. */
+    val finishedPairingActions: FinishedPairingActions =
+        FinishedPairingActions(confirm = { node.confirmPairing(it) }, dismiss = { node.dismissPairing(it) })
 
     /** What the tray shows ([TrayModel]). */
     val trayView: StateFlow<TrayView> =
@@ -164,6 +191,7 @@ class DesktopApp(
                 }
             }
         scope.launch { controller.language.collect { stringsState.value = DesktopStrings.forLanguage(it.tag) } }
+        scope.launch { watchPutAside() }
         scope.launch { node.events.filterIsInstance<NodeEvent.Problem>().collect { log(it.message, it.error) } }
         scope.launch { ports.problems.collect { log(it.message, it.error) } }
         refreshAutoStart()
@@ -271,6 +299,25 @@ class DesktopApp(
                     false
                 }
         }
+    }
+
+    /**
+     * Notes the codes the user put aside on the shared sheet while their transfer ran ("Not now", Back, the scrim): the
+     * sheet went although the transfer still runs with its code. A sheet that goes because its transfer ended is not
+     * put aside, so its code is asked for once more.
+     */
+    private suspend fun watchPutAside() {
+        var shown: String? = null
+        combine(controller.radar.state, node.transfers) { radar, transfers -> radar.senderPairing?.transferId to transfers }
+            .collect { (id, transfers) ->
+                val previous = shown
+                if (previous != null && id != previous) {
+                    val t = transfers.firstOrNull { it.id == previous }
+                    if (t != null && !t.stage.isFinal && t.pairingCode != null) putAside.value += previous
+                }
+                shown = id
+                putAside.value = putAside.value.filterTo(HashSet()) { a -> transfers.any { it.id == a } }
+            }
     }
 
     /** This computer's static code (F‑B6), again at every beacon epoch since it carries the current beacon ID. */

@@ -68,6 +68,41 @@ class LanLinkProviderTest {
             }
         }
 
+    /** A stranger whose offer was accepted must not make this device dial the internet, loopback or other machines. */
+    @Test
+    fun `a LinkReady may only name the session's peer, as an IP literal`() =
+        runBlocking<Unit> {
+            withTimeout(10_000) {
+                val lanAddress = InetAddress.getByName("192.168.1.10")
+                val peer = InetAddress.getByName("192.168.1.20")
+                val provider = LanLinkProvider(lanAddress, peerAddress = peer)
+                val joined = provider.join(JoinRequest(LinkMode.LAN)) {}
+                for (address in listOf(
+                    "127.0.0.1",
+                    "8.8.8.8",
+                    "192.168.1.21",
+                    "example.com",
+                    "999.1.1.1",
+                    "0.0.0.0",
+                    "224.0.0.251",
+                    "::1",
+                )) {
+                    assertFailsWith<IOException>(address) { joined.connect(address, 443) }
+                }
+                assertEquals(peer, provider.checkDialable("192.168.1.20"))
+                assertEquals(peer, provider.checkDialable("::ffff:192.168.1.20"), "its IPv4-mapped form is the same host")
+                joined.teardown()
+
+                // Without a known peer: local networks only, loopback only on a loopback-bound provider.
+                val unbound = LanLinkProvider(lanAddress)
+                assertEquals(InetAddress.getByName("10.0.0.5"), unbound.checkDialable("10.0.0.5"))
+                assertEquals(InetAddress.getByName("169.254.3.4"), unbound.checkDialable("169.254.3.4"))
+                assertFailsWith<IOException> { unbound.checkDialable("8.8.8.8") }
+                assertFailsWith<IOException> { unbound.checkDialable("127.0.0.1") }
+                assertEquals(loopback, LanLinkProvider(loopback).checkDialable(loopback.hostAddress))
+            }
+        }
+
     @Test
     fun `only the LAN rung is served and never on the wildcard address`() =
         runBlocking<Unit> {

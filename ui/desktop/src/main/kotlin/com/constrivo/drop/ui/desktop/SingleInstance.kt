@@ -28,6 +28,11 @@ import java.util.HexFormat
  * The port and a random token are in `instance.lock.port` next to the lock, readable by the owner only, so another user
  * of the machine cannot raise this user's window. The listener reads one short line per connection with a timeout and
  * ignores anything but `activate <token>`.
+ *
+ * Quitting takes a few seconds after the window has gone (the node stops, mDNS says goodbye). The app calls
+ * [stopAccepting] as soon as its window exits, so a copy started meanwhile finds no one to activate; it then waits for
+ * the lock ([acquire]) and becomes the app once the old copy has exited, instead of raising a window that is gone and
+ * exiting with nothing shown.
  */
 class SingleInstance private constructor(
     private val channel: FileChannel,
@@ -51,13 +56,21 @@ class SingleInstance private constructor(
     /** The loopback port of the activation listener. */
     val port: Int get() = server.localPort
 
-    override fun close() {
+    /**
+     * Stops answering later copies (the app is quitting): the listener and the port file go, the lock stays until
+     * [close]. Idempotent.
+     */
+    fun stopAccepting() {
         closeQuietly(server)
         try {
             Files.deleteIfExists(portFile)
         } catch (_: IOException) {
             // The next start overwrites it.
         }
+    }
+
+    override fun close() {
+        stopAccepting()
         try {
             lock.release()
         } catch (_: IOException) {
@@ -75,34 +88,59 @@ class SingleInstance private constructor(
         private const val CONNECT_TIMEOUT_MILLIS = 1_000
         private const val PORT_FILE_ATTEMPTS = 20
         private const val PORT_FILE_RETRY_MILLIS = 50L
+        private const val LOCK_RETRY_MILLIS = 100L
+        private const val NANOS_PER_MILLI = 1_000_000L
+
+        /** How long a start waits for a copy that holds the lock without answering (quitting, bounded by its stop). */
+        const val EXIT_WAIT_MILLIS: Long = 20_000
 
         /**
-         * Takes the lock at [lockFile], or asks the copy holding it to show itself. [onActivate] runs on a background
+         * Takes the lock at [lockFile], or asks the copy holding it to show itself. A copy that holds the lock but does
+         * not answer is quitting ([stopAccepting]) or starting: the lock is tried again for up to [waitForExitMillis],
+         * so a start right after Quit becomes the app once the old copy has exited. [onActivate] runs on a background
          * thread each time a later copy starts.
          *
          * @throws IOException when the lock file or the listener cannot be created at all (a read-only data folder).
          */
         fun acquire(
             lockFile: Path,
+            waitForExitMillis: Long = EXIT_WAIT_MILLIS,
             onActivate: () -> Unit,
         ): Outcome {
+            require(waitForExitMillis >= 0) { "the wait must not be negative" }
             lockFile.parent?.let(OwnerOnlyFiles::createDirectories)
             val portFile = lockFile.resolveSibling(lockFile.fileName.toString() + PORT_FILE_SUFFIX)
-            val channel = FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE)
-            val lock =
-                try {
-                    channel.tryLock()
-                } catch (_: OverlappingFileLockException) {
-                    // Held by this very JVM (tests, or a second start inside one process).
-                    null
-                } catch (e: IOException) {
-                    closeQuietly(channel)
-                    throw e
-                }
-            if (lock == null) {
+            val deadline = System.nanoTime() + waitForExitMillis * NANOS_PER_MILLI
+            while (true) {
+                val channel = FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE)
+                val lock = tryLock(channel)
+                if (lock != null) return primary(channel, lock, portFile, onActivate)
                 closeQuietly(channel)
-                return Outcome.Secondary(activate(portFile))
+                if (activate(portFile)) return Outcome.Secondary(activated = true)
+                if (System.nanoTime() - deadline >= 0) return Outcome.Secondary(activated = false)
+                Thread.sleep(LOCK_RETRY_MILLIS)
             }
+        }
+
+        /** The lock on [channel], or null when another process (or this JVM) holds it. */
+        private fun tryLock(channel: FileChannel): FileLock? =
+            try {
+                channel.tryLock()
+            } catch (_: OverlappingFileLockException) {
+                // Held by this very JVM (tests, or a second start inside one process).
+                null
+            } catch (e: IOException) {
+                closeQuietly(channel)
+                throw e
+            }
+
+        /** This process as the app: the activation listener and its port file next to the lock just taken. */
+        private fun primary(
+            channel: FileChannel,
+            lock: FileLock,
+            portFile: Path,
+            onActivate: () -> Unit,
+        ): Outcome {
             val server =
                 try {
                     ServerSocket(0, 0, InetAddress.getLoopbackAddress())

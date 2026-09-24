@@ -50,10 +50,13 @@ import com.constrivo.drop.ui.shared.components.QuietButton
 import com.constrivo.drop.ui.shared.components.SheetSurface
 import com.constrivo.drop.ui.shared.components.SheetTitle
 import com.constrivo.drop.ui.shared.model.BubbleUi
+import com.constrivo.drop.ui.shared.model.SenderPairingUi
 import com.constrivo.drop.ui.shared.presenter.DropAppController
 import com.constrivo.drop.ui.shared.presenter.RadarSheet
 import com.constrivo.drop.ui.shared.presenter.Screen
 import com.constrivo.drop.ui.shared.qr.QrMatrix
+import com.constrivo.drop.ui.shared.receive.SenderPairingCallbacks
+import com.constrivo.drop.ui.shared.receive.SenderPairingSheet
 import com.constrivo.drop.ui.shared.send.QrCode
 import com.constrivo.drop.ui.shared.text.deviceNameText
 import com.constrivo.drop.ui.shared.text.sizeText
@@ -71,6 +74,7 @@ object DesktopTags {
     const val DROP_HINT = "desktop.dropHint"
     const val SEND_TO = "desktop.sendTo"
     const val SEND_TO_CANCEL = "desktop.sendTo.cancel"
+    const val PAIRING = "desktop.pairing"
 
     fun sendToDevice(key: String): String = "desktop.sendTo.$key"
 
@@ -89,8 +93,24 @@ sealed interface DesktopBanner {
 }
 
 /**
+ * A send's pairing code after its transfer ended (F‑B3): a small first send ends before anyone can compare the codes,
+ * and the shared sheet goes with the transfer, so the desktop keeps asking until the user answers.
+ */
+data class FinishedPairing(
+    val transferId: String,
+    val peerName: String,
+    val code: String,
+)
+
+/** What the answers to a [FinishedPairing] do: "Yes, it matches", or "Not now" / Cancel. */
+class FinishedPairingActions(
+    val confirm: (transferId: String) -> Unit = {},
+    val dismiss: (transferId: String) -> Unit = {},
+)
+
+/**
  * The desktop window's content (design §9): the shared app ([DropApp]) with the desktop's banner above the radar, the
- * whole area as a drop zone ([ShellState]) and the "Send to…" list over it.
+ * whole area as a drop zone ([ShellState]), the "Send to…" list over it, and a finished send's unanswered code.
  */
 @OptIn(ExperimentalFoundationApi::class, ExperimentalComposeUiApi::class)
 @Composable
@@ -101,8 +121,11 @@ fun DesktopShell(
     banner: DesktopBanner?,
     modifier: Modifier = Modifier,
     dark: Boolean = androidx.compose.foundation.isSystemInDarkTheme(),
+    pairing: FinishedPairing? = null,
+    pairingActions: FinishedPairingActions = FinishedPairingActions(),
 ) {
     val screen by controller.screen.collectAsState()
+    val coveredBySheet = sheetShowing(controller)
     val density = LocalDensity.current
     DropTheme(dark = dark) {
         val colors = LocalDropColors.current
@@ -122,9 +145,14 @@ fun DesktopShell(
                     .testTag(DesktopTags.DROP_AREA),
             ) {
                 DropApp(controller, dark = dark)
-                if (screen == Screen.RADAR && shell.sendTo == null) BubbleDropTargets(controller, shell)
+                // Under a sheet or card the bubbles are hidden: a drop there goes to the area ("Send to…", or the open
+                // picker), never to a bubble behind the sheet.
+                val finished = pairing?.takeIf { !coveredBySheet && screen != Screen.ONBOARDING }
+                val bubbleTargets = screen == Screen.RADAR && shell.sendTo == null && !coveredBySheet && finished == null
+                if (bubbleTargets) BubbleDropTargets(controller, shell)
                 if (shell.dragging) DropHint(shell.hover, strings)
                 shell.sendTo?.let { sendTo -> SendToSheet(controller, shell, sendTo, strings) }
+                if (finished != null && shell.sendTo == null) FinishedPairingSheet(finished, pairingActions)
             }
         }
     }
@@ -132,6 +160,45 @@ fun DesktopShell(
 
 @OptIn(ExperimentalComposeUiApi::class)
 private fun carriesFiles(event: DragAndDropEvent): Boolean = event.dragData() is DragData.FilesList
+
+/** Whether one of the shared app's sheets or cards covers the screen (the picker, a code, a prompt, a card). */
+@Composable
+private fun sheetShowing(controller: DropAppController): Boolean {
+    val radar by controller.radar.state.collectAsState()
+    val radarSheet by controller.radarSheet.collectAsState()
+    val incoming by controller.incoming.state.collectAsState()
+    val installer by controller.installerWarning.collectAsState()
+    val browser by controller.browserApproval.state.collectAsState()
+    val permission by controller.permissions.state.collectAsState()
+    return radarSheet != null || incoming != null || installer != null || browser != null || permission != null ||
+        radar.senderPairing != null || radar.cancelConfirm != null
+}
+
+/** The shared sender's code sheet for a transfer that already ended, over a scrim that does not dismiss it. */
+@Composable
+private fun FinishedPairingSheet(
+    pairing: FinishedPairing,
+    actions: FinishedPairingActions,
+) {
+    val colors = LocalDropColors.current
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(colors.scrim)
+            .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = {})
+            .testTag(DesktopTags.PAIRING),
+        contentAlignment = Alignment.BottomCenter,
+    ) {
+        SenderPairingSheet(
+            SenderPairingUi(pairing.transferId, pairing.peerName, pairing.code),
+            SenderPairingCallbacks(
+                onConfirm = { actions.confirm(pairing.transferId) },
+                onCancel = { actions.dismiss(pairing.transferId) },
+                onLater = { actions.dismiss(pairing.transferId) },
+            ),
+        )
+    }
+}
 
 /**
  * A drop target for files: the whole area ([bubbleKey] null) or one bubble. Compose hands a drag to the innermost

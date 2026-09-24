@@ -106,6 +106,9 @@ sealed interface DropDecision {
     /** Dropped on empty space, a busy bubble or another screen: ask "Send to…" with the bubble list. */
     data object ChooseDevice : DropDecision
 
+    /** Dropped while the file picker is open: the files join its selection (as its "Browse files" would add them). */
+    data object AddToPicker : DropDecision
+
     /** Nothing to do: no files, or the app is still being set up. */
     data object Ignore : DropDecision
 }
@@ -113,17 +116,21 @@ sealed interface DropDecision {
 /** The drop rules of design §9, pure so they are tested without a window. */
 object DropTargets {
     /**
-     * What dropping files does: onto an idle bubble of the radar it sends to that device; anywhere else (empty space,
-     * the "+N more" bubble, a bubble that is already sending or receiving, the dashboard) it asks "Send to…". During
-     * onboarding and with nothing droppable it does nothing.
+     * What dropping files does: onto an idle bubble of the radar it sends to that device; while the file picker is open
+     * the files join its selection; anywhere else (empty space, the "+N more" bubble, a bubble that is already sending
+     * or receiving, a sheet over the radar, the dashboard) it asks "Send to…". During onboarding and with nothing
+     * droppable it does nothing. The shell lays no bubble targets under a sheet or card, so a drop there never lands on
+     * a bubble hidden behind it.
      */
     fun decide(
         screen: Screen,
         hasFiles: Boolean,
         bubbleUnderPointer: BubbleUi?,
+        pickerOpen: Boolean = false,
     ): DropDecision =
         when {
             !hasFiles || screen == Screen.ONBOARDING -> DropDecision.Ignore
+            pickerOpen -> DropDecision.AddToPicker
             screen == Screen.RADAR && bubbleUnderPointer != null && !bubbleUnderPointer.busy -> DropDecision.SendTo(bubbleUnderPointer.key)
             else -> DropDecision.ChooseDevice
         }

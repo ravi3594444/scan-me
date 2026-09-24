@@ -22,6 +22,8 @@ import com.constrivo.drop.ui.shared.model.FileThumb
 import com.constrivo.drop.ui.shared.model.PickedItem
 import com.constrivo.drop.ui.shared.model.StatsSnapshot
 import com.constrivo.drop.ui.shared.model.TransferStage
+import org.jetbrains.skia.Codec
+import org.jetbrains.skia.Data
 import java.nio.file.Files
 import java.nio.file.Paths
 import kotlin.test.Test
@@ -96,6 +98,87 @@ class PortMappersTest {
         val withPreview = offer.copy(previews = listOf(Preview(0, "image/jpeg", Bytes(byteArrayOf(1, 2, 3)))))
         // Bytes that are no picture fall back to the type's glyph (Skia refuses them).
         assertEquals(FileThumb.Glyph(FileKind.IMAGE), PortMappers.incoming(withPreview).previews.single())
+    }
+
+    /**
+     * Previews are pictures from a stranger before any consent (N12): a small image decodes, while a few bytes that
+     * declare a huge picture, a picture over the side limit or a preview of another type show the type's glyph, refused
+     * from the header before a pixel is allocated.
+     */
+    @Test
+    fun onlySmallImagePreviewsAreDecoded() {
+        val small = png(8, 8)
+        assertIs<FileThumb.Picture>(PortMappers.decodePreview(Preview(0, "image/png", Bytes(small))))
+        assertNull(PortMappers.decodePreview(Preview(0, "application/octet-stream", Bytes(small))), "not an image type")
+        assertNull(PortMappers.decodePreview(Preview(0, "image/png", Bytes(png(PortMappers.MAX_PREVIEW_SIDE + 1, 4)))))
+        val bomb = pngDeclaring(16_384, 16_384)
+        assertTrue(bomb.size < 4096, "it fits a preview: ${bomb.size} bytes")
+        Data.makeFromBytes(bomb).use { data -> Codec.makeFromData(data).use { assertEquals(16_384, it.width, "Skia reads its header") } }
+        val started = System.nanoTime()
+        assertNull(PortMappers.decodePreview(Preview(0, "image/png", Bytes(bomb))))
+        assertTrue(System.nanoTime() - started < 2_000_000_000L, "refused from the header, not decoded")
+        val offer = offer().copy(previews = listOf(Preview(0, "image/png", Bytes(bomb))))
+        assertEquals(FileThumb.Glyph(FileKind.IMAGE), PortMappers.incoming(offer).previews.first())
+    }
+
+    private fun offer() =
+        NodeOffer(
+            id = "o",
+            senderDeviceId = "d",
+            senderKey = "k",
+            senderName = "Rohan",
+            senderPlatform = DevicePlatform.PHONE,
+            trusted = false,
+            sas = "123456",
+            fileCount = 1,
+            totalBytes = 10,
+            mimeHistogram = mapOf("image/png" to 1),
+            previewNames = emptyList(),
+            previews = emptyList(),
+            arrivedAtElapsedMillis = 7,
+        )
+
+    /** A real PNG of [width] × [height] pixels (ImageIO). */
+    private fun png(
+        width: Int,
+        height: Int,
+    ): ByteArray {
+        val image = java.awt.image.BufferedImage(width, height, java.awt.image.BufferedImage.TYPE_INT_ARGB)
+        val out = java.io.ByteArrayOutputStream()
+        assertTrue(javax.imageio.ImageIO.write(image, "png", out))
+        return out.toByteArray()
+    }
+
+    /** A PNG whose header declares [width] × [height] while its data holds a few rows (a decompression bomb's shape). */
+    private fun pngDeclaring(
+        width: Int,
+        height: Int,
+    ): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        out.write(byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A))
+
+        fun chunk(
+            type: String,
+            data: ByteArray,
+        ) {
+            val name = type.toByteArray(Charsets.US_ASCII)
+            out.write(java.nio.ByteBuffer.allocate(4).putInt(data.size).array())
+            out.write(name)
+            out.write(data)
+            val crc =
+                java.util.zip.CRC32().apply {
+                    update(name)
+                    update(data)
+                }
+            out.write(java.nio.ByteBuffer.allocate(4).putInt(crc.value.toInt()).array())
+        }
+        // 8-bit RGBA, deflate, no interlace.
+        chunk("IHDR", java.nio.ByteBuffer.allocate(13).putInt(width).putInt(height).put(byteArrayOf(8, 6, 0, 0, 0)).array())
+        val rows = java.io.ByteArrayOutputStream()
+        java.util.zip.DeflaterOutputStream(rows).use { it.write(ByteArray((width * 4 + 1) * 4)) }
+        chunk("IDAT", rows.toByteArray())
+        chunk("IEND", ByteArray(0))
+        return out.toByteArray()
     }
 
     @Test

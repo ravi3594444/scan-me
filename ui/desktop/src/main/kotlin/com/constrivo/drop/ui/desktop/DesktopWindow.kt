@@ -62,6 +62,7 @@ fun ApplicationScope.DesktopWindow(
     var visible by remember { mutableStateOf(!(startHidden && trayInstalled)) }
     val strings by app.strings.collectAsState()
     val banner by app.banner.collectAsState()
+    val finishedPairing by app.finishedPairing.collectAsState()
     val icon = remember { BitmapPainter(TrayIcons.render(TrayState.IDLE, ICON_SIZE).toComposeImageBitmap()) }
 
     LaunchedEffect(app) {
@@ -120,7 +121,7 @@ fun ApplicationScope.DesktopWindow(
                 app.windowFocused.value = false
             }
         }
-        DesktopShell(app.controller, app.shell, strings, banner)
+        DesktopShell(app.controller, app.shell, strings, banner, pairing = finishedPairing, pairingActions = app.finishedPairingActions)
     }
 }
 

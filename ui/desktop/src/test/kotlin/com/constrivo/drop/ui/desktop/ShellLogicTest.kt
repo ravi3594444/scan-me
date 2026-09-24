@@ -64,6 +64,12 @@ class ShellLogicTest {
         assertEquals(DropDecision.ChooseDevice, DropTargets.decide(Screen.DASHBOARD, true, idle))
         assertEquals(DropDecision.Ignore, DropTargets.decide(Screen.ONBOARDING, true, idle))
         assertEquals(DropDecision.Ignore, DropTargets.decide(Screen.RADAR, hasFiles = false, bubbleUnderPointer = idle))
+        // The open picker takes the files, whatever lies under the pointer; onboarding still ignores them.
+        assertEquals(DropDecision.AddToPicker, DropTargets.decide(Screen.RADAR, true, null, pickerOpen = true))
+        assertEquals(DropDecision.AddToPicker, DropTargets.decide(Screen.RADAR, true, idle, pickerOpen = true))
+        assertEquals(DropDecision.AddToPicker, DropTargets.decide(Screen.DASHBOARD, true, null, pickerOpen = true))
+        assertEquals(DropDecision.Ignore, DropTargets.decide(Screen.ONBOARDING, true, null, pickerOpen = true))
+        assertEquals(DropDecision.Ignore, DropTargets.decide(Screen.RADAR, false, null, pickerOpen = true))
     }
 
     @Test

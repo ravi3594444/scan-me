@@ -8,6 +8,7 @@ import java.nio.file.Path
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -92,6 +93,44 @@ class DesktopSupportTest {
         }
         val again = assertIs<SingleInstance.Outcome.Primary>(SingleInstance.acquire(lock) {})
         again.instance.close()
+    }
+
+    /**
+     * A start while the first copy quits (its window gone, its node still stopping) finds no one to activate: it waits
+     * for the lock and becomes the app once the first copy has exited, instead of exiting with nothing shown.
+     */
+    @Test
+    fun aStartWhileTheFirstQuitsBecomesTheAppOnceTheFirstHasExited() {
+        val lock = root.resolve("instance.lock")
+        val first = assertIs<SingleInstance.Outcome.Primary>(SingleInstance.acquire(lock) {})
+        first.instance.stopAccepting()
+        assertNull(SingleInstance.readPortFile(lock.resolveSibling("instance.lock.port")), "no one answers any more")
+        val exiting =
+            thread {
+                Thread.sleep(700)
+                first.instance.close()
+            }
+        try {
+            val second = assertIs<SingleInstance.Outcome.Primary>(SingleInstance.acquire(lock, waitForExitMillis = 10_000) {})
+            second.instance.close()
+        } finally {
+            exiting.join()
+        }
+    }
+
+    /** A copy that holds the lock and never answers (hung) is given up on after the wait. */
+    @Test
+    fun aCopyThatHoldsTheLockWithoutAnsweringIsGivenUpOn() {
+        val lock = root.resolve("instance.lock")
+        val first = assertIs<SingleInstance.Outcome.Primary>(SingleInstance.acquire(lock) {})
+        try {
+            first.instance.stopAccepting()
+            val started = System.nanoTime()
+            assertEquals(SingleInstance.Outcome.Secondary(activated = false), SingleInstance.acquire(lock, waitForExitMillis = 300) {})
+            assertTrue(System.nanoTime() - started < 5_000_000_000L, "bounded")
+        } finally {
+            first.instance.close()
+        }
     }
 
     @Test

@@ -21,7 +21,7 @@ class AppDirectoriesTest {
         assertEquals(Paths.get("/home/asha/Received/Drop"), dirs.received)
         assertEquals(Paths.get("/home/asha/.local/share/drop/drop.db"), dirs.database)
         assertEquals(Paths.get("/home/asha/.local/share/drop/partials"), dirs.partials)
-        assertEquals(Paths.get("/home/asha/.config/drop/secrets"), dirs.secrets)
+        assertEquals(Paths.get("/home/asha/.local/share/drop/secrets"), dirs.secrets, "device-bound: never under the synced config folder")
     }
 
     @Test
@@ -42,6 +42,10 @@ class AppDirectoriesTest {
         assertEquals(Paths.get("/profile/AppData/Local/Drop"), dirs.data)
         assertEquals(Paths.get("/profile/AppData/Local/Drop/Cache"), dirs.cache)
         assertEquals(Paths.get("/profile/Received/Drop"), dirs.received)
+        // A roaming profile copies %APPDATA% to every PC: the identity, k_adv and the database key stay in %LOCALAPPDATA%.
+        assertEquals(Paths.get("/profile/AppData/Local/Drop/secrets"), dirs.secrets)
+        assertEquals(Paths.get("/profile/AppData/Local/Drop/instance.lock"), dirs.instanceLock)
+        assertTrue(!dirs.secrets.startsWith(dirs.config), "secrets never roam")
         val fallback = AppDirectories.forOs(DesktopOs.WINDOWS, Paths.get("/profile"), emptyMap())
         assertEquals(Paths.get("/profile/AppData/Roaming/Drop"), fallback.config)
         assertEquals(Paths.get("/profile/AppData/Local/Drop"), fallback.data)

@@ -86,6 +86,40 @@ class LanDiscoveryTest {
     }
 
     /**
+     * RFC 6762's 120 s instead of JmDNS's hour, so a desktop that vanishes without a goodbye leaves no ghost bubble for
+     * long. JmDNS reads `net.dns.ttl` once when its constants load; the app's `main` sets it first, and this class sets
+     * it when it loads and gives the announcer the short TTL whatever the order was.
+     */
+    @Test
+    fun `records are announced with the 120 s TTL of host-bound records`() {
+        val discovery = JmdnsLanDiscovery(InetAddress.getLoopbackAddress())
+        try {
+            assertEquals("120", System.getProperty(JmdnsLanDiscovery.TTL_PROPERTY))
+            assertEquals(JmdnsLanDiscovery.RECORD_TTL_SECONDS, javax.jmdns.impl.tasks.state.DNSStateTask.defaultTTL())
+            assertEquals(120, JmdnsLanDiscovery.RECORD_TTL_SECONDS)
+        } finally {
+            discovery.close()
+        }
+    }
+
+    /** A browse follows the discovery to a new address and reports what it had found on the old one as lost. */
+    @Test
+    fun `rebinding moves browsing to the new address`() =
+        runBlocking<Unit> {
+            val discovery = JmdnsLanDiscovery(InetAddress.getLoopbackAddress())
+            try {
+                val other = InetAddress.getByName("127.0.0.2")
+                discovery.rebind(other)
+                assertEquals(other, discovery.address)
+                assertTrue(discovery.toString().contains("127.0.0.2"), discovery.toString())
+                discovery.rebind(other) // the same address: nothing to do
+                assertFailsWith<IllegalArgumentException> { discovery.rebind(InetAddress.getByName("0.0.0.0")) }
+            } finally {
+                discovery.shutdown()
+            }
+        }
+
+    /**
      * Two JmDNS instances on a real interface see each other's record, then its goodbye (F‑A3). Skipped where the
      * container has no multicast-capable interface or multicast does not loop back.
      */

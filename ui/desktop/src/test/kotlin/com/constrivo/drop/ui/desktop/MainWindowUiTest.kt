@@ -1,5 +1,9 @@
 package com.constrivo.drop.ui.desktop
 
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.State
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.SkikoComposeUiTest
@@ -21,6 +25,8 @@ import com.constrivo.drop.core.discovery.SystemWallClock
 import com.constrivo.drop.core.discovery.Visibility
 import com.constrivo.drop.platform.desktop.node.NodeOffer
 import com.constrivo.drop.ui.shared.TestTags
+import com.constrivo.drop.ui.shared.components.LocalTapClock
+import com.constrivo.drop.ui.shared.components.TapGuard
 import com.constrivo.drop.ui.shared.fake.InMemoryDrop
 import com.constrivo.drop.ui.shared.model.SelfProfile
 import com.constrivo.drop.ui.shared.presenter.DropAppController
@@ -43,9 +49,10 @@ import kotlin.test.assertTrue
 
 /**
  * The main window's content at the design's 420 × 640 (design §9), rendered offscreen with Skia: the no-Bluetooth
- * banner with the static code, drop targets that sit on the bubbles, "Send to…" for a drop on empty space, a drop on a
- * bubble sending at once, the shortcuts, and the incoming card over the shell. The shared UI runs on its in-memory
- * backend; the node side of the same flows is covered in `DesktopAppTest`.
+ * banner with the static code, drop targets that sit on the bubbles (and none under a sheet or card), "Send to…" for a
+ * drop on empty space, a drop on a bubble sending at once, a drop on the open picker joining it, the shortcuts, the
+ * incoming card over the shell and a finished send's code. The shared UI runs on its in-memory backend; the node side
+ * of the same flows is covered in `DesktopAppTest`.
  */
 @OptIn(ExperimentalTestApi::class)
 class MainWindowUiTest {
@@ -117,13 +124,29 @@ class MainWindowUiTest {
     private fun ui(
         fixture: Fixture,
         banner: DesktopBanner? = DesktopBanner.NoBluetooth("DROP:static-code-for-tests"),
+        pairing: State<FinishedPairing?> = mutableStateOf(null),
+        pairingActions: FinishedPairingActions = FinishedPairingActions(),
+        tapClock: (() -> Long)? = null,
         block: SkikoComposeUiTest.() -> Unit,
     ) = runSkikoComposeUiTest(
         size = Size(WindowPlacement.DEFAULT_WIDTH.toFloat(), WindowPlacement.DEFAULT_HEIGHT.toFloat()),
         density = Density(1f),
     ) {
         try {
-            setContent { DesktopShell(fixture.controller, fixture.shell, en, banner, dark = false) }
+            setContent {
+                val shell = @Composable {
+                    DesktopShell(
+                        fixture.controller,
+                        fixture.shell,
+                        en,
+                        banner,
+                        dark = false,
+                        pairing = pairing.value,
+                        pairingActions = pairingActions,
+                    )
+                }
+                if (tapClock == null) shell() else CompositionLocalProvider(LocalTapClock provides tapClock, content = shell)
+            }
             waitForIdle()
             block()
         } finally {
@@ -303,10 +326,84 @@ class MainWindowUiTest {
         }
     }
 
+    /**
+     * Under the open picker no bubble takes a drop (it lies hidden behind the sheet): the files join the picker's
+     * selection instead, and nothing is sent.
+     */
+    @Test
+    fun aDropOnTheOpenPickerAddsToItAndNoHiddenBubbleTakesIt() {
+        val f = Fixture()
+        ui(f) {
+            f.fake.devices.value = devices
+            mainClock.advanceTimeBy(2_000)
+            waitForIdle()
+            assertTrue(exists(DesktopTags.dropTarget("meera")))
+            onNodeWithTag(TestTags.bubble("meera"), useUnmergedTree = true).performClick()
+            waitForIdle()
+            assertEquals(RadarSheet.PICKER, f.controller.radarSheet.value)
+            for (d in devices) assertFalse(exists(DesktopTags.dropTarget(d.key)), "no drop target under the picker: ${d.key}")
+            assertTrue(f.shell.onDrop(f.paths(), bubbleKey = null))
+            waitForIdle()
+            assertEquals(listOf("a.txt", "b.jpg"), f.controller.picker.selection().items.map { it.name })
+            assertFalse(exists(DesktopTags.SEND_TO), "the files joined the picker")
+            assertTrue(f.fake.calls.none { it.startsWith("send:") }, "${f.fake.calls}")
+            assertEquals(RadarSheet.PICKER, f.controller.radarSheet.value)
+        }
+    }
+
+    /**
+     * A finished send's unanswered code (F‑B3) is asked for over the radar, with no bubble target under it; "Yes, it
+     * matches" (after the tap guard) and "Not now" reach the node.
+     */
+    @Test
+    fun aFinishedSendsCodeIsAskedForAndTheAnswersGoThrough() {
+        val f = Fixture()
+        val pairing = mutableStateOf<FinishedPairing?>(FinishedPairing("t1", "Meera", "482913"))
+        val answers = ArrayList<String>()
+        val actions =
+            FinishedPairingActions(
+                confirm = {
+                    answers += "confirm:$it"
+                    pairing.value = null
+                },
+                dismiss = {
+                    answers += "dismiss:$it"
+                    pairing.value = null
+                },
+            )
+        var now = 0L
+        ui(f, pairing = pairing, pairingActions = actions, tapClock = { now }) {
+            f.fake.devices.value = devices
+            mainClock.advanceTimeBy(2_000)
+            waitForIdle()
+            assertTrue(exists(DesktopTags.PAIRING))
+            assertTrue(hasTextNode("482\u202F913"), "the code as both screens show it")
+            for (d in devices) assertFalse(exists(DesktopTags.dropTarget(d.key)), "no drop target under the prompt: ${d.key}")
+            onNode(hasText("Yes, it matches"), useUnmergedTree = true).performClick()
+            waitForIdle()
+            assertTrue(answers.isEmpty(), "a tap as the prompt appears does not count")
+            now = TapGuard.ARM_MILLIS
+            onNode(hasText("Yes, it matches"), useUnmergedTree = true).performClick()
+            waitForIdle()
+            assertEquals(listOf("confirm:t1"), answers)
+            assertFalse(exists(DesktopTags.PAIRING))
+            assertTrue(exists(DesktopTags.dropTarget("meera")), "the bubbles take drops again")
+
+            pairing.value = FinishedPairing("t2", "Dev's phone", "123456")
+            waitForIdle()
+            onNode(hasText("Not now"), useUnmergedTree = true).performClick()
+            waitForIdle()
+            assertEquals(listOf("confirm:t1", "dismiss:t2"), answers)
+        }
+    }
+
     @Test
     fun theIncomingCardShowsOverTheShell() {
         val f = Fixture()
         ui(f) {
+            f.fake.devices.value = devices
+            mainClock.advanceTimeBy(2_000)
+            waitForIdle()
             val offer =
                 NodeOffer(
                     id = "0123456789abcdef0123456789abcdef",
@@ -326,6 +423,7 @@ class MainWindowUiTest {
             f.fake.offers.value = listOf(PortMappers.incoming(offer) { null })
             waitForIdle()
             assertTrue(exists(TestTags.INCOMING_CARD))
+            for (d in devices) assertFalse(exists(DesktopTags.dropTarget(d.key)), "no drop target under the card: ${d.key}")
             onNodeWithTag(TestTags.INCOMING_DECLINE, useUnmergedTree = true).performClick()
             waitForIdle()
             assertTrue(f.fake.calls.any { it.startsWith("decline:") }, "${f.fake.calls}")

@@ -151,8 +151,11 @@ data class NodeTransfer(
  *
  * @property id the transfer id (32 hex digits); [DesktopNode.accept] and [DesktopNode.decline] take it.
  * @property senderKey the sender's radar key when it is on the radar, else `d:<deviceId>` (the avatar hash only).
- * @property trusted the verified sender identity is a trusted device (F‑B4).
- * @property sas the six-digit code of a first-time pairing (F‑B3); null for a trusted sender.
+ * @property trusted the session proved the pairing both ways (F‑B4): the sender is a trusted device here and its
+ *   `Hello` carried a valid trusted proof, so both devices hold the same recognition secret.
+ * @property sas the six-digit code of a pairing (F‑B3) whenever the session did not prove one; null for a trusted
+ *   sender and for a resumed transfer (its code was the first session's).
+ * @property isResume the transfer was interrupted (an app restart here, T‑07) and resumes from what arrived already.
  * @property arrivedAtElapsedMillis on the node's monotonic clock, for the card's 30 s bar.
  */
 data class NodeOffer(
@@ -170,6 +173,7 @@ data class NodeOffer(
     val previews: List<Preview>,
     val arrivedAtElapsedMillis: Long,
     val timeoutMillis: Long = ProtocolConstants.OFFER_TIMEOUT_MS,
+    val isResume: Boolean = false,
 )
 
 /**
@@ -232,29 +236,70 @@ sealed interface BrowserShareStatus {
  * Timing and limits of a [DesktopNode]; the defaults are the production values, tests shorten them.
  *
  * @property dialTimeoutMillis per candidate endpoint (`EndpointDialer`); a LAN answers in well under a second.
- * @property offerWaitMillis how long an inbound connection may take to send its `Offer` after the handshake.
+ * @property offerWaitMillis how long an inbound session that proved a pairing may take to send its `Offer` (or, for the
+ *   trust exchange after a pairing, its `TrustShare`) after the handshake.
+ * @property untrustedOfferWaitMillis the same for a session that proved no pairing: a stranger's sender sends its
+ *   `Offer` at once, so a stranger holding a session open without one is closed soon.
  * @property finishedRetentionMillis how long a finished transfer stays in [DesktopNode.transfers] (the completion tick,
  *   "Declined", design §4.2).
+ * @property pairingRetentionMillis how long a finished send keeps a code its user has not answered yet (F‑B3: a small
+ *   first send ends before anyone can compare the codes; the desktop shows the code until confirmed or dismissed).
  * @property progressPersistMillis `transfer.bytes_done` is written at most this often (F‑F1 shows 250 ms; History does
  *   not need it).
- * @property trustSyncWaitMillis after pairing, how long the sender waits for the peer's `TrustShare` (S3).
+ * @property trustSyncWaitMillis in the trust exchange after a pairing, how long to wait for the peer's `TrustShare` (S3).
+ * @property trustSyncRetryMillis the first pause before a trust exchange that could not reach the peer runs again
+ *   (doubling, for at most [TRUST_SYNC_ATTEMPTS] tries); a new sighting of the peer retries sooner.
  * @property maxPendingOffers more offers waiting for an answer are declined `busy`.
+ * @property reconnectWindowMillis S8 `Reconnecting`: a sender whose link dropped offers the transfer again for this
+ *   long, with back-off, before it waits for the peer to be seen again.
+ * @property parkedWindowMillis S8 `Parked`: after this long since the interruption the transfer is given up.
+ * @property lanRung whether the ladder's LAN rung adds parallel streams; off only in tests that shape the primary link.
+ * @property helloWaitMillis an inbound connection must send its `Hello` within this long.
+ * @property handshakeTimeoutMillis the whole handshake, Finished included, on the LAN.
+ * @property maxUnauthenticated inbound connections that may be between accept and the end of their handshake at once
+ *   ([maxUnauthenticatedPerHost] from one address); more are closed at once (§13).
+ * @property maxWaitingForOffer authenticated inbound sessions that may wait for their first message at once.
  */
 data class NodeTuning(
     val dialTimeoutMillis: Long = 3_000,
     val offerWaitMillis: Long = 60_000,
+    val untrustedOfferWaitMillis: Long = 15_000,
     val finishedRetentionMillis: Long = 10_000,
+    val pairingRetentionMillis: Long = 10 * 60_000,
     val progressPersistMillis: Long = 1_000,
     val trustSyncWaitMillis: Long = 3_000,
+    val trustSyncRetryMillis: Long = 5_000,
     val maxPendingOffers: Int = 4,
     val lingerMillis: Long = EngineConfig.DEFAULT_LINGER_MILLIS,
     val sweepIntervalMillis: Long = ResumeDataCleaner.DEFAULT_INTERVAL_MILLIS,
     val lifecycle: LinkLifecycle = LinkLifecycle(),
+    val reconnectWindowMillis: Long = ProtocolConstants.RECONNECT_WINDOW_MS,
+    val parkedWindowMillis: Long = ProtocolConstants.PARKED_WINDOW_MS,
+    val lanRung: Boolean = true,
+    val helloWaitMillis: Long = 2_000,
+    val handshakeTimeoutMillis: Long = 5_000,
+    val maxUnauthenticated: Int = 16,
+    val maxUnauthenticatedPerHost: Int = 4,
+    val maxWaitingForOffer: Int = 16,
 ) {
     init {
-        require(dialTimeoutMillis > 0 && offerWaitMillis > 0 && trustSyncWaitMillis > 0) { "timeouts must be positive" }
-        require(finishedRetentionMillis >= 0 && progressPersistMillis > 0 && sweepIntervalMillis > 0) { "intervals out of range" }
+        require(dialTimeoutMillis > 0 && offerWaitMillis > 0 && untrustedOfferWaitMillis > 0 && trustSyncWaitMillis > 0) {
+            "timeouts must be positive"
+        }
+        require(helloWaitMillis > 0 && handshakeTimeoutMillis > 0 && trustSyncRetryMillis > 0) { "timeouts must be positive" }
+        require(finishedRetentionMillis >= 0 && pairingRetentionMillis >= 0 && progressPersistMillis > 0 && sweepIntervalMillis > 0) {
+            "intervals out of range"
+        }
+        require(reconnectWindowMillis > 0 && parkedWindowMillis >= reconnectWindowMillis) {
+            "the parked window contains the reconnect window"
+        }
         require(maxPendingOffers >= 1) { "at least one offer must be able to wait" }
+        require(maxUnauthenticated >= 1 && maxUnauthenticatedPerHost >= 1 && maxWaitingForOffer >= 1) { "limits must admit a connection" }
+    }
+
+    companion object {
+        /** A trust exchange that could not reach the peer is tried this often before it is given up. */
+        const val TRUST_SYNC_ATTEMPTS: Int = 6
     }
 }
 
@@ -265,8 +310,9 @@ data class NodeTuning(
  * @property secrets where the identity, `k_adv` and the database key live ([com.constrivo.drop.platform.desktop.FileSecretStorage]
  *   wrapped by the OS keychain).
  * @property lan mDNS ([com.constrivo.drop.platform.desktop.lan.JmdnsLanDiscovery], or the in-memory network in tests).
- * @property lanAddress the LAN interface address ([com.constrivo.drop.platform.desktop.lan.LanInterfaces.select]); the
- *   control listener, the LAN links and the browser receive server bind it, never the wildcard.
+ * @property lanAddress the LAN interface address at start ([com.constrivo.drop.platform.desktop.lan.LanInterfaces.select]);
+ *   the control listener, the LAN links and the browser receive server bind it, never the wildcard.
+ *   [DesktopNode.setLanAddress] moves the node to another one when the machine changes networks.
  * @property controlPort the control listener's port; 0 picks a free one (announced in the mDNS record).
  * @property database an open database, or null to open [AppDirectories.database]; a given one is not closed by the node.
  */

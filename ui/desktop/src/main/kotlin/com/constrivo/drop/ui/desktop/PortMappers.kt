@@ -12,6 +12,7 @@ import com.constrivo.drop.core.data.TransferStatus
 import com.constrivo.drop.core.data.VisibilityPreference
 import com.constrivo.drop.core.ladder.TransportBadge
 import com.constrivo.drop.core.protocol.Preview
+import com.constrivo.drop.core.protocol.ProtocolConstants
 import com.constrivo.drop.core.transfer.receive.FileNameSanitizer
 import com.constrivo.drop.platform.desktop.files.MarkingFileStore
 import com.constrivo.drop.platform.desktop.files.SendFile
@@ -40,6 +41,8 @@ import com.constrivo.drop.ui.shared.model.TransferSnapshot
 import com.constrivo.drop.ui.shared.model.TransferStage
 import com.constrivo.drop.ui.shared.model.TrustedDeviceEntry
 import com.constrivo.drop.ui.shared.model.VisibilityState
+import org.jetbrains.skia.Codec
+import org.jetbrains.skia.Data
 import org.jetbrains.skia.Image
 import java.nio.file.Files
 import java.nio.file.InvalidPathException
@@ -128,13 +131,30 @@ object PortMappers {
         return kinds.take(minOf(fileCount, MAX_PREVIEWS)).map { FileThumb.Glyph(it) }
     }
 
-    /** A preview decoded with Skia, or null when the bytes are not an image Skia reads. */
-    fun decodePreview(preview: Preview): FileThumb? =
-        try {
-            FileThumb.Picture(Image.makeFromEncoded(preview.data.toByteArray()).toComposeImageBitmap(), FileKind.fromMime(preview.mime))
+    /**
+     * A preview decoded with Skia, or null when it is not a small image Skia reads. Previews come from any sender before
+     * the user consented (N12 caps their bytes at 4 KiB, not their pixels): a few bytes can declare a 16384 × 16384
+     * picture, so the header is read first ([Codec]) and anything larger than [MAX_PREVIEW_SIDE] on a side, or not an
+     * image type, is refused before a pixel is allocated.
+     */
+    fun decodePreview(preview: Preview): FileThumb? {
+        if (!preview.mime.startsWith("image/")) return null
+        val bytes = preview.data.toByteArray()
+        if (bytes.isEmpty() || bytes.size > ProtocolConstants.MAX_PREVIEW_BYTES) return null
+        return try {
+            Data.makeFromBytes(bytes).use { data ->
+                Codec.makeFromData(data).use { codec ->
+                    if (codec.width !in 1..MAX_PREVIEW_SIDE || codec.height !in 1..MAX_PREVIEW_SIDE) return null
+                }
+            }
+            FileThumb.Picture(Image.makeFromEncoded(bytes).toComposeImageBitmap(), FileKind.fromMime(preview.mime))
         } catch (_: Exception) {
             null
         }
+    }
+
+    /** The largest preview side decoded (a thumbnail); anything larger shows the type's glyph. */
+    const val MAX_PREVIEW_SIDE: Int = 512
 
     /** A received file for the tray (design §5.2). */
     fun received(item: ReceivedItem): ReceivedFile {

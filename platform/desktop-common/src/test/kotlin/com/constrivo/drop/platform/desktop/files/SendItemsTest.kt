@@ -59,6 +59,43 @@ class SendItemsTest {
     }
 
     @Test
+    fun `the walk stops at the limit in a deterministic order and says it truncated`() {
+        for (folder in listOf("b", "a", "c")) for (i in 9 downTo 0) file("big/$folder/$i.bin")
+        val limited = SendItems.expand(listOf(root.resolve("big")), limit = 12)
+        assertTrue(limited.truncated)
+        assertEquals((0..9).map { "big/a/$it.bin" } + listOf("big/b/0.bin", "big/b/1.bin"), limited.files.map { it.name })
+        val all = SendItems.expand(listOf(root.resolve("big")), limit = 30)
+        assertEquals(false, all.truncated, "exactly the limit is not truncated")
+        assertEquals(30, all.files.size)
+    }
+
+    @Test
+    fun `a name too long for the protocol loses leading folders, never the file name`() {
+        val deep = (1..60).map { "папка-$it" } // Cyrillic: two UTF-8 bytes a character, about 1,000 bytes of folders
+        val name = SendItems.sendName(deep + "IMG_0001.jpg")
+        assertTrue(name.encodeToByteArray().size <= 1024, "${name.encodeToByteArray().size} bytes")
+        assertTrue(name.endsWith("/IMG_0001.jpg"), name)
+        assertTrue(name.startsWith("папка-"), "whole folders are dropped, not cut: $name")
+        assertEquals("a/b.txt", SendItems.sendName(listOf("a", "b.txt")))
+        assertEquals("only.txt", SendItems.sendName(listOf("only.txt"), maxBytes = 3), "the file name itself always stays")
+        val tree = file((1..40).joinToString("/") { "Ordner-mit-langem-Namen-$it" } + "/photo.jpg")
+        val sent = SendItems.expand(listOf(root.resolve("Ordner-mit-langem-Namen-1"))).files.single()
+        assertEquals(tree, sent.path)
+        assertTrue(sent.name.endsWith("/photo.jpg") && sent.name.encodeToByteArray().size <= 1024, sent.name)
+    }
+
+    @Test
+    fun `an interrupted walk stops with InterruptedException`() {
+        file("stop/a.txt")
+        Thread.currentThread().interrupt()
+        try {
+            assertFailsWith<InterruptedException> { SendItems.expand(listOf(root.resolve("stop"))) }
+        } finally {
+            Thread.interrupted()
+        }
+    }
+
+    @Test
     fun `symbolic links and missing paths are skipped, never followed`() {
         val target = file("outside/secret.txt")
         file("album/one.jpg")

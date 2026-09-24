@@ -30,7 +30,10 @@ import kotlinx.coroutines.CancellationException
  *
  * The transfer row itself is written by the app when the `Offer` arrives (it is History), before the engine calls
  * [create]. A record exists while its plan does and its transfer is an unfinished receive: [delete] removes the plan and
- * the manifests but keeps the rows for History, and a finished transfer never resumes.
+ * the manifests but keeps the rows for History, and a finished transfer never resumes. [create] makes a record only for
+ * the peer the row names (N3: another identity offering the same `transfer_id` gets none), and a record that replaces
+ * an earlier one starts the listed files over (pending, no saved URI); a hash an earlier `FileDone` stored stays until
+ * the new `FileDone` replaces it, since the row can only be told a new one.
  *
  * Failures never reach the engine: a store may lag (a lost write only makes the receiver ask for a unit it already
  * has, [ResumeStore]), so a failed write is reported to [onError] and dropped, and a record that cannot be read back
@@ -68,16 +71,35 @@ class DataResumeStore(
     ) {
         guarded("creating the resume record of ${transferId.toHex()}", Unit) {
             val transfer = data.transfers.get(transferId)
-            if (transfer == null || !transfer.isActive) {
+            if (transfer == null || !transfer.isActive || transfer.direction != TransferDirection.RECEIVE) {
                 onError("no unfinished transfer ${transferId.toHex()} to resume into", IllegalStateException("missing transfer row"))
                 return@guarded
             }
-            // A new record replaces any old one: its manifests go before the plan names the new layout.
+            // N3: a record belongs to the peer that started the transfer; another identity with the same id gets none.
+            val owner = data.devices.find(transfer.peerDeviceId)?.identityKey()
+            if (owner == null || !owner.contentEquals(peerIdentityKey)) {
+                onError(
+                    "transfer ${transferId.toHex()} belongs to another device; no resume record is kept",
+                    IllegalStateException("resume record for another peer"),
+                )
+                return@guarded
+            }
+            // A new record replaces any old one: its manifests go before the plan names the new layout, and the files of
+            // an earlier attempt start over (a done file of the old layout is not done in the new one).
             data.manifests.deleteForTransfer(transferId)
             plans.write(transferId, summary)
-            val listed = data.transferFiles.files(transferId).mapTo(HashSet()) { it.index }
+            val listed = data.transferFiles.files(transferId)
+            for (row in listed) {
+                if (row.status !=
+                    TransferFileStatus.PENDING
+                ) {
+                    data.transferFiles.updateStatus(transferId, row.index, TransferFileStatus.PENDING)
+                }
+                if (row.savedUri != null) data.transferFiles.setSavedUri(transferId, row.index, null)
+            }
+            val indices = listed.mapTo(HashSet()) { it.index }
             files
-                .filter { it.index !in listed }
+                .filter { it.index !in indices }
                 .map { NewTransferFile(it.index, it.name, it.mime, it.size) }
                 .chunked(FILE_BATCH)
                 .forEach { data.transferFiles.add(transferId, it) }

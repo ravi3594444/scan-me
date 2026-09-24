@@ -84,10 +84,24 @@ class TrayModelTest {
             TrayModel.state(emptyList(), listOf(transfer("a", NodeStage.AWAITING_ACCEPT, code = "123456")), false),
         )
         assertEquals(
-            TrayState.TRANSFERRING,
+            TrayState.IDLE,
             TrayModel.state(emptyList(), listOf(transfer("a", NodeStage.AWAITING_ACCEPT, NodeDirection.RECEIVE, "123456")), false),
         )
-        assertEquals(TrayState.IDLE, TrayModel.state(emptyList(), listOf(transfer("a", NodeStage.FAILED, code = "123456")), false))
+        // F-B3: a small first send ends before the code can be compared; its code still waits for the user.
+        assertEquals(TrayState.ATTENTION, TrayModel.state(emptyList(), listOf(transfer("a", NodeStage.DONE, code = "123456")), false))
+    }
+
+    /** Only moving transfers animate: one waiting for its peer can stay parked for 24 h (S8). */
+    @Test
+    fun onlyTransfersThatMoveBytesAnimateTheArc() {
+        for (stage in listOf(NodeStage.CONNECTING, NodeStage.TRANSFERRING, NodeStage.VERIFYING)) {
+            assertEquals(TrayState.TRANSFERRING, TrayModel.state(emptyList(), listOf(transfer("a", stage)), false), "$stage")
+        }
+        for (stage in listOf(NodeStage.AWAITING_ACCEPT, NodeStage.RECONNECTING, NodeStage.WAITING_FOR_PEER, NodeStage.CANCELLED)) {
+            assertEquals(TrayState.IDLE, TrayModel.state(emptyList(), listOf(transfer("a", stage)), false), "$stage")
+        }
+        val parkedAndMoving = listOf(transfer("a", NodeStage.WAITING_FOR_PEER), transfer("b", NodeStage.TRANSFERRING))
+        assertEquals(TrayState.TRANSFERRING, TrayModel.state(emptyList(), parkedAndMoving, false))
     }
 
     @Test

@@ -1,6 +1,5 @@
 package com.constrivo.drop.platform.desktop.node
 
-import com.constrivo.drop.core.crypto.toHex
 import com.constrivo.drop.core.protocol.DataChannel
 import com.constrivo.drop.core.protocol.FrameCodec
 import com.constrivo.drop.core.protocol.FrameLimits
@@ -8,14 +7,13 @@ import com.constrivo.drop.core.protocol.FrameType
 import com.constrivo.drop.core.protocol.LinkKind
 import com.constrivo.drop.core.protocol.ProtocolException
 import com.constrivo.drop.core.transfer.LowLatencyChannel
-import com.constrivo.drop.core.transfer.engine.PrimaryLinkSource
-import kotlinx.coroutines.CompletableDeferred
 import java.io.EOFException
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * The first frame of an inbound control connection, read before the handshake runs: its bytes (replayed to whoever
- * handles the connection) and the identity key the `Hello` claims. The claim is not authenticated here; routing on it
- * only picks which handshake runs, and that handshake then requires the identity (N3).
+ * The first frame of an inbound control connection, read before the handshake runs under a short deadline: its bytes
+ * (replayed to the handshake) and the identity key the `Hello` claims. The claim is not authenticated here, and nothing
+ * is decided on it: every inbound connection starts a new session, whose handshake verifies the identity.
  */
 internal class InboundHello(
     val frame: ByteArray,
@@ -145,53 +143,55 @@ internal class ReplayChannel(
 }
 
 /**
- * Hands inbound connections to receivers waiting for their sender to come back (N3: a reconnect runs the handshake
- * again, with the peer's identity required). A receiving transfer's [PrimaryLinkSource] ([sourceFor]) waits here; the
- * accept loop [offer]s every connection whose `Hello` claims that identity to the oldest waiter, and handles the rest
- * as new sessions. Thread-safe.
+ * Admission of inbound control connections before they authenticate (§13: anyone on the LAN can connect). At most
+ * [maxTotal] connections may be between their accept and the end of their handshake at once, and at most [maxPerHost]
+ * from one address, so a host that opens silent connections neither exhausts the node's threads nor locks every other
+ * device out; a connection beyond either limit is closed at once. Thread-safe.
  */
-internal class ReconnectWaiters {
+internal class InboundGate(
+    private val maxTotal: Int,
+    private val maxPerHost: Int,
+) {
     private val lock = Any()
-    private val waiting = LinkedHashMap<String, ArrayDeque<CompletableDeferred<DataChannel>>>()
+    private var total = 0
+    private val perHost = HashMap<String, Int>()
 
-    /** The reconnect source of a receiver whose sender has identity [peerIdentity]. */
-    fun sourceFor(peerIdentity: ByteArray): PrimaryLinkSource {
-        val key = peerIdentity.toHex()
-        return PrimaryLinkSource {
-            val slot = CompletableDeferred<DataChannel>()
-            synchronized(lock) { waiting.getOrPut(key) { ArrayDeque() }.addLast(slot) }
-            try {
-                slot.await()
-            } finally {
-                synchronized(lock) {
-                    waiting[key]?.let { queue ->
-                        queue.remove(slot)
-                        if (queue.isEmpty()) waiting.remove(key)
-                    }
-                }
+    init {
+        require(maxTotal >= 1 && maxPerHost >= 1) { "the gate must admit at least one connection" }
+    }
+
+    /** A place for a connection from [host] (its address, null when unknown), or null when the gate is full. */
+    fun tryEnter(host: String?): Ticket? {
+        val key = host ?: UNKNOWN_HOST
+        synchronized(lock) {
+            val fromHost = perHost[key] ?: 0
+            if (total >= maxTotal || fromHost >= maxPerHost) return null
+            total++
+            perHost[key] = fromHost + 1
+        }
+        return Ticket(key)
+    }
+
+    /** Connections admitted and not yet released (tests). */
+    val size: Int get() = synchronized(lock) { total }
+
+    /** One admitted connection; [close] gives its place back, once. */
+    inner class Ticket internal constructor(
+        private val key: String,
+    ) : AutoCloseable {
+        private val released = AtomicBoolean(false)
+
+        override fun close() {
+            if (!released.compareAndSet(false, true)) return
+            synchronized(lock) {
+                total--
+                val left = (perHost[key] ?: 1) - 1
+                if (left <= 0) perHost.remove(key) else perHost[key] = left
             }
         }
     }
 
-    /** Gives [channel] to the oldest receiver waiting for [claimedIdentity]; false when none is waiting. */
-    fun offer(
-        claimedIdentity: ByteArray?,
-        channel: DataChannel,
-    ): Boolean {
-        claimedIdentity ?: return false
-        val key = claimedIdentity.toHex()
-        while (true) {
-            val slot =
-                synchronized(lock) {
-                    val queue = waiting[key] ?: return false
-                    val first = queue.removeFirstOrNull()
-                    if (queue.isEmpty()) waiting.remove(key)
-                    first
-                } ?: return false
-            if (slot.complete(channel)) return true
-        }
+    private companion object {
+        const val UNKNOWN_HOST = "?"
     }
-
-    /** How many receivers wait (tests). */
-    val size: Int get() = synchronized(lock) { waiting.values.sumOf { it.size } }
 }

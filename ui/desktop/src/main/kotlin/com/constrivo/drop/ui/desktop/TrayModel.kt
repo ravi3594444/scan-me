@@ -66,8 +66,9 @@ data class TrayView(
  * binding ([SystemTrayController]) only renders it.
  *
  * - State: [TrayState.ATTENTION] when something waits for the user (an incoming offer, a SAS to compare on the
- *   sender's side, a browser asking to connect), else [TrayState.TRANSFERRING] while any transfer runs, else
- *   [TrayState.IDLE]. Attention wins, since it is the one the user must act on.
+ *   sender's side, a browser asking to connect), else [TrayState.TRANSFERRING] while a transfer moves bytes, else
+ *   [TrayState.IDLE] (also while one reconnects or waits for its peer). Attention wins, since it is the one the user
+ *   must act on.
  * - Menu: Open, Visibility (the four modes, the chosen one checked), Received folder, Start at login (only where
  *   auto-start is available, F‑H5), Quit.
  */
@@ -88,27 +89,27 @@ object TrayModel {
             else -> TrayState.IDLE
         }
 
-    /** The stages after which a transfer no longer moves (kept briefly on the radar for its completion animation). */
-    private val ENDED: Set<NodeStage> =
-        setOf(NodeStage.DONE, NodeStage.FAILED, NodeStage.CANCELLED, NodeStage.DECLINED, NodeStage.NO_ANSWER)
+    /**
+     * The stages in which bytes move (or are about to): the arc animates for these only. A transfer waiting for an
+     * answer, reconnecting, or parked for up to 24 h waiting for its peer (S8) does not move, so the icon stays still.
+     */
+    private val MOVING: Set<NodeStage> = setOf(NodeStage.CONNECTING, NodeStage.TRANSFERRING, NodeStage.VERIFYING)
 
     /**
      * The state for the node's [offers] and [transfers] and whether a browser asks to connect ([browserPrompt]): a
-     * sender's pairing code counts as waiting for the user until the transfer ends.
+     * sender's pairing code counts as waiting for the user until it is answered, also after its transfer ended (F‑B3).
      */
     fun state(
         offers: List<NodeOffer>,
         transfers: List<NodeTransfer>,
         browserPrompt: Boolean,
-    ): TrayState {
-        val running = transfers.filter { it.stage !in ENDED }
-        return state(
+    ): TrayState =
+        state(
             waitingOffers = offers.size,
-            pairingCodes = running.count { it.direction == NodeDirection.SEND && it.pairingCode != null },
+            pairingCodes = transfers.count { it.direction == NodeDirection.SEND && it.pairingCode != null },
             browserPrompts = if (browserPrompt) 1 else 0,
-            runningTransfers = running.size,
+            runningTransfers = transfers.count { it.stage in MOVING },
         )
-    }
 
     /**
      * The mode to check in the menu: "Everyone for 10 min" while its window is open (not the "Everyone" it amounts

@@ -3,6 +3,7 @@ package com.constrivo.drop.platform.desktop.node
 import com.constrivo.drop.core.data.TransferDirection
 import com.constrivo.drop.core.data.TransferFileStatus
 import com.constrivo.drop.core.data.TransferStatus
+import com.constrivo.drop.core.protocol.HintCode
 import com.constrivo.drop.core.protocol.LinkKind
 import com.constrivo.drop.core.protocol.TransferId
 import com.constrivo.drop.platform.desktop.files.MarkingFileStore
@@ -11,11 +12,15 @@ import com.constrivo.drop.platform.desktop.node.NodeHarness.Companion.seen
 import com.constrivo.drop.platform.desktop.node.NodeHarness.Companion.sha256
 import com.constrivo.drop.platform.desktop.node.NodeHarness.Companion.transfer
 import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.filterIsInstance
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import java.nio.file.Files
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.random.Random
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -29,8 +34,9 @@ import kotlin.test.assertTrue
  * F‑D2, F‑G2, F‑H4 LAN path, T‑19's desktop half):
  *
  * 1. Alice drops a folder of 1,000 small files and two larger files on Bob's bubble; both screens show the same SAS;
- *    Bob confirms it and accepts with "Always accept", Alice confirms it; the transfer runs with bundling over the LAN
- *    primary and the ladder's LAN rung.
+ *    Bob confirms it and accepts with "Always accept", Alice confirms it; the transfer runs with bundling (the `Offer`
+ *    names bundles, History records the hint) over the LAN primary and the ladder's LAN rung (its data streams come
+ *    up during the larger files).
  * 2. Every byte arrives, in one per-drop subfolder (more than 20 files, design §9), and both History rows and their
  *    files say done.
  * 3. The pair now trusts each other: the advertising secrets were exchanged (S3), so each radar shows the other as
@@ -52,8 +58,8 @@ class DesktopNodeEndToEndTest {
                         Files.createDirectories(dir)
                         Files.write(dir.resolve("photo-%04d.jpg".format(i)), random.nextBytes(1 + random.nextInt(4096)))
                     }
-                    val movie = source.resolve("movie.mp4").also { Files.write(it, random.nextBytes(5 * MIB + 3)) }
-                    val archive = source.resolve("archive.zip").also { Files.write(it, random.nextBytes(3 * MIB + 11)) }
+                    val movie = source.resolve("movie.mp4").also { Files.write(it, random.nextBytes(40 * MIB + 3)) }
+                    val archive = source.resolve("archive.zip").also { Files.write(it, random.nextBytes(24 * MIB + 11)) }
                     val items = SendItems.expand(listOf(folder, movie, archive))
                     assertEquals(SMALL_FILES + 2, items.files.size)
                     assertEquals("Holiday/day 1/photo-0000.jpg", items.files.first().name)
@@ -68,6 +74,15 @@ class DesktopNodeEndToEndTest {
                     val finishedOnBob = async { bob.events.filterIsInstance<NodeEvent.TransferFinished>().first() }
                     val finishedOnAlice = async { alice.events.filterIsInstance<NodeEvent.TransferFinished>().first() }
                     val id = assertNotNull(alice.send(bobOnAlice.key, items.files))
+                    // The ladder's LAN rung: parallel data streams beside the primary connection (§7.4).
+                    val streams = AtomicInteger()
+                    val sampler =
+                        launch {
+                            while (isActive) {
+                                alice.statsOf(id)?.dataConnections?.let { n -> streams.accumulateAndGet(n, ::maxOf) }
+                                delay(10)
+                            }
+                        }
 
                     // The SAS on both screens (F-B3), before anything is accepted.
                     val offer = bob.offers.first { it.isNotEmpty() }.single()
@@ -83,7 +98,14 @@ class DesktopNodeEndToEndTest {
                     alice.confirmPairing(id)
 
                     val sent = transfer(alice, id) { it.stage.isFinal }
+                    sampler.cancel()
                     assertEquals(NodeStage.DONE, sent.stage, "sender: ${sent.failure}")
+                    assertTrue(streams.get() > 0, "the LAN rung carried data streams")
+                    val offered = assertNotNull(alice.offerOf(id))
+                    assertTrue(
+                        offered.bundleSmall && offered.bundleCount > 0,
+                        "the small files travel in bundles (S4): ${offered.bundleCount}",
+                    )
                     val received = transfer(bob, id) { it.stage.isFinal }
                     assertEquals(NodeStage.DONE, received.stage, "receiver: ${received.failure}")
                     assertEquals(items.files.sumOf { it.size }, received.bytesDone)
@@ -116,10 +138,12 @@ class DesktopNodeEndToEndTest {
                     assertEquals(items.files.sumOf { it.size }, aliceRow.bytesDone)
                     assertEquals(LinkKind.LAN, aliceRow.transport)
                     assertEquals("Bob", aliceRow.peerName)
+                    assertTrue(HintCode.BUNDLING in aliceRow.hints, "History records the bundling hint: ${aliceRow.hints}")
                     val bobRow = assertNotNull(bob.data.transfers.get(transferId))
                     assertEquals(TransferStatus.DONE, bobRow.status)
                     assertEquals(TransferDirection.RECEIVE, bobRow.direction)
                     assertEquals(items.files.sumOf { it.size }, bobRow.bytesDone)
+                    assertTrue(HintCode.BUNDLING in bobRow.hints, "History records the bundling hint: ${bobRow.hints}")
                     assertEquals(mapOf(TransferFileStatus.DONE to SMALL_FILES + 2), bob.data.transferFiles.statusCounts(transferId))
                     assertEquals(mapOf(TransferFileStatus.DONE to SMALL_FILES + 2), alice.data.transferFiles.statusCounts(transferId))
                     val bobFiles = bob.data.transferFiles.files(transferId)

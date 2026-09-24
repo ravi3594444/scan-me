@@ -7,12 +7,14 @@ import com.constrivo.drop.core.protocol.TransferId
 import com.constrivo.drop.platform.desktop.files.SendItems
 import com.constrivo.drop.platform.desktop.node.DesktopNode
 import com.constrivo.drop.platform.desktop.node.NodeEvent
+import com.constrivo.drop.platform.desktop.node.NodeOffer
 import com.constrivo.drop.ui.shared.model.AppLanguage
 import com.constrivo.drop.ui.shared.model.AttachedFiles
 import com.constrivo.drop.ui.shared.model.BrowserShareState
 import com.constrivo.drop.ui.shared.model.ClearPartialsResult
 import com.constrivo.drop.ui.shared.model.HistoryEntry
 import com.constrivo.drop.ui.shared.model.HistoryFile
+import com.constrivo.drop.ui.shared.model.IncomingOffer
 import com.constrivo.drop.ui.shared.model.OemBrand
 import com.constrivo.drop.ui.shared.model.PickedItem
 import com.constrivo.drop.ui.shared.model.RadioState
@@ -45,9 +47,11 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
 import java.nio.file.Files
 import java.nio.file.Path
@@ -69,6 +73,7 @@ class DesktopPorts(
     private val strings: () -> DesktopStrings,
     private val appVersion: String,
     private val io: CoroutineDispatcher = Dispatchers.IO,
+    private val compute: CoroutineDispatcher = Dispatchers.Default,
 ) : RadarActions,
     IncomingActions,
     LiveActions,
@@ -81,6 +86,9 @@ class DesktopPorts(
     OnboardingActions {
     private val receivedPaths = ConcurrentHashMap<String, Path>()
 
+    /** Each waiting offer's card content, decoded once (its previews are pictures from a stranger, N12). */
+    private val offerCards = ConcurrentHashMap<String, IncomingOffer>()
+
     /** Where the Files tab's "Browse files" result goes (the controller's `onFilesPicked`); set by the app. */
     @Volatile
     var onFilesChosen: (List<PickedItem>) -> Unit = {}
@@ -91,7 +99,8 @@ class DesktopPorts(
         return DropDependencies(
             devices = node.devices,
             transfers = node.transfers.map { list -> list.map(PortMappers::snapshot) },
-            offers = node.offers.map { list -> list.map { PortMappers.incoming(it) } },
+            // Off the UI thread, and once per offer: the offer list changes whenever any offer comes or goes.
+            offers = node.offers.map(::incomingOffers).flowOn(compute),
             received = node.received.onEach { receivedPaths[it.id] = it.path }.map(PortMappers::received),
             radio = flowOf(radioState()),
             visibility = node.visibility.map(PortMappers::visibility),
@@ -114,6 +123,13 @@ class DesktopPorts(
             monotonicClock = node.config.monotonicClock,
             onboarding = onboarding,
         )
+    }
+
+    /** The cards of [offers]: decoded once per offer id, forgotten once the offer is gone. */
+    fun incomingOffers(offers: List<NodeOffer>): List<IncomingOffer> {
+        val ids = offers.mapTo(HashSet()) { it.id }
+        offerCards.keys.retainAll(ids)
+        return offers.map { offer -> offerCards.getOrPut(offer.id) { PortMappers.incoming(offer) } }
     }
 
     /**
@@ -285,11 +301,21 @@ class DesktopPorts(
         launchIo { node.data.settings.set(SettingKeys.HAPTICS, enabled) }
     }
 
-    // ---- MyCodeSource (F-B6 static code, F-H4 browser path) ----
+    // ---- MyCodeSource (F-B5 five-minute code with the LAN address, F-H4 browser path) ----
 
+    /**
+     * A code signed now for five minutes, with this computer's LAN address and control port (F‑H4: a phone that scans
+     * it dials the computer directly, behind the handshake's identity check, where the network filters multicast);
+     * its fallback is that address to type. The banner's static code (F‑B6) stays separate.
+     */
     override suspend fun current(): MyCode {
-        val now = node.config.wallClock.nowMillis()
-        return MyCode(node.staticCode(), fallbackCode = null, issuedAtMillis = now, expiresAtMillis = null)
+        val code = node.oneTimeCode()
+        return MyCode(
+            code.payload,
+            fallbackCode = code.fallback,
+            issuedAtMillis = code.issuedAtMillis,
+            expiresAtMillis = code.expiresAtMillis,
+        )
     }
 
     override val browserShare: Flow<BrowserShareState>
@@ -332,7 +358,7 @@ class DesktopPorts(
             val s = strings()
             val chosen = host.chooseFiles(s["chooser.files"], s["chooser.send"])
             if (chosen.isEmpty()) return@launch
-            val items = withContext(io) { SendItems.expand(chosen) }
+            val items = runInterruptible(io) { SendItems.expand(chosen) }
             onFilesChosen(PortMappers.pickedItems(items.files))
         }
     }

@@ -1,5 +1,6 @@
 package com.constrivo.drop.platform.desktop.node
 
+import com.constrivo.drop.core.crypto.handshake.HandshakeResult
 import com.constrivo.drop.core.data.DropData
 import com.constrivo.drop.core.data.TransferFileStatus
 import com.constrivo.drop.core.data.TransferOutcome
@@ -22,7 +23,6 @@ import com.constrivo.drop.core.transfer.engine.FileStatus
 import com.constrivo.drop.core.transfer.engine.Transfer
 import com.constrivo.drop.core.transfer.engine.TransferProgress
 import com.constrivo.drop.core.transfer.session.Endpoint
-import com.constrivo.drop.core.transfer.session.SecureSession
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -45,6 +45,11 @@ import com.constrivo.drop.core.data.WifiBand as StoredBand
  * and its History row (architecture §12 `transfer`, F‑G2): status as the reducer persists it, bytes at most every
  * [progressPersistMillis], the link and band, the hints, and the outcome at the end. Everything written to the
  * database goes through one coroutine per transfer, in order, and failures are reported, never thrown at the engine.
+ *
+ * A transfer may take several engine runs ([Attempt]s): a link that drops is followed by a new session on which the
+ * sender offers the same transfer again and the receiver resumes it (S8, T‑07). The tracker follows one attempt at a
+ * time ([attach], [detach]) and keeps what spans them: the History row, the time spent streaming, the hints, whether
+ * the user accepted, and the sender's pairing code, which outlives the transfer until the user answers it (F‑B3).
  */
 internal class TransferTracker(
     val id: TransferId,
@@ -65,13 +70,14 @@ internal class TransferTracker(
     private var writer: Job? = null
     private var mapper: Job? = null
 
+    /** The engine run this tracker follows now; null between attempts. */
     @Volatile
-    var transfer: Transfer? = null
+    var attempt: Attempt? = null
         private set
 
-    @Volatile
-    var bridge: LadderTransferBridge? = null
-        private set
+    val transfer: Transfer? get() = attempt?.transfer
+
+    val bridge: LadderTransferBridge? get() = attempt?.bridge
 
     /** Whether History has a row for this transfer (created by [recordCreated]). */
     @Volatile
@@ -81,24 +87,48 @@ internal class TransferTracker(
     @Volatile
     private var keepAwake: Releasable? = null
 
-    /** The peer's verified identity key, once the handshake ran. */
+    val isAwake: Boolean get() = keepAwake != null
+
+    /** The peer's verified identity key, once a handshake ran (or, for a send restored after a restart, from History). */
     @Volatile
     var peerIdentity: ByteArray? = null
 
-    /** The session the transfer started on (its handshake result holds the SAS and the recognition secret). */
-    @Volatile
-    var session: SecureSession? = null
-
-    /** Sender: the LAN endpoints the peer was reached at (reconnects try them first, N3). */
+    /** Sender: the LAN endpoints the peer was reached at (a new session tries them first). */
     @Volatile
     var endpoints: List<Endpoint> = emptyList()
 
-    /** Sender: this side's user confirmed the SAS during this transfer (the trust exchange follows it, S3). */
+    /** Sender: what to offer again after an interruption. */
     @Volatile
-    var pairedHere: Boolean = false
+    var sendSpec: SendSpec? = null
 
-    // Confined to the mapper coroutine.
-    private var everAccepted = false
+    /** Receiver: the store every attempt of this transfer writes to. */
+    @Volatile
+    var store: ReceiveStore? = null
+
+    /** Sender: the first session's handshake, while its code waits for the user ([pairingCode]). */
+    @Volatile
+    var pairingResult: HandshakeResult? = null
+
+    /** The local user cancelled while no attempt ran (the sender's reconnect loop ends). */
+    @Volatile
+    var cancelRequested: Boolean = false
+
+    /** Bumped to wake the sender's reconnect loop (a cancel, a new sighting). */
+    val wake = MutableStateFlow(0)
+
+    /** The transfer was accepted in this process (by the user, auto-accept, or a resume of an accepted transfer). */
+    @Volatile
+    var everAccepted: Boolean = false
+        private set
+
+    @Volatile
+    private var finished = false
+
+    /** The tracker reached its end ([finish], [abort] or [abandon]); a later offer of the same id is not a resume. */
+    val isFinished: Boolean get() = finished
+
+    // Touched only by the mapper coroutine, or by [detach] and [finish] after it stopped.
+    private var resuming = false
     private var streamingSince: Long? = null
     private var activeMillis = 0L
     private val hintsSeen = LinkedHashSet<HintCode>()
@@ -123,20 +153,29 @@ internal class TransferTracker(
             }
     }
 
-    /** Updates what the UI shows before the engine runs (dialling, a failure to connect). */
+    /** Updates what the UI shows outside an attempt (dialling, reconnecting, a failure to connect). */
     fun update(change: (NodeTransfer) -> NodeTransfer) = mutableState.update(change)
 
-    /** The sender's SAS while the pairing is not confirmed (F‑B3); null hides it. */
+    /** The sender's SAS while the pairing is not answered (F‑B3); null hides it. It stays after the transfer ends. */
     fun setPairingCode(code: String?) {
         pairing.value = code
+        if (code == null) pairingResult = null
         mutableState.update { it.copy(pairingCode = code) }
     }
 
     val pairingCode: String? get() = pairing.value
 
+    /** Emits the pairing code as it changes (the finished-transfer retention waits for it to be answered). */
+    val pairingState: StateFlow<String?> = pairing.asStateFlow()
+
     /** The History row exists (created by the node on the `Offer`). */
     fun recordCreated() {
         hasRow = true
+    }
+
+    /** Marks the transfer accepted in this process (a later offer of it resumes without a card). */
+    fun markAccepted() {
+        everAccepted = true
     }
 
     /** Holds a keep-awake request until the transfer ends (architecture §9). */
@@ -147,30 +186,43 @@ internal class TransferTracker(
 
     /** The reducer asked to persist [state] (called in the engine's actor: queue only). */
     fun onPersist(state: TransferState) {
-        if (!hasRow || state.phase.isTerminal) return
+        if (!hasRow || state.phase.isTerminal || finished) return
         val status = TransferStatus.of(state.phase)
         writes.trySend { data.transfers.updateStatus(id, status) }
     }
 
     /**
-     * Follows [transfer] (and [bridge]'s ladder) until it ends, mapping every change to [state] and History.
-     * [localCaps] and [peerCaps] feed the hint rules when no ladder state exists yet.
+     * Follows [attempt] (its transfer and its ladder) until it ends or is [detach]ed, mapping every change to [state]
+     * and History. [localCaps] and [peerCaps] feed the hint rules when no ladder state exists yet. [resumed] marks an
+     * attempt that offers or answers an interrupted transfer again: until it is accepted it shows as reconnecting, with
+     * the bytes that already arrived.
      */
     @OptIn(ExperimentalCoroutinesApi::class)
     fun attach(
-        transfer: Transfer,
-        bridge: LadderTransferBridge?,
+        attempt: Attempt,
         localCaps: Capabilities,
         peerCaps: Capabilities,
+        resumed: Boolean,
     ) {
-        this.transfer = transfer
-        this.bridge = bridge
-        val ladder = bridge?.runner?.flatMapLatest { runner -> runner?.state ?: flowOf(null) } ?: flowOf(null)
+        check(mapper == null) { "detach the previous attempt first" }
+        this.attempt = attempt
+        resuming = resumed
+        val transfer = attempt.transfer
+        val ladder = attempt.bridge?.runner?.flatMapLatest { runner -> runner?.state ?: flowOf(null) } ?: flowOf(null)
         mapper =
             scope.launch {
                 combine(transfer.progress, transfer.state, ladder, pairing) { p, s, l, code -> Snapshot(p, s, l, code) }
                     .collect { snap -> onSnapshot(snap, transfer, localCaps, peerCaps) }
             }
+    }
+
+    /** Stops following the current attempt (it is being retired); the tracker keeps its state for the next one. */
+    suspend fun detach() {
+        mapper?.cancelAndJoin()
+        mapper = null
+        attempt = null
+        streamingSince?.let { activeMillis += monotonicClock.elapsedMillis() - it }
+        streamingSince = null
     }
 
     private class Snapshot(
@@ -187,7 +239,10 @@ internal class TransferTracker(
         peerCaps: Capabilities,
     ) {
         val p = snap.progress
-        if (snap.state.acceptedAtMillis != null) everAccepted = true
+        if (snap.state.acceptedAtMillis != null) {
+            everAccepted = true
+            resuming = false
+        }
         val now = monotonicClock.elapsedMillis()
         val streaming = p.phase == TransferPhase.STREAMING_BLUETOOTH || p.phase == TransferPhase.STREAMING_WIFI
         if (streaming && streamingSince == null) streamingSince = now
@@ -212,23 +267,26 @@ internal class TransferTracker(
                     HintInputs(linkKind = p.linkKind, freqMhz = p.freqMhz, local = localCaps, peer = peerCaps, bundledFiles = bundled),
                 )
             }
-        val stage = NodeStage.of(p.phase, p.declineReason, p.cancelReason, everAccepted)
+        var stage = NodeStage.of(p.phase, p.declineReason, p.cancelReason, everAccepted)
+        // A transfer offered again after a drop is still the one the user accepted: it reconnects, it does not wait.
+        val waitingAgain = resuming && everAccepted && stage == NodeStage.AWAITING_ACCEPT
+        if (waitingAgain) stage = NodeStage.RECONNECTING
         mutableState.update {
             it.copy(
                 stage = stage,
                 peerName = p.peerName.ifEmpty { it.peerName },
                 fileCount = p.fileCount,
                 bytesTotal = p.bytesTotal,
-                bytesDone = p.bytesDone,
+                bytesDone = if (waitingAgain) maxOf(it.bytesDone, p.bytesDone) else p.bytesDone,
                 bytesPerSecond = p.bytesPerSecond.takeIf { v -> v > 0 }?.toLong(),
                 etaMillis = p.etaMillis,
                 badge = badge,
                 hint = hint,
-                pairingCode = snap.pairingCode.takeIf { !stage.isFinal },
+                pairingCode = snap.pairingCode,
                 failure = p.failure,
             )
         }
-        persistProgress(p, now)
+        if (!waitingAgain) persistProgress(p, now)
     }
 
     private fun persistProgress(
@@ -257,20 +315,27 @@ internal class TransferTracker(
         }
     }
 
+    /** Between attempts (S8): the link dropped and the transfer waits for its next session. */
+    fun markInterrupted(stage: NodeStage = NodeStage.RECONNECTING) {
+        mutableState.update { it.copy(stage = stage, bytesPerSecond = null, etaMillis = null) }
+    }
+
     /**
      * The transfer ended with [final]: files are reconciled with the engine's last word (the sender marks what the
      * receiver confirmed; the receiver's store already wrote its files, anything missing is written now), the row is
-     * finished with the outcome (F‑G2, F‑G4), and the keep-awake request is released. Suspends until History is
-     * written.
+     * finished with the outcome (F‑G2, F‑G4), and the keep-awake request is released. The sender's pairing code stays
+     * until the user answers it. Suspends until History is written.
      */
     suspend fun finish(
         final: TransferProgress,
         finalState: TransferState?,
         folder: Path?,
     ) {
+        finished = true
         keepAwake?.release()
         keepAwake = null
         mapper?.cancelAndJoin()
+        mapper = null
         val now = monotonicClock.elapsedMillis()
         streamingSince?.let { activeMillis += now - it }
         streamingSince = null
@@ -282,7 +347,7 @@ internal class TransferTracker(
                 bytesDone = final.bytesDone,
                 bytesPerSecond = null,
                 etaMillis = null,
-                pairingCode = null,
+                pairingCode = pairing.value,
                 failure = final.failure,
                 folder = folder,
             )
@@ -300,8 +365,8 @@ internal class TransferTracker(
             TransferOutcome(
                 status = status,
                 bytesDone = final.bytesDone,
-                transport = final.linkKind,
-                band = StoredBand.fromFrequencyMhz(final.freqMhz),
+                transport = final.linkKind ?: lastLink,
+                band = StoredBand.fromFrequencyMhz(if (final.linkKind != null) final.freqMhz else lastFreq),
                 avgSpeedBytesPerSecond = average,
                 hints = hintsSeen.toList(),
                 failedFiles = failed.coerceAtMost(final.fileCount),
@@ -310,6 +375,42 @@ internal class TransferTracker(
             reconcileFiles(doneFiles)
             data.transfers.finish(id, outcome)
         }
+        writes.close()
+        writer?.join()
+    }
+
+    /**
+     * The transfer ended between attempts ([stage]: the user cancelled it, or the peer never came back, S8): History
+     * is finished with what arrived so far. Suspends until History is written.
+     */
+    suspend fun abort(
+        stage: NodeStage,
+        failure: String?,
+    ) {
+        finished = true
+        keepAwake?.release()
+        keepAwake = null
+        mapper?.cancelAndJoin()
+        mapper = null
+        mutableState.update { it.copy(stage = stage, bytesPerSecond = null, etaMillis = null, failure = failure) }
+        if (!hasRow) {
+            writes.close()
+            writer?.join()
+            return
+        }
+        val status = if (stage == NodeStage.FAILED) TransferStatus.FAILED else TransferStatus.CANCELLED
+        val bytes = state.value.bytesDone
+        val average = if (activeMillis > 0 && bytes > 0) bytes * 1000 / activeMillis else null
+        val outcome =
+            TransferOutcome(
+                status = status,
+                bytesDone = bytes,
+                transport = lastLink,
+                band = StoredBand.fromFrequencyMhz(lastFreq),
+                avgSpeedBytesPerSecond = average,
+                hints = hintsSeen.toList(),
+            )
+        writes.trySend { data.transfers.finish(id, outcome) }
         writes.close()
         writer?.join()
     }
@@ -351,6 +452,7 @@ internal class TransferTracker(
 
     /** Cancels the mapping and the writer without writing anything more (the node is shutting down). */
     fun abandon() {
+        finished = true
         keepAwake?.release()
         keepAwake = null
         mapper?.cancel()

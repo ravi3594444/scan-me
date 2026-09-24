@@ -12,8 +12,8 @@ import java.nio.file.Paths
  *
  * | | Linux (XDG) | Windows | macOS |
  * | --- | --- | --- | --- |
- * | [config] (secrets, window placement) | `$XDG_CONFIG_HOME/drop` or `~/.config/drop` | `%APPDATA%\Drop` | `~/Library/Application Support/Drop` |
- * | [data] (database, partial files) | `$XDG_DATA_HOME/drop` or `~/.local/share/drop` | `%LOCALAPPDATA%\Drop` | `~/Library/Application Support/Drop` |
+ * | [config] (window placement) | `$XDG_CONFIG_HOME/drop` or `~/.config/drop` | `%APPDATA%\Drop` | `~/Library/Application Support/Drop` |
+ * | [data] (database, partial files, [secrets], [instanceLock]) | `$XDG_DATA_HOME/drop` or `~/.local/share/drop` | `%LOCALAPPDATA%\Drop` | `~/Library/Application Support/Drop` |
  * | [cache] | `$XDG_CACHE_HOME/drop` or `~/.cache/drop` | `%LOCALAPPDATA%\Drop\Cache` | `~/Library/Caches/com.constrivo.drop` |
  * | [received] | `~/Received/Drop` | `%USERPROFILE%\Received\Drop` | `~/Received/Drop` |
  *
@@ -21,6 +21,11 @@ import java.nio.file.Paths
  * relative are ignored, as the XDG Base Directory specification requires; a missing `%APPDATA%` or `%LOCALAPPDATA%`
  * falls back to its usual place under the profile. [received] is the default Received folder; the user's choice
  * (Settings "Save location", `SettingKeys.SAVE_LOCATION`) overrides it through [receivedFolder].
+ *
+ * Everything that belongs to this one machine lives under [data], never under [config]: a roaming Windows profile
+ * copies `%APPDATA%` to every PC the user signs in to, and dotfile setups sync `~/.config`, which would give two
+ * machines one identity key (F‑B4, architecture §10.1: identity keys and pairings belong to one device). Only portable
+ * preferences (the window placement) go to [config].
  *
  * Received files of a drop with more than 20 files go into a per-drop subfolder (design §9); the file store does that
  * (`DirectoryFileStore.DEFAULT_SUBFOLDER_THRESHOLD`).
@@ -37,8 +42,11 @@ data class AppDirectories(
     /** App-private partial files, `<transfer_id>/<file_index>.part` (architecture §7.6). */
     val partials: Path get() = data.resolve(PARTIALS_DIR)
 
-    /** [FileSecretStorage]'s directory: identity seed, advertising secret, database key (N11). */
-    val secrets: Path get() = config.resolve(SECRETS_DIR)
+    /**
+     * [FileSecretStorage]'s directory: identity seed, advertising secret, database key (N11). Under [data], so it never
+     * roams or syncs to another machine.
+     */
+    val secrets: Path get() = data.resolve(SECRETS_DIR)
 
     /** The single-instance lock and its activation port (architecture §10.2: single instance guard). */
     val instanceLock: Path get() = data.resolve(INSTANCE_LOCK_FILE)
