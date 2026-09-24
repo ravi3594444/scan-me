@@ -27,7 +27,7 @@ androidx-camera = "1.6.2"
 androidx-test-runner = "1.7.0"
 androidx-test-ext-junit = "1.3.0"
 compileSdk = "37"
-targetSdk = "37"
+targetSdk = "36"  # 37 needs the ACCESS_LOCAL_NETWORK runtime flow first (Android 17 local network permission)
 minSdk = "31"
 jvmTarget = "17"
 
