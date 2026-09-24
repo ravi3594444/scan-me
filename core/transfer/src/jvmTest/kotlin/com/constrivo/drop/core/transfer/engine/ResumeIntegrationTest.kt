@@ -3,9 +3,15 @@ package com.constrivo.drop.core.transfer.engine
 import com.constrivo.drop.core.protocol.LinkKind
 import com.constrivo.drop.core.protocol.ProtocolConstants
 import com.constrivo.drop.core.protocol.TransferPhase
+import com.constrivo.drop.core.protocol.TransferTimeouts
+import com.constrivo.drop.core.transfer.DropInfo
+import com.constrivo.drop.core.transfer.FileStore
 import com.constrivo.drop.core.transfer.MemorySource
+import com.constrivo.drop.core.transfer.PartialFile
+import com.constrivo.drop.core.transfer.PublishedFile
 import com.constrivo.drop.core.transfer.TestSupport
 import com.constrivo.drop.core.transfer.receive.InMemoryResumeStore
+import com.constrivo.drop.core.transfer.store.DirectoryFileStore
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
@@ -71,7 +77,124 @@ class ResumeIntegrationTest {
         }
 
     @Test
-    fun `T-07 an app kill keeps the resume data, a restart re-verifies the partials and completes`() =
+    fun `N3 a stored transfer resumes only with the peer that started it`() =
+        runBlocking<Unit> {
+            val resume = InMemoryResumeStore()
+            EnginePair(primaryKind = LinkKind.LAN, primaryBytesPerSecond = 8L * mib, resumeStore = resume).use { pair ->
+                val files = files()
+                val id: com.constrivo.drop.core.protocol.TransferId
+                withTimeout(60_000) {
+                    val (sending, receiving) = pair.start(files)
+                    id = sending.transferId
+                    receiving.progress.first { it.bytesDone >= 6L * mib }
+                    delay(300)
+                    pair.killEngines()
+                }
+                assertNotNull(resume.load(id))
+                withTimeout(30_000) {
+                    // Another device that learnt the transfer id offers the same files: it must not continue them.
+                    val stranger = TestSupport.sessionConfig("Stranger")
+                    val (a, b) = TestSupport.handshake(stranger, pair.receiverConfig, pair.newPrimary())
+                    TransferEngine(pair.engineConfig(stranger, pair.senderStore), pair.scope).send(a, files, SendOptions(transferId = id))
+                    val incoming = pair.scope.async { pair.receiverEngine.receive(b) }.await()
+                    assertTrue(!incoming.isResume, "a record made with another peer is not a resume")
+                    // The real sender, on a fresh handshake, still resumes.
+                    val (c, d) = pair.connect()
+                    pair.senderEngine.send(c, files, SendOptions(transferId = id))
+                    val again = pair.scope.async { pair.receiverEngine.receive(d) }.await()
+                    assertTrue(again.isResume, "the peer that started it resumes")
+                }
+            }
+        }
+
+    /** A receiver store whose partial reads take [readDelayMillis] each while [slow] is set (a removable card). */
+    private class SlowReadStore(
+        private val delegate: DirectoryFileStore,
+        private val readDelayMillis: Long,
+    ) : FileStore by delegate {
+        @Volatile
+        var slow = true
+
+        override suspend fun openPartial(
+            transferId: String,
+            fileIndex: Int,
+            expectedSize: Long,
+        ): PartialFile {
+            val inner = delegate.openPartial(transferId, fileIndex, expectedSize)
+            return object : PartialFile by inner {
+                override suspend fun read(
+                    position: Long,
+                    buffer: ByteArray,
+                    offset: Int,
+                    length: Int,
+                ): Int {
+                    if (slow) delay(readDelayMillis)
+                    return inner.read(position, buffer, offset, length)
+                }
+            }
+        }
+
+        override suspend fun publish(
+            partial: PartialFile,
+            name: String,
+            mimeType: String?,
+            drop: DropInfo,
+        ): PublishedFile = delegate.publish(partial, name, mimeType, drop)
+    }
+
+    @Test
+    fun `T-07 re-reading gigabytes of partials does not hold the Accept past the offer window`() =
+        runBlocking<Unit> {
+            val resume = InMemoryResumeStore()
+            var slowStore: SlowReadStore? = null
+            // A 3 s offer window and 300 ms per 256 KiB read: re-hashing the stored units before the Accept would need
+            // well over 10 s (the old behaviour), so the sender would give up with `timeout`.
+            EnginePair(
+                primaryKind = LinkKind.LAN,
+                primaryBytesPerSecond = 8L * mib,
+                resumeStore = resume,
+                timeouts = TransferTimeouts(offerMillis = 3_000),
+                receiverStore = { dir ->
+                    SlowReadStore(DirectoryFileStore(dir.resolve("partials"), dir.resolve("received")), 300).also {
+                        it.slow = false
+                        slowStore = it
+                    }
+                },
+            ).use { pair ->
+                val files = files()
+                val id: com.constrivo.drop.core.protocol.TransferId
+                withTimeout(60_000) {
+                    val (sending, receiving) = pair.start(files)
+                    id = sending.transferId
+                    receiving.progress.first { it.bytesDone >= 10L * mib }
+                    delay(400)
+                    pair.killEngines()
+                }
+                val stored = assertNotNull(resume.load(id)).manifests.values.sumOf { it.receivedCount }
+                assertTrue(stored >= 2, "units stored before the kill: $stored")
+                withTimeout(60_000) {
+                    val store = assertNotNull(slowStore)
+                    store.slow = true
+                    val (a, b) = pair.connect()
+                    val sending = pair.senderEngine.send(a, files, SendOptions(transferId = id))
+                    val incoming = pair.scope.async { pair.receiverEngine.receive(b) }.await()
+                    assertTrue(incoming.isResume)
+                    val started = System.nanoTime()
+                    incoming.accept()
+                    assertNotNull(sending.accept.first { it != null }, "the Accept arrived")
+                    val millis = (System.nanoTime() - started) / 1_000_000
+                    assertTrue(millis < 3_000, "the Accept took $millis ms")
+                    store.slow = false
+                    assertEquals(TransferPhase.DONE, sending.await().phase)
+                }
+                for (file in files) {
+                    assertEquals(TestSupport.sha256(file.bytes), TestSupport.sha256(pair.receivedFile(file.name)), file.name)
+                }
+            }
+        }
+
+    @Test
+    fun `T-07 an app kill keeps the resume data, a restart re-verifies the partials in the background and completes`() =
         runBlocking<Unit> {
             val resume = InMemoryResumeStore()
             EnginePair(primaryKind = LinkKind.LAN, primaryBytesPerSecond = 8L * mib, resumeStore = resume).use { pair ->
@@ -119,15 +242,15 @@ class ResumeIntegrationTest {
                             true,
                         )
                     val requested = layout.expand(missing).map { it.unit }.toSet()
-                    assertTrue(
-                        com.constrivo.drop.core.protocol.TransferUnit(video, bad) in requested,
-                        "the damaged unit is requested again",
-                    )
+                    // The Accept goes out after a length check only (within the 30 s offer window); the re-hash runs
+                    // while the rest streams and asks for the damaged unit with a Retransmit.
                     assertTrue(requested.size < layout.totalUnits, "units that survived are not requested")
                     val sent = sending.await()
                     val received = receiving.await()
                     assertEquals(TransferPhase.DONE, sent.phase, "sender: $sent")
                     assertEquals(TransferPhase.DONE, received.phase, "receiver: $received")
+                    assertEquals(1, receiving.stats.resumeDamagedUnits, "the re-hash found the damaged unit")
+                    assertEquals(0, receiving.stats.fileHashMismatches, "it was requested before any whole-file check")
                     val total = files.sumOf { it.size }
                     assertTrue(
                         sending.stats.fileBytesSent < total,

@@ -4,9 +4,11 @@ import com.constrivo.drop.core.crypto.CryptoProvider
 import com.constrivo.drop.core.protocol.DataChannel
 import com.constrivo.drop.core.protocol.InMemoryDataChannel
 import com.constrivo.drop.core.protocol.LinkKind
+import com.constrivo.drop.core.protocol.TransferTimeouts
 import com.constrivo.drop.core.transfer.FaultyChannel
 import com.constrivo.drop.core.transfer.FileStore
 import com.constrivo.drop.core.transfer.PowerPolicy
+import com.constrivo.drop.core.transfer.SilentChannel
 import com.constrivo.drop.core.transfer.SourceFile
 import com.constrivo.drop.core.transfer.StallableChannel
 import com.constrivo.drop.core.transfer.TestSupport
@@ -49,13 +51,16 @@ internal class EnginePair(
     val reverifyOnResume: Boolean = true,
     val senderPower: PowerPolicy? = null,
     val receiverPower: PowerPolicy? = null,
+    val timeouts: TransferTimeouts = TransferTimeouts(),
+    senderStore: ((Path) -> DirectoryFileStore)? = null,
 ) : AutoCloseable {
     val dir: Path = TestSupport.tempDir("pair")
     val senderConfig: SessionConfig = TestSupport.sessionConfig("Sender", provider = crypto)
     val receiverConfig: SessionConfig = TestSupport.sessionConfig("Receiver", provider = crypto)
     val directoryStore = DirectoryFileStore(dir.resolve("partials"), dir.resolve("received"), io = io)
     val receiverStore: FileStore = receiverStore?.invoke(dir) ?: directoryStore
-    val senderStore = DirectoryFileStore(dir.resolve("sender-partials"), dir.resolve("sender-unused"), io = io)
+    val senderStore =
+        senderStore?.invoke(dir) ?: DirectoryFileStore(dir.resolve("sender-partials"), dir.resolve("sender-unused"), io = io)
     val received: Path get() = dir.resolve("received")
 
     /** Scope of the current engines; [killEngines] cancels it (a simulated app kill). */
@@ -88,6 +93,7 @@ internal class EnginePair(
             debug = debug,
             lingerMillis = lingerMillis,
             reverifyOnResume = reverifyOnResume,
+            timeouts = timeouts,
         )
 
     val senderEngine: TransferEngine get() = TransferEngine(engineConfig(senderConfig, senderStore, senderPower), scope)
@@ -194,6 +200,34 @@ internal class EnginePair(
         coroutineScope {
             launch { sender.connectLink(host, use) }
             launch { receiver.connectLink(join, use) }
+        }
+        return all
+    }
+
+    /** Like [attachMemory], with every channel able to go silent ([SilentChannel.stall]) without closing. */
+    suspend fun attachStallable(
+        sender: Transfer,
+        receiver: Transfer,
+        generation: Int,
+        kind: LinkKind = LinkKind.P2P,
+        bytesPerSecond: Long? = null,
+    ): List<SilentChannel> {
+        val pending = Channel<DataChannel>(Channel.UNLIMITED)
+        val all = java.util.Collections.synchronizedList(ArrayList<SilentChannel>())
+        val host = DataLink(kind, generation, DataLinkRole.ACCEPT) { pending.receive() }
+        val join =
+            DataLink(kind, generation, DataLinkRole.CONNECT) {
+                val (x, y) = InMemoryDataChannel.pair(kind, capacitySegments = 128)
+                val a = SilentChannel(if (bytesPerSecond != null) FaultyChannel(x, bytesPerSecond) else x)
+                val b = SilentChannel(if (bytesPerSecond != null) FaultyChannel(y, bytesPerSecond) else y)
+                all += a
+                all += b
+                pending.send(b)
+                a
+            }
+        coroutineScope {
+            launch { sender.connectLink(host) }
+            launch { receiver.connectLink(join) }
         }
         return all
     }

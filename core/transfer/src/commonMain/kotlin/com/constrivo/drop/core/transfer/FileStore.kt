@@ -27,6 +27,11 @@ interface SourceFile {
         length: Int,
     ): Int
 
+    /**
+     * Releases the file handle. The engine closes a source once its file is sent and acknowledged, and all of them when
+     * the transfer ends or parks; a later [read] (a retransmit, a resume) must open it again, and a close must not break
+     * a read that is in progress.
+     */
     suspend fun close()
 }
 
@@ -53,7 +58,10 @@ interface PartialFile {
     /** Current length of the partial in bytes (resume: a unit whose bytes lie beyond it is not on disk). */
     suspend fun length(): Long
 
-    /** Makes every byte written so far durable (`fsync`); the resume manifest marks units only after this (N5). */
+    /**
+     * Makes every byte written so far durable (`fsync`); the resume manifest marks units only after this (N5). Throws
+     * when it cannot, including on a closed handle.
+     */
     suspend fun sync()
 
     /** Closes the handle; the partial stays on disk. Idempotent. */

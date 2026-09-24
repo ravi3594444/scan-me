@@ -6,9 +6,16 @@ import com.constrivo.drop.core.protocol.ProtocolConstants
 import com.constrivo.drop.core.protocol.TransferPhase
 import com.constrivo.drop.core.transfer.MemorySource
 import com.constrivo.drop.core.transfer.TestSupport
+import com.constrivo.drop.core.transfer.net.TcpDataChannel
+import com.constrivo.drop.core.transfer.net.TcpListener
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import java.net.InetSocketAddress
+import java.nio.ByteBuffer
+import java.nio.channels.SocketChannel
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -99,6 +106,47 @@ class LinkLossIntegrationTest {
                     assertEquals(TransferPhase.DONE, sending.await().phase)
                     assertEquals(TransferPhase.DONE, receiving.await().phase)
                     assertEquals(files.sumOf { it.size }, sending.stats.fileBytesSent)
+                }
+                assertEquals(TestSupport.sha256(files[0].bytes), TestSupport.sha256(pair.receivedFile("a.bin")))
+            }
+        }
+
+    @Test
+    fun `idle and garbage connections to the host's port neither block the link nor use up its accept loop`() =
+        runBlocking<Unit> {
+            EnginePair(primaryKind = LinkKind.BLUETOOTH, primaryBytesPerSecond = 50_000).use { pair ->
+                val files = listOf(MemorySource("a.bin", TestSupport.randomBytes(20 * mib + 5, 104)))
+                withTimeout(60_000) {
+                    val (sending, receiving) = pair.start(files)
+                    val listener = TcpListener(kind = LinkKind.LAN)
+                    val strangers = ArrayList<SocketChannel>()
+                    try {
+                        // Before the joiner: two peers that connect and say nothing, and eight port scans that send
+                        // garbage or nothing and hang up (more than the accept loop's failure limit).
+                        repeat(2) { strangers += SocketChannel.open(InetSocketAddress("127.0.0.1", listener.port)) }
+                        repeat(8) { i ->
+                            SocketChannel.open(InetSocketAddress("127.0.0.1", listener.port)).use { scan ->
+                                if (i % 2 == 0) scan.write(ByteBuffer.wrap(TestSupport.randomBytes(64, 200L + i)))
+                            }
+                        }
+                        val host = DataLink(LinkKind.LAN, 0, DataLinkRole.ACCEPT) { listener.accept() }
+                        val join =
+                            DataLink(LinkKind.LAN, 0, DataLinkRole.CONNECT) {
+                                TcpDataChannel.connect("127.0.0.1", listener.port, LinkKind.LAN)
+                            }
+                        coroutineScope {
+                            launch { sending.connectLink(host) }
+                            launch { receiving.connectLink(join) }
+                        }
+                        // The data streams that follow the control stream get through too.
+                        receiving.progress.first { it.streams >= 4 || it.isTerminal }
+                        assertEquals(TransferPhase.DONE, sending.await().phase)
+                        assertEquals(TransferPhase.DONE, receiving.await().phase)
+                        assertEquals(LinkKind.LAN, receiving.progress.value.linkKind)
+                    } finally {
+                        strangers.forEach { runCatching { it.close() } }
+                        listener.close()
+                    }
                 }
                 assertEquals(TestSupport.sha256(files[0].bytes), TestSupport.sha256(pair.receivedFile("a.bin")))
             }

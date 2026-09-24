@@ -34,6 +34,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.concurrent.Volatile
 
 /**
@@ -48,10 +49,18 @@ import kotlin.concurrent.Volatile
  *   (at most [ProtocolConstants.STREAM_WINDOW] unacknowledged per stream: work stealing over one shared queue, §7.4), on
  *   at most the policy's number of streams. Without a Wi-Fi link the primary connection carries data: on Bluetooth in
  *   16 KiB blocks with one block in flight, each acknowledged (the head start, S1), on a LAN primary in whole units.
+ * - **Head start before the list (F-E5).** On a Bluetooth primary the first block goes out right after `Accept`, before
+ *   the `FileList` pages, which follow it interleaved with the next blocks; the receiver keeps early blocks in memory
+ *   until the list is complete. Wi-Fi streams and a LAN primary start only once every page is written, so a chunk frame
+ *   never overtakes the pages the receiver needs to place it.
  * - **Hop.** When a Wi-Fi link is taken into use the Bluetooth stream finishes its in-flight block, waits for its ack, and
- *   puts the rest of its unit at the front of the queue from the first unacknowledged byte, so no byte is sent twice.
+ *   puts the rest of its unit at the front of the queue from the first unacknowledged byte, so no byte is sent twice. The
+ *   release of the unit and the requeue happen in one critical section (the producer drops a queued copy of a unit that
+ *   is still held). A `Resume` or `Retransmit` that names the held unit tells the Bluetooth stream where to continue,
+ *   which also recovers a lost block ack.
  * - **Acks and FileDone.** Acks retire units; `FileDone` goes out once a file's last unit is written and its SHA-256 is
- *   known; `AllChunksAcked` is raised when every unit is acknowledged and every `FileDone` is out.
+ *   known; `AllChunksAcked` is raised when every unit is acknowledged and every `FileDone` is out. A file whose units are
+ *   all acknowledged and whose `FileDone` is out has its source closed (a later retransmit reopens it).
  */
 internal class SendSide(
     private val run: TransferRun,
@@ -83,6 +92,9 @@ internal class SendSide(
     private var btBlock: BtBlock? = null
     private var btUnit: Long = -1
 
+    /** Where a `Resume` or `Retransmit` wants the unit the Bluetooth stream holds from next, or -1. */
+    private var btResumeFrom: Int = -1
+
     // ---- per-file state, under [lock] ----
     private val sha = arrayOfNulls<Sha256Digest>(fileCount)
     private val needsDone = BooleanArray(fileCount)
@@ -90,6 +102,10 @@ internal class SendSide(
     private val pendingSend = IntArray(fileCount)
     private val hashPassRequested = BooleanArray(fileCount)
     private val hashPasses = Channel<Int>(Channel.UNLIMITED)
+
+    /** Units carrying each file that are not acknowledged; its source closes at 0 once its `FileDone` is out. */
+    private val unackedUnits = IntArray(fileCount) { f -> if (layout.bundlePlan.isBundled(f)) 1 else layout.unitCount(f) }
+    private val sourceClosed = BooleanArray(fileCount)
 
     // ---- scheduling, under [lock] ----
     private val workers = HashMap<Conn, Worker>()
@@ -100,6 +116,10 @@ internal class SendSide(
     private var awaitingResume = false
     private var fileListConfirmed = false
     private var listWritten = false
+    private var listRound = 0
+
+    /** Completed by the first Bluetooth block while the `FileList` waits for it (the head start, F-E5). */
+    private var firstBlock: CompletableDeferred<Unit>? = null
     private var allAckedPosted = false
     private var producerJob: Job? = null
     private var hashJob: Job? = null
@@ -148,10 +168,15 @@ internal class SendSide(
     }
 
     private class Worker(
-        val job: Job,
+        val conn: Conn,
     ) {
+        lateinit var job: Job
+
         @Volatile
         var stopRequested = false
+
+        /** A new primary worker waits for this one to finish (its block in flight) before it starts. */
+        var rescheduled = false
     }
 
     // =====================================================================================================
@@ -183,16 +208,31 @@ internal class SendSide(
     }
 
     /**
-     * Sends the `FileList` pages (N12) and starts the stream workers only once they are written: on a Bluetooth primary
-     * the pages and the head-start blocks share one connection, and the receiver cannot place a chunk before it knows
-     * the file list.
+     * Sends the `FileList` pages (N12). On a Bluetooth primary the head start begins first: the first block goes out
+     * before the pages (the receiver keeps early blocks in memory until its list is complete), so progress moves within a
+     * second of `Accept` however long the list is (F-E5). Wi-Fi streams and a LAN primary start only once every page was
+     * handed to its connection, so no chunk frame overtakes a page on a stream whose reader would wait for it.
      */
     private fun sendFileListThenSchedule() {
-        lock.withLock { listWritten = false }
-        for (page in plan.fileListPages) run.sendControl(page)
+        val (round, headStart) =
+            lock.withLock {
+                listWritten = false
+                listRound++
+                // Something is left to send (the producer may already hold the queue's only unit).
+                val bluetooth = run.primary.kind == LinkKind.BLUETOOTH && activeGeneration == null && ackedUnits < total
+                firstBlock = if (bluetooth) CompletableDeferred() else null
+                listRound to firstBlock
+            }
+        if (headStart != null) scheduleWorkers()
         run.scope.launch {
+            if (headStart != null) withTimeoutOrNull(FIRST_BLOCK_WAIT_MILLIS) { headStart.await() }
+            for (page in plan.fileListPages) run.sendControl(page)
             run.drainOutbox()
-            lock.withLock { listWritten = true }
+            lock.withLock {
+                if (listRound != round) return@launch
+                listWritten = true
+                firstBlock = null
+            }
             scheduleWorkers()
         }
     }
@@ -215,6 +255,13 @@ internal class SendSide(
             leftover.buffer.release()
         }
         ready.close()
+        withContext(NonCancellable) { for (source in plan.sources) runCatching { source.close() } }
+    }
+
+    /** Parked for up to 24 h (S8): give the free send buffers back and close every source (reads reopen them). */
+    fun onParked() {
+        pool.trim()
+        run.scope.launch(config.io) { withContext(NonCancellable) { for (source in plan.sources) runCatching { source.close() } } }
     }
 
     // =====================================================================================================
@@ -241,11 +288,23 @@ internal class SendSide(
             var g = 0L
             while (g < total) {
                 val unit = layout.unitAt(g)
-                val flying = inFlight[g]?.alive == true || btUnit == g
+                val held = btUnit == g
                 if (!listed[g]) {
                     inFlight.remove(g)?.window?.release()
                     if (!acked[g]) markAcked(g, unit, null, live = false)
-                } else if (!flying) {
+                    if (held) btBlock?.outcome?.complete(BlockOutcome.Acked)
+                } else if (held) {
+                    // The Bluetooth stream holds this unit: it continues from where the receiver says, which also
+                    // recovers a block ack that was lost with a control route; it puts the unit back if it lacks
+                    // those bytes.
+                    val from = offsets[g] ?: 0
+                    if (acked[g]) unack(g, unit)
+                    setCountedPrefix(g, unit, from)
+                    sentOnce.clear(g)
+                    btResumeFrom = from
+                    btBlock?.outcome?.complete(BlockOutcome.Resend(from))
+                } else if (inFlight[g]?.alive != true) {
+                    inFlight.remove(g) // a dead stream's entry: the unit is queued again below
                     if (acked[g]) unack(g, unit)
                     setCountedPrefix(g, unit, offsets[g] ?: 0)
                     sentOnce.clear(g)
@@ -254,9 +313,9 @@ internal class SendSide(
             }
             for (f in 0 until fileCount) pendingSend[f] = 0
             for ((unit, global) in entries) {
-                if (inFlight[global]?.alive == true || btUnit == global) continue
-                toQueue += unit to global
+                if (inFlight[global]?.alive == true) continue
                 for (f in filesOf(unit.unit)) pendingSend[f]++
+                if (btUnit != global) toQueue += unit to global
             }
             for (f in 0 until fileCount) {
                 val want = pendingSend[f] > 0 || isEmptyChunked(f)
@@ -274,7 +333,8 @@ internal class SendSide(
 
     fun onAck(ack: Ack) {
         lock.withLock {
-            fileListConfirmed = true
+            // Bluetooth blocks are acked before the receiver has the whole list (F-E5); a whole unit only after it.
+            if (ack.chunks.any { it.blockOffset == null }) fileListConfirmed = true
             for (ref in ack.chunks) {
                 val unit = ref.unit
                 if (!layout.contains(unit)) continue
@@ -330,6 +390,10 @@ internal class SendSide(
         addBytes(unit, before, layout.unitLength(unit), kind.takeIf { live })
         acked.set(g)
         ackedUnits++
+        for (f in filesOf(unit)) {
+            unackedUnits[f]--
+            maybeCloseSource(f)
+        }
     }
 
     private fun unack(
@@ -340,6 +404,18 @@ internal class SendSide(
         ackedUnits--
         addBytes(unit, layout.unitLength(unit), 0, null)
         countedPrefix.remove(g)
+        for (f in filesOf(unit)) {
+            unackedUnits[f]++
+            sourceClosed[f] = false
+        }
+    }
+
+    /** Closes file [f]'s source once all its units are acknowledged and its `FileDone` is out (caller holds the lock). */
+    private fun maybeCloseSource(f: Int) {
+        if (sourceClosed[f] || unackedUnits[f] > 0 || needsDone[f] || (hashPassRequested[f] && sha[f] == null)) return
+        sourceClosed[f] = true
+        val source = plan.sources[f]
+        run.scope.launch(config.io) { runCatching { source.close() } }
     }
 
     /** Counts bytes `0 until from` of a unit that is not acknowledged (the receiver holds them, S1). */
@@ -369,7 +445,8 @@ internal class SendSide(
         if (bytes == 0L) return
         bytesDone += bytes
         if (sign > 0 && kind != null) {
-            run.meter.add(bytes)
+            // Acked bytes drive the stream count (§7.4); the live speed counts bytes as they are written (F-F1).
+            run.policyMeter.add(bytes)
             ackedByKind[kind] = (ackedByKind[kind] ?: 0) + bytes
         }
         if (unit.isBundle) {
@@ -391,9 +468,11 @@ internal class SendSide(
         lock.withLock {
             for (resumeUnit in units) {
                 val g = layout.globalIndex(resumeUnit.unit)
-                val block = btBlock
-                if (btUnit == g && block != null) {
-                    block.outcome.complete(BlockOutcome.Resend(resumeUnit.fromOffset))
+                if (btUnit == g) {
+                    if (acked[g]) unack(g, resumeUnit.unit)
+                    setCountedPrefix(g, resumeUnit.unit, resumeUnit.fromOffset)
+                    btResumeFrom = resumeUnit.fromOffset
+                    btBlock?.outcome?.complete(BlockOutcome.Resend(resumeUnit.fromOffset))
                     continue
                 }
                 inFlight.remove(g)?.window?.release()
@@ -408,11 +487,13 @@ internal class SendSide(
     fun onResume(message: Resume) {
         val units = layout.expand(message.missing)
         build(units)
-        // Without any ack yet the receiver may not hold the whole file list: it restarts its list with every Resume.
+        // Until a whole unit was acked the receiver may not hold the whole file list, and a receiver without a list
+        // asks for everything: it restarts its list with every Resume, so the pages go again.
+        val everything = units.size.toLong() == total && units.all { it.fromOffset == 0 }
         val resend =
             lock.withLock {
                 awaitingResume = false
-                !fileListConfirmed
+                !fileListConfirmed || everything
             }
         if (resend) sendFileListThenSchedule() else scheduleWorkers()
         sendReadyFileDones()
@@ -521,6 +602,7 @@ internal class SendSide(
                 needsDone[f] = false
                 needsDoneCount--
                 out += FileDone(plan.transferId, f, digest)
+                maybeCloseSource(f)
             }
         }
         for (message in out) run.sendControl(message)
@@ -592,8 +674,11 @@ internal class SendSide(
                     run.call { run.reduce(TransferEvent.LocalCancel(CancelReason.SOURCE)) }
                     return
                 }
-            if (!item.priority) hashInStream(item, buffer.bytes, length, inStream)
-            val hash = config.chunkHasher.hash(buffer.bytes, ChunkHeader.SIZE, length)
+            val hash =
+                withContext(config.compute) {
+                    if (!item.priority) hashInStream(item, buffer.bytes, length, inStream)
+                    config.chunkHasher.hash(buffer.bytes, ChunkHeader.SIZE, length)
+                }
             ready.send(Prepared(item, buffer, length, hash))
         }
     }
@@ -656,8 +741,7 @@ internal class SendSide(
             requeueInFlight { it === conn }
             if (conn.isPrimary) {
                 btBlock?.outcome?.complete(BlockOutcome.Lost)
-                primaryWorker?.job?.cancel()
-                primaryWorker = null
+                primaryWorker?.let(::stopWorker)
             }
         }
         scheduleWorkers()
@@ -667,8 +751,7 @@ internal class SendSide(
         lock.withLock {
             workers.values.forEach { it.job.cancel() }
             workers.clear()
-            primaryWorker?.job?.cancel()
-            primaryWorker = null
+            primaryWorker?.let(::stopWorker)
             btBlock?.outcome?.complete(BlockOutcome.Lost)
             requeueInFlight { true }
             activeGeneration = null
@@ -694,9 +777,10 @@ internal class SendSide(
     /** Starts and stops workers so the link in use has one per stream up to the target, or the primary carries data. */
     fun scheduleWorkers() {
         lock.withLock {
-            if (!streaming || stopped || awaitingResume || !listWritten) return
+            if (!streaming || stopped || awaitingResume) return
+            val listed = listWritten
             val generation = activeGeneration
-            val wanted = if (generation != null) run.connectionsOf(generation).take(run.streamTarget.value) else emptyList()
+            val wanted = if (generation != null && listed) run.connectionsOf(generation).take(run.streamTarget.value) else emptyList()
             val iterator = workers.entries.iterator()
             while (iterator.hasNext()) {
                 val (conn, worker) = iterator.next()
@@ -712,30 +796,46 @@ internal class SendSide(
             }
             activeStreams = wanted.size
             val primary = run.primary
-            if (wanted.isEmpty() && primary.alive) {
-                if (primaryWorker?.job?.isActive != true) {
-                    primaryWorker =
-                        launchWorker(primary) {
-                            if (primary.kind == LinkKind.BLUETOOTH) bluetoothWorker(primary, it) else wifiWorker(primary, it)
+            // The Bluetooth head start runs before the file list is out (F-E5); a LAN primary waits for it.
+            val primaryAllowed = listed || (primary.kind == LinkKind.BLUETOOTH && firstBlock != null)
+            val current = primaryWorker
+            if (wanted.isEmpty() && primary.alive && primaryAllowed) {
+                when {
+                    // Not isActive: a cancelled worker is no longer "active" while it still finishes its block.
+                    current == null || current.job.isCompleted -> {
+                        primaryWorker =
+                            launchWorker(primary) {
+                                if (primary.kind == LinkKind.BLUETOOTH) bluetoothWorker(primary, it) else wifiWorker(primary, it)
+                            }
+                    }
+
+                    current.stopRequested || current.conn !== primary -> {
+                        // One Bluetooth worker at a time: the stopping one finishes its block in flight first.
+                        if (!current.rescheduled) {
+                            current.rescheduled = true
+                            current.job.invokeOnCompletion { scheduleWorkers() }
                         }
+                    }
                 }
-            } else {
-                primaryWorker?.let {
-                    // The Bluetooth stream finishes its in-flight block (its send runs non-cancellable) and stops.
-                    it.stopRequested = true
-                    it.job.cancel()
-                }
-                primaryWorker = null
+            } else if (current != null) {
+                // The Bluetooth stream finishes its in-flight block (its send runs non-cancellable) and stops.
+                stopWorker(current)
             }
         }
+    }
+
+    private fun stopWorker(worker: Worker) {
+        if (worker.stopRequested) return
+        worker.stopRequested = true
+        worker.job.cancel()
     }
 
     private fun launchWorker(
         conn: Conn,
         body: suspend (Worker) -> Unit,
     ): Worker {
-        lateinit var worker: Worker
-        val job =
+        val worker = Worker(conn)
+        worker.job =
             run.scope.launch(config.io, start = kotlinx.coroutines.CoroutineStart.LAZY) {
                 try {
                     body(worker)
@@ -743,8 +843,7 @@ internal class SendSide(
                     lock.withLock { if (workers[conn] === worker) workers.remove(conn) }
                 }
             }
-        worker = Worker(job)
-        job.start()
+        worker.job.start()
         return worker
     }
 
@@ -807,6 +906,8 @@ internal class SendSide(
             payloadBytesSent += prepared.length
             fileBytesSent += dataBytesIn(unit, from, from + prepared.length)
         }
+        // Wi-Fi streams count their bytes as the socket takes them (CountingChannel); the primary counts per frame.
+        if (conn.isPrimary) run.meter.add(prepared.length.toLong())
         unitSent(g, unit)
         return true
     }
@@ -838,7 +939,10 @@ internal class SendSide(
         val stale =
             lock.withLock {
                 val drop = stopped || acked[g] || item.epoch != queue.epoch || inFlight.containsKey(g)
-                if (!drop) btUnit = g
+                if (!drop) {
+                    btUnit = g
+                    btResumeFrom = -1
+                }
                 if (acked[g]) unitDropped(g, unit)
                 drop
             }
@@ -847,15 +951,31 @@ internal class SendSide(
             return true
         }
         var offset = start
-        var result = true
+        // Where the rest of the unit goes back into the queue from when this stream lets go of it (-1: it does not).
+        var requeueFrom = -1
+        var keepGoing = true
         try {
-            while (offset < length) {
-                val stop = worker.stopRequested || !conn.alive
-                if (stop || lock.withLock { acked[g] }) {
-                    if (stop) lock.withLock { if (!acked[g]) queue.addPriority(ResumeUnit(unit, offset), g) }
-                    result = !stop
-                    return result
+            while (true) {
+                val resumed = lock.withLock { btResumeFrom.also { btResumeFrom = -1 } }
+                if (resumed >= 0) {
+                    if (resumed < start) {
+                        // The receiver needs bytes before the ones this buffer holds: the unit is read again.
+                        requeueFrom = resumed
+                        return true
+                    }
+                    offset = resumed
                 }
+                if (offset >= length) {
+                    // Every block is acked, or a peer named an offset past the unit: then send it whole again.
+                    if (!lock.withLock { acked[g] }) requeueFrom = 0
+                    return true
+                }
+                if (worker.stopRequested || !conn.alive) {
+                    requeueFrom = offset
+                    keepGoing = false
+                    return false
+                }
+                if (lock.withLock { acked[g] }) return true
                 val n = minOf(ProtocolConstants.BLUETOOTH_BLOCK_SIZE, length - offset)
                 prepared.buffer.bytes.copyInto(
                     block,
@@ -872,44 +992,53 @@ internal class SendSide(
                     config.debug.beforeChunkSealed(conn.streamId)
                     conn.secure.sendChunk(block, 0, ChunkHeader.SIZE + n)
                 } catch (e: Throwable) {
-                    lock.withLock { if (!acked[g]) queue.addPriority(ResumeUnit(unit, offset), g) }
+                    requeueFrom = offset
+                    keepGoing = false
                     run.connFailed(conn, e)
-                    result = false
                     return false
                 }
-                lock.withLock {
-                    payloadBytesSent += n
-                    fileBytesSent += dataBytesIn(unit, offset, offset + n)
-                }
+                val signal =
+                    lock.withLock {
+                        payloadBytesSent += n
+                        fileBytesSent += dataBytesIn(unit, offset, offset + n)
+                        firstBlock
+                    }
+                run.meter.add(n.toLong())
+                signal?.complete(Unit)
                 if (!firstBlockReported) {
                     firstBlockReported = true
                     run.reduceLater(TransferEvent.FirstChunkOverBluetooth)
                 }
                 if (offset + n >= length) unitSent(g, unit)
-                when (val o = outcome.await()) {
+                when (outcome.await()) {
                     BlockOutcome.Acked -> {
                         offset += n
                     }
 
                     is BlockOutcome.Resend -> {
-                        offset = o.from.coerceIn(start, length - 1)
+                        continue // the offset is in btResumeFrom, applied at the top of the loop
                     }
 
                     BlockOutcome.Lost -> {
-                        lock.withLock { if (!acked[g]) queue.addPriority(ResumeUnit(unit, offset), g) }
-                        result = false
+                        requeueFrom = offset
+                        keepGoing = false
                         return false
                     }
                 }
             }
-            return true
         } finally {
             prepared.buffer.release()
             lock.withLock {
-                btBlock = null
+                // Let go of the unit and queue its rest in one step: the producer drops a queued unit that is still
+                // held, so a requeue before the release could lose the unit for good.
+                val pending = btResumeFrom
+                btResumeFrom = -1
+                val from = if (pending >= 0) pending else requeueFrom
+                if (btBlock?.global == g) btBlock = null
                 if (btUnit == g) btUnit = -1
+                if (from >= 0 && !acked[g] && !stopped) queue.addPriority(ResumeUnit(unit, from), g)
             }
-            if (result) checkAllAcked()
+            if (keepGoing) checkAllAcked()
         }
     }
 
@@ -931,6 +1060,9 @@ internal class SendSide(
         /** Mirrors `HintRules.BUNDLING_HINT_MIN_FILES` in `core/ladder` (which depends on this module). */
         const val BUNDLING_HINT_MIN_FILES: Int = 10
         private const val HASH_PASS_BUFFER = ProtocolConstants.MIB
+
+        /** The `FileList` waits at most this long for the first head-start block (a slow first read). */
+        private const val FIRST_BLOCK_WAIT_MILLIS = 2_000L
     }
 }
 

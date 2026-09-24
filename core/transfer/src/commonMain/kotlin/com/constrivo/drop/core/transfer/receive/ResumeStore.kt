@@ -134,6 +134,11 @@ data class ResumeSummary(
 class ResumeRecord(
     val transferId: TransferId,
     val summary: ResumeSummary,
+    /**
+     * The verified identity key of the sender the record was made with: only that peer resumes it (N3); an `Offer`
+     * with the same id from anyone else starts over.
+     */
+    val peerIdentityKey: ByteArray,
     /** The complete file list from the `FileList` pages. */
     val files: List<FileEntry>,
     /** Manifests by tracking key. */
@@ -157,12 +162,16 @@ interface ResumeStore {
     /** The stored record of [transferId], or null. */
     suspend fun load(transferId: TransferId): ResumeRecord?
 
-    /** Starts a record for [transferId] (replacing any old one) once its file list is known, with empty manifests. */
+    /**
+     * Starts a record for [transferId] (replacing any old one) once its file list is known, with empty manifests, for
+     * the sender whose verified identity is [peerIdentityKey].
+     */
     suspend fun create(
         transferId: TransferId,
         summary: ResumeSummary,
         files: List<FileEntry>,
         atMillis: Long,
+        peerIdentityKey: ByteArray,
     )
 
     /** Stores [manifests] (one write-behind batch), replacing the stored ones of their keys; ignored without a record. */
@@ -187,6 +196,7 @@ interface ResumeStore {
 class InMemoryResumeStore : ResumeStore {
     private class Entry(
         val summary: ResumeSummary,
+        val peerIdentityKey: ByteArray,
         val files: List<FileEntry>,
         val manifests: MutableMap<Int, UnitManifest> = HashMap(),
         val fileStates: MutableMap<Int, FileResumeState> = HashMap(),
@@ -203,7 +213,15 @@ class InMemoryResumeStore : ResumeStore {
     override suspend fun load(transferId: TransferId): ResumeRecord? =
         lock.withLock {
             entries[transferId]?.let {
-                ResumeRecord(transferId, it.summary, it.files, HashMap(it.manifests), HashMap(it.fileStates), it.updatedAtMillis)
+                ResumeRecord(
+                    transferId,
+                    it.summary,
+                    it.peerIdentityKey.copyOf(),
+                    it.files,
+                    HashMap(it.manifests),
+                    HashMap(it.fileStates),
+                    it.updatedAtMillis,
+                )
             }
         }
 
@@ -212,8 +230,9 @@ class InMemoryResumeStore : ResumeStore {
         summary: ResumeSummary,
         files: List<FileEntry>,
         atMillis: Long,
+        peerIdentityKey: ByteArray,
     ) {
-        lock.withLock { entries[transferId] = Entry(summary, files.toList(), updatedAtMillis = atMillis) }
+        lock.withLock { entries[transferId] = Entry(summary, peerIdentityKey.copyOf(), files.toList(), updatedAtMillis = atMillis) }
     }
 
     override suspend fun putManifests(manifests: Collection<UnitManifest>) {

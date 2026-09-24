@@ -1,10 +1,14 @@
 package com.constrivo.drop.core.transfer.engine
 
+import com.constrivo.drop.core.protocol.Ack
 import com.constrivo.drop.core.protocol.LinkKind
+import com.constrivo.drop.core.protocol.ProtocolConstants
 import com.constrivo.drop.core.protocol.TransferPhase
 import com.constrivo.drop.core.transfer.MemorySource
 import com.constrivo.drop.core.transfer.TestSupport
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -59,6 +63,87 @@ class HeadStartHopTest {
                         file.name,
                     )
                 }
+            }
+        }
+
+    @Test
+    fun `repeated hops between Bluetooth and Wi-Fi never lose the rest of a unit`() =
+        runBlocking<Unit> {
+            EnginePair(primaryKind = LinkKind.BLUETOOTH, primaryBytesPerSecond = 400_000).use { pair ->
+                val files = listOf(MemorySource("movie.mp4", TestSupport.randomBytes(40 * 1024 * 1024 + 17, 14)))
+                withTimeout(60_000) {
+                    val (sending, receiving) = pair.start(files)
+                    // The link is up but data stays on Bluetooth until the test moves it.
+                    pair.attachMemory(sending, receiving, generation = 0, use = false, bytesPerSecond = 3_000_000)
+                    val random = kotlin.random.Random(7)
+                    repeat(24) {
+                        // On Bluetooth long enough for a block or two, then hop; the producer is idle in take() when the
+                        // Bluetooth stream puts the rest of its unit back.
+                        sending.useLink(null)
+                        delay(60L + random.nextLong(60))
+                        sending.useLink(0)
+                        delay(20L + random.nextLong(40))
+                    }
+                    assertEquals(TransferPhase.DONE, sending.await().phase)
+                    assertEquals(TransferPhase.DONE, receiving.await().phase)
+                    assertEquals(files.sumOf { it.size }, sending.stats.fileBytesSent, "no byte twice across 24 hops")
+                }
+                assertEquals(TestSupport.sha256(files[0].bytes), TestSupport.sha256(pair.receivedFile("movie.mp4")))
+            }
+        }
+
+    @Test
+    fun `a Bluetooth block written after the rest of its unit still makes the unit durable`() =
+        runBlocking<Unit> {
+            // The Bluetooth reader is slow to queue its blocks' writes; the hop happens meanwhile, and the Wi-Fi stream
+            // brings the rest of the unit. Every unit must still reach the manifest and the file its SHA-256 check.
+            val hooks =
+                DebugHooks(beforeWritesQueued = { unit, offset ->
+                    if (!unit.isBundle && offset > 0 && offset < ProtocolConstants.CHUNK_SIZE) Thread.sleep(150)
+                })
+            EnginePair(primaryKind = LinkKind.BLUETOOTH, primaryBytesPerSecond = 200_000, debug = hooks).use { pair ->
+                val files = listOf(MemorySource("clip.mp4", TestSupport.randomBytes(6 * 1024 * 1024 + 3, 15)))
+                withTimeout(60_000) {
+                    val (sending, receiving) = pair.start(files)
+                    receiving.progress.first { it.bytesDone > 3 * ProtocolConstants.BLUETOOTH_BLOCK_SIZE }
+                    pair.attachTcp(sending, receiving, generation = 0)
+                    assertEquals(TransferPhase.DONE, sending.await().phase)
+                    assertEquals(TransferPhase.DONE, receiving.await().phase)
+                }
+                assertEquals(TestSupport.sha256(files[0].bytes), TestSupport.sha256(pair.receivedFile("clip.mp4")))
+            }
+        }
+
+    @Test
+    fun `a Bluetooth block ack lost with the receiver's Wi-Fi control route is recovered by the Resume that follows`() =
+        runBlocking<Unit> {
+            val block = ProtocolConstants.BLUETOOTH_BLOCK_SIZE
+            val dropped = CompletableDeferred<Unit>()
+            val hooks =
+                DebugHooks(dropControl = { message ->
+                    val lose =
+                        message is Ack && !dropped.isCompleted &&
+                            message.chunks.any { it.fileIndex == 0 && (it.blockOffset ?: 0) >= 8 * block }
+                    if (lose) dropped.complete(Unit)
+                    lose
+                })
+            EnginePair(primaryKind = LinkKind.BLUETOOTH, primaryBytesPerSecond = 300_000, debug = hooks).use { pair ->
+                val files = listOf(MemorySource("clip.mp4", TestSupport.randomBytes(1024 * 1024 + 11, 16)))
+                withTimeout(60_000) {
+                    val (sending, receiving) = pair.start(files)
+                    // The receiver's control moves to a Wi-Fi stream; the sender's data stays on Bluetooth.
+                    val channels = pair.attachMemory(sending, receiving, generation = 0, use = false)
+                    receiving.moveControl(0)
+                    dropped.await()
+                    // The sender now waits for an ack that is gone. The Wi-Fi link dies; the receiver's route falls back
+                    // to Bluetooth and it re-states what it misses, which settles the block.
+                    delay(200)
+                    channels.toList().forEach { it.close() }
+                    assertEquals(TransferPhase.DONE, sending.await().phase)
+                    assertEquals(TransferPhase.DONE, receiving.await().phase)
+                    assertEquals(0, sending.stats.sessionEpoch, "no reconnect was needed")
+                }
+                assertEquals(TestSupport.sha256(files[0].bytes), TestSupport.sha256(pair.receivedFile("clip.mp4")))
             }
         }
 }

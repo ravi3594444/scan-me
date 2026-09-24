@@ -30,6 +30,7 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * A [FileStore] on `java.nio.file` for desktops and tests (architecture §7.6, §10.2; design §9; F-D5):
@@ -55,6 +56,10 @@ class DirectoryFileStore(
     private val publishLock = Mutex()
     private val dropFolders = ConcurrentHashMap<String, Path>()
     private val open = ConcurrentHashMap.newKeySet<PathPartialFile>()
+    private val openSourceFiles = AtomicInteger()
+
+    /** Sources of [source] with an open file handle right now (the engine closes each once its file is sent). */
+    val openSources: Int get() = openSourceFiles.get()
 
     init {
         Files.createDirectories(partialRoot)
@@ -68,7 +73,7 @@ class DirectoryFileStore(
         path: Path,
         name: String = path.fileName.toString(),
         mimeType: String? = probeMime(path),
-    ): SourceFile = PathSourceFile(path, name, mimeType, io)
+    ): SourceFile = PathSourceFile(path, name, mimeType, io, openSourceFiles)
 
     override suspend fun openSource(uri: String): SourceFile {
         val path = if (uri.startsWith("file:")) Paths.get(URI(uri)) else Paths.get(uri)
@@ -281,12 +286,16 @@ class DirectoryFileStore(
  */
 private const val IO_SLICE: Int = 256 * 1024
 
-/** A picked file on disk, read with positional reads so retransmits can read any unit again. */
+/**
+ * A picked file on disk, read with positional reads so retransmits can read any unit again. The handle opens on the
+ * first read and again after [close]; reads and [close] are serialised, so a close never breaks a read in progress.
+ */
 internal class PathSourceFile(
     private val path: Path,
     override val name: String,
     override val mimeType: String?,
     private val io: CoroutineDispatcher,
+    private val openCount: AtomicInteger = AtomicInteger(),
 ) : SourceFile {
     private val lock = Mutex()
     private var channel: FileChannel? = null
@@ -302,13 +311,22 @@ internal class PathSourceFile(
         length: Int,
     ): Int {
         require(offset >= 0 && length >= 0 && offset <= buffer.size - length) { "range out of bounds" }
-        val ch = lock.withLock { channel ?: withContext(io) { FileChannel.open(path, StandardOpenOption.READ) }.also { channel = it } }
-        return withContext(io) { ch.read(ByteBuffer.wrap(buffer, offset, minOf(length, IO_SLICE)), position) }
+        return lock.withLock {
+            val ch =
+                channel ?: withContext(io) { FileChannel.open(path, StandardOpenOption.READ) }.also {
+                    channel = it
+                    openCount.incrementAndGet()
+                }
+            withContext(io) { ch.read(ByteBuffer.wrap(buffer, offset, minOf(length, IO_SLICE)), position) }
+        }
     }
 
     override suspend fun close() {
         lock.withLock {
-            channel?.let { runCatching { it.close() } }
+            channel?.let {
+                runCatching { it.close() }
+                openCount.decrementAndGet()
+            }
             channel = null
         }
     }
@@ -375,8 +393,10 @@ internal class PathPartialFile(
 
     override suspend fun sync() {
         withContext(io) {
+            // A closed handle cannot make anything durable: saying so is what keeps the manifest honest (N5).
+            if (!channel.isOpen) throw StorageException("syncing $path failed: the partial is closed")
             try {
-                if (channel.isOpen) channel.force(false)
+                channel.force(false)
             } catch (e: IOException) {
                 throw store.storageError("syncing $path failed", e)
             }

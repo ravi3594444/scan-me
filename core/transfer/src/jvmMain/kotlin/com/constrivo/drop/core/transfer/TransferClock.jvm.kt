@@ -4,6 +4,8 @@ import java.util.concurrent.locks.ReentrantLock
 
 internal actual fun currentTimeMillis(): Long = System.currentTimeMillis()
 
+internal actual fun monotonicMillis(): Long = System.nanoTime() / 1_000_000
+
 internal actual class TransferLock actual constructor() {
     private val delegate = ReentrantLock()
 

@@ -44,6 +44,14 @@ internal class BufferPool(
         return PooledBuffer(bytes, this)
     }
 
+    /** Drops the buffers that are back in the pool (a parked transfer, S8); later [acquire]s allocate again. */
+    fun trim() {
+        lock.withLock {
+            allocated -= free.size
+            free.clear()
+        }
+    }
+
     internal fun giveBack(bytes: ByteArray) {
         lock.withLock { free.addLast(bytes) }
         permits.release()

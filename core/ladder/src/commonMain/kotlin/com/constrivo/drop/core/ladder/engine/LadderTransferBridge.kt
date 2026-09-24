@@ -42,9 +42,11 @@ import kotlin.concurrent.Volatile
  * ([LadderRunner.onPeerSelected]; the authority's runner ignores it), the 250 ms throughput samples (the receiver's
  * count of arrived bytes decides the LAN check), link losses, and the start and end of the transfer.
  *
- * Runs: the first run starts when the transfer starts streaming ([onTransferStarted]); every reconnect (a new session,
- * N3) closes the old run and starts a new one whose generation base is [LadderGenerations.PER_RUN] higher, so the new
- * run's `LinkReady` and `StreamOpen` generations never collide with the old ones. [runnerFactory] builds a run's runner
+ * Runs: the first run starts when the transfer starts streaming ([onTransferStarted]) at generation base 0; every
+ * reconnect (a new session, N3) closes the old run and starts a new one whose base comes from the new session's
+ * transcript hash ([generationBaseFor]). Both devices hold the same transcript, so they agree on the base even when a
+ * handshake completed on one side only (a count of local session starts would then differ for the rest of the
+ * transfer), and a new session's base collides with an old one only by a 1-in-2^20 chance. [runnerFactory] builds a run's runner
  * from this session and the run's generation base (the app computes the plan and `LadderNegotiation` agreement; on the
  * sender it reads [Transfer.accept] for the receiver's link intent).
  *
@@ -148,7 +150,7 @@ class LadderTransferBridge(
             followJob?.cancel()
             scope.launch { old.closeAndAwait() }
         }
-        base += LadderGenerations.PER_RUN
+        base = generationBaseFor(transfer.sessionTranscriptHash)
         launchRun(base)
     }
 
@@ -163,6 +165,21 @@ class LadderTransferBridge(
         followJob = scope.launch { follow(runner) }
         runner.start()
         runner.onTransferStarted()
+    }
+
+    companion object {
+        /** Runs a reconnected session's base can take: [LadderGenerations.PER_RUN] apart, never 0 (the first run's). */
+        const val RUN_SLOTS: Int = 1 shl 20
+
+        /** The generation base of a reconnected session with this [transcriptHash] (the same on both devices). */
+        fun generationBaseFor(transcriptHash: ByteArray): Int {
+            require(transcriptHash.size >= 4) { "transcript hash too short" }
+            val bits =
+                ((transcriptHash[0].toInt() and 0xFF) shl 24) or ((transcriptHash[1].toInt() and 0xFF) shl 16) or
+                    ((transcriptHash[2].toInt() and 0xFF) shl 8) or (transcriptHash[3].toInt() and 0xFF)
+            val slot = 1 + (bits ushr 12) % (RUN_SLOTS - 1)
+            return slot * LadderGenerations.PER_RUN
+        }
     }
 
     /** Moves data (sender) and the follower's control stream as the runner's state says. */

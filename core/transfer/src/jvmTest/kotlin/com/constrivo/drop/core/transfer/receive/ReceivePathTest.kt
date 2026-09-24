@@ -166,7 +166,8 @@ class ResumeStateTest {
             val summary = ResumeSummary(3, 30 + 9 * MIB, ProtocolConstants.CHUNK_SIZE, true, 1)
             store.putManifests(listOf(UnitManifest.empty(ID, 2, 3, 0)))
             assertNull(store.load(ID), "a manifest without a record is ignored")
-            store.create(ID, summary, files, atMillis = 5)
+            val peer = ByteArray(32) { 7 }
+            store.create(ID, summary, files, atMillis = 5, peerIdentityKey = peer)
             val tracker = ManifestTracker(ID, layout)
             tracker.markReceived(chunk(2), hash(2))
             store.putManifests(tracker.dirtyManifests(6))
@@ -174,6 +175,7 @@ class ResumeStateTest {
             store.putFileState(ID, 2, FileResumeState(FileResumeStatus.DONE, sha, "content://x"), atMillis = 7)
             val record = store.load(ID)!!
             assertEquals(summary, record.summary)
+            assertTrue(peer.contentEquals(record.peerIdentityKey), "the record names the peer it was made with")
             assertEquals(files, record.files)
             assertTrue(record.manifests.getValue(2).isReceived(2))
             assertEquals(FileResumeStatus.DONE, record.fileStates.getValue(2).status)

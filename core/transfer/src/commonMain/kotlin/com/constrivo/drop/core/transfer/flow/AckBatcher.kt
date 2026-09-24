@@ -21,8 +21,9 @@ import kotlinx.coroutines.selects.select
  * would otherwise lose 50 ms per 16 KiB block.
  *
  * [send] runs in one coroutine of [scope], so acks leave in order; a failed send drops that batch (the control route is
- * gone, and the `Resume` that follows lists what is still missing). [clock] must run with [scope]'s dispatcher time
- * (see [TransferClock]). Close with [close]; references added afterwards are dropped.
+ * gone, and the `Resume` that follows lists what is still missing). The deadline is on [clock]'s monotonic time line
+ * ([TransferClock.elapsedMillis]), which must run with [scope]'s dispatcher time. Close with [close]; references added
+ * afterwards are dropped.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class AckBatcher(
@@ -76,7 +77,7 @@ class AckBatcher(
             batch += first.ref
             var urgent = first.urgent
             var open = true
-            val deadline = clock.nowMillis() + maxDelayMillis
+            val deadline = clock.elapsedMillis() + maxDelayMillis
             while (open && !urgent && batch.size < maxRefs) {
                 val ready = inbox.tryReceive()
                 val next: Pending? =
@@ -91,7 +92,7 @@ class AckBatcher(
                         }
 
                         else -> {
-                            val remaining = deadline - clock.nowMillis()
+                            val remaining = deadline - clock.elapsedMillis()
                             if (remaining <= 0) {
                                 null
                             } else {

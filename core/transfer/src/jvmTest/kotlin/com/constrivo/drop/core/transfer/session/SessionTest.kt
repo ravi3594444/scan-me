@@ -167,6 +167,27 @@ class SessionTest {
         }
 
     @Test
+    fun `a connection that sends no StreamOpen is refused after the deadline, and garbage at once`() =
+        runBlocking<Unit> {
+            withTimeout(20_000) {
+                val (a, b) = TestSupport.handshake(sender, receiver, TestSupport.memoryPair())
+                // Anyone on the network can connect to the host's port and say nothing (S7 has no answer for it).
+                val (_, idle) = TestSupport.memoryPair()
+                val started = System.nanoTime()
+                val silent = assertFailsWith<ProtocolException> { b.acceptStream(idle, LinkKind.LAN, timeoutMillis = 300) }
+                val millis = (System.nanoTime() - started) / 1_000_000
+                assertTrue(millis in 250..5_000, "refused after $millis ms")
+                assertTrue(silent.message!!.contains("within"), silent.message)
+                val (junk, garbage) = TestSupport.memoryPair()
+                junk.write(TestSupport.randomBytes(64, 8))
+                junk.close()
+                assertFailsWith<ProtocolException> { b.acceptStream(garbage, LinkKind.LAN, timeoutMillis = 5_000) }
+                a.close()
+                b.close()
+            }
+        }
+
+    @Test
     fun `a flipped bit in any chunk block fails authentication`() =
         runBlocking<Unit> {
             withTimeout(20_000) {

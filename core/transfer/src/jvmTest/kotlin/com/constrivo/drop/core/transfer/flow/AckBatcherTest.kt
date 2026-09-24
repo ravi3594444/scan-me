@@ -71,6 +71,28 @@ class AckBatcherTest {
         }
 
     @Test
+    fun `a wall clock stepped back an hour does not hold the batch`() =
+        runTest {
+            val sent = ArrayList<Sent>()
+            var stepped = false
+            val clock =
+                object : TransferClock {
+                    // NTP moves the wall clock back once the batch is open; the monotonic time line is not affected.
+                    override fun nowMillis(): Long = testScheduler.currentTime - if (stepped) 3_600_000 else 0
+
+                    override fun elapsedMillis(): Long = testScheduler.currentTime
+                }
+            val acks = AckBatcher(id, backgroundScope, clock) { sent += Sent(it, testScheduler.currentTime) }
+            acks.add(ref(0))
+            runCurrent()
+            stepped = true
+            advanceTimeBy(51)
+            runCurrent()
+            assertEquals(1, sent.size, "the partial batch still left after 50 ms")
+            assertEquals(50, sent[0].atMillis)
+        }
+
+    @Test
     fun `an urgent Bluetooth block flushes the batch without waiting`() =
         runTest {
             val sent = ArrayList<Sent>()
@@ -114,14 +136,14 @@ class AckBatcherTest {
         }
 }
 
-/** §4: the receiver counts Wi-Fi bytes as the socket delivers them, per link kind. */
+/** §4 and F-F1: the receiver counts Wi-Fi bytes as the socket delivers them, the sender as it writes them. */
 class ArrivalMeterTest {
     @Test
     fun `bytes read through a counting channel are drained per kind`() =
         runTest {
             val meter = ArrivalMeter()
             val (a, b) = InMemoryDataChannel.pair(LinkKind.LAN)
-            val counted = CountingChannel(b, meter)
+            val counted = CountingChannel(b, onRead = meter::add)
             a.write(ByteArray(10_000))
             val buffer = ByteArray(4_000)
             var got = 0
@@ -131,6 +153,20 @@ class ArrivalMeterTest {
             assertEquals(mapOf(LinkKind.LAN to 10_000L, LinkKind.BLUETOOTH to 16_384L), meter.drain())
             assertTrue(meter.drain().isEmpty(), "a drain resets the counts")
             assertEquals(LinkKind.LAN, counted.kind)
+            counted.close()
+        }
+
+    @Test
+    fun `writes are counted in slices as they go out`() =
+        runTest {
+            val (a, b) = InMemoryDataChannel.pair(LinkKind.P2P, capacitySegments = 64)
+            val counts = ArrayList<Long>()
+            val counted = CountingChannel(a, onWrite = { _, n -> counts += n }, writeSlice = 1_000)
+            counted.write(ByteArray(2_500))
+            assertEquals(listOf(1_000L, 1_000L, 500L), counts)
+            val buffer = ByteArray(2_500)
+            var got = 0
+            while (got < 2_500) got += b.read(buffer, got, buffer.size - got)
             counted.close()
         }
 }

@@ -1,5 +1,6 @@
 package com.constrivo.drop.core.transfer.engine
 
+import com.constrivo.drop.core.protocol.ControlMessage
 import com.constrivo.drop.core.protocol.ControlMoved
 import com.constrivo.drop.core.protocol.DataChannel
 import com.constrivo.drop.core.protocol.LinkKind
@@ -28,10 +29,12 @@ import kotlinx.coroutines.Dispatchers
  * @property fileStore sources (sender) and partials plus the destination (receiver).
  * @property resumeStore the receiver's durable resume state (N5); the app adapts `core/data` to it.
  * @property io dispatcher for file and socket I/O.
- * @property compute dispatcher for hashing and AEAD work.
+ * @property compute dispatcher for the per-unit hashing: the sender's XXH3 and in-stream SHA-256 of each unit, the
+ *   receiver's XXH3 check of each frame and the resume re-verification (sealing runs inside the socket write, on [io]).
  * @property power thermal signal (F-F6); null means always cool.
- * @property reverifyOnResume re-hash every unit a resumed receiver has on disk against its stored XXH3 before accepting
- *   (N5), so a `.part` damaged by a crash is requested again instead of failing the whole-file check.
+ * @property reverifyOnResume re-hash every unit a resumed receiver has on disk against its stored XXH3 (N5), in the
+ *   background after the `Accept`, so a `.part` damaged by a crash is requested again instead of failing the whole-file
+ *   check.
  * @property lingerMillis after its last message, the side that sent it waits this long for the peer to close first, so
  *   the final `Complete` or `Cancel` is not lost to a reset connection.
  */
@@ -67,7 +70,9 @@ class EngineConfig(
  * Fault injection for the integration tests (T-28). [corruptPlaintext] runs on the sender after a frame's XXH3 was
  * computed and before it is sealed, so a corruption it makes passes the AEAD and must be caught by the receiver's
  * per-frame hash; return true after changing the payload. [beforeChunkSealed] can throw (for example a
- * `FrameLimitException`) to simulate a key reaching its limit.
+ * `FrameLimitException`) to simulate a key reaching its limit. [beforeWritesQueued] runs on the receiver when a
+ * verified frame of `unit` from `blockOffset` was placed, before its writes are queued and it is acked (a slow reader).
+ * [dropControl] drops an outgoing control message when it returns true (a message lost with its route).
  */
 class DebugHooks(
     val corruptPlaintext: (
@@ -78,6 +83,8 @@ class DebugHooks(
         length: Int,
     ) -> Boolean = { _, _, _, _, _ -> false },
     val beforeChunkSealed: (streamId: Int) -> Unit = {},
+    val beforeWritesQueued: (unit: TransferUnit, blockOffset: Int) -> Unit = { _, _ -> },
+    val dropControl: (ControlMessage) -> Boolean = { false },
 ) {
     companion object {
         val NONE: DebugHooks = DebugHooks()
@@ -178,8 +185,27 @@ object EngineLimits {
     /** Heartbeats and the watchdog re-arm at most this often. */
     const val WATCHDOG_FEED_MILLIS: Long = 1_000
 
-    /** Control messages buffered from a stream that is not (yet) the peer's control route. */
-    const val MAX_BUFFERED_CONTROL: Int = 4096
+    /**
+     * Control messages buffered from streams that are not (yet) the peer's control route, and their total sealed size:
+     * enough for the `FileDone`s of a few thousand bundled files that cross a route change, and bounded memory.
+     */
+    const val MAX_BUFFERED_CONTROL: Int = 8192
+    const val MAX_BUFFERED_CONTROL_BYTES: Long = ProtocolConstants.MIB.toLong()
+
+    /** A route the peer named whose stream is not up here after this long is replaced by the stream it uses (N13). */
+    const val PENDING_ROUTE_MILLIS: Long = 5_000
+
+    /** A Wi-Fi connection with no frame for this long (heartbeats go every 2 s on every connection) is dead (N13). */
+    const val LINK_WATCHDOG_MILLIS: Long = 6_000
+
+    /** A connection to the host must send its `StreamOpen` within this long (anyone on the network can connect). */
+    const val STREAM_OPEN_TIMEOUT_MILLIS: Long = com.constrivo.drop.core.transfer.session.SecureSession.STREAM_OPEN_TIMEOUT_MILLIS
+
+    /** The joiner waits this long for the host's answer to a `StreamOpen` (the host may bring the link up a bit later). */
+    const val HOST_ANSWER_TIMEOUT_MILLIS: Long = 10_000
+
+    /** Bluetooth block bytes a receiver keeps in memory before the file list is complete (F-E5). */
+    const val MAX_STAGED_BYTES: Int = ProtocolConstants.MIB
 
     /** A thermal hint from the peer counts for this long (the hot device repeats it every [THERMAL_HINT_REPEAT_MILLIS]). */
     const val PEER_THERMAL_MILLIS: Long = 45_000

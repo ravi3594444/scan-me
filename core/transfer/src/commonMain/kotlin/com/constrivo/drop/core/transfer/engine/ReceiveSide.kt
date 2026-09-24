@@ -23,6 +23,7 @@ import com.constrivo.drop.core.protocol.Offer
 import com.constrivo.drop.core.protocol.ProtocolConstants
 import com.constrivo.drop.core.protocol.ProtocolException
 import com.constrivo.drop.core.protocol.Resume
+import com.constrivo.drop.core.protocol.Retransmit
 import com.constrivo.drop.core.protocol.Sha256Digest
 import com.constrivo.drop.core.protocol.TransferEvent
 import com.constrivo.drop.core.protocol.TransferLayout
@@ -31,6 +32,7 @@ import com.constrivo.drop.core.protocol.TransferState
 import com.constrivo.drop.core.protocol.TransferUnit
 import com.constrivo.drop.core.transfer.DropInfo
 import com.constrivo.drop.core.transfer.PartialFile
+import com.constrivo.drop.core.transfer.StorageException
 import com.constrivo.drop.core.transfer.StorageFullException
 import com.constrivo.drop.core.transfer.TransferLock
 import com.constrivo.drop.core.transfer.flow.AckBatcher
@@ -65,17 +67,23 @@ import kotlin.concurrent.Volatile
  *   mismatch re-requests it (`Retransmit`, three strikes fail the file, §7.8). Stream readers take a buffer from the
  *   receive pool before reading a frame; the pool is the bounded 16 MiB write queue, drained by one writer per
  *   destination file, so a slow disk stops the readers and TCP pushes back on the sender (§7.4).
+ * - **Head start before the list (F-E5).** Bluetooth blocks that arrive before the `FileList` is complete are
+ *   verified, acked and kept in memory (at most [EngineLimits.MAX_STAGED_BYTES]; beyond that the ack waits, which holds
+ *   the sender's one block in flight), and count as progress at once; the complete list places them like any block.
  * - **Durability (N5).** A unit's bit is set in the resume manifest only after its bytes were written and the `.part`
  *   was `fsync`ed, in write-behind batches at most [EngineLimits.FLUSH_MILLIS] apart, with the unit's hash, so a `.part`
- *   can be re-verified after a crash. Bluetooth blocks of a chunk are written as they arrive and their synced prefix is
- *   kept too (S1); blocks of a bundle are assembled in memory.
+ *   can be re-verified after a crash. A failed `fsync` marks nothing and ends the transfer like a failed write.
+ *   Bluetooth blocks of a chunk are written as they arrive and their synced prefix is kept too (S1); blocks of a bundle
+ *   are assembled in memory (Bluetooth only, at most [MAX_ASSEMBLIES] at a time).
  * - **Files.** When a file's units are durable and its `FileDone` hash is known (S2), the `.part` is re-read and hashed
  *   with SHA-256; a match publishes it through [com.constrivo.drop.core.transfer.FileStore.publish] under its sanitised
  *   name (F-D5); a mismatch re-hashes the units against their stored hashes to name the bad ones (N5) and re-requests
  *   them. A file that fails for good releases its remaining units (they are acked) so the transfer can complete.
  * - **Resume.** `Accept.resume` and every `Resume` state the complete missing set (§7.6), with the durable prefix of a
  *   unit received as Bluetooth blocks; a file whose data is complete but whose `FileDone` never arrived gets its last
- *   unit requested again, so the sender repeats the `FileDone`.
+ *   unit requested again, so the sender repeats the `FileDone`. After an app kill the stored units are checked for
+ *   length before the `Accept` (inside the 30 s offer window) and re-hashed in the background while the rest streams;
+ *   a damaged unit is requested again with `Retransmit` (N5).
  */
 internal class ReceiveSide(
     private val run: TransferRun,
@@ -93,6 +101,21 @@ internal class ReceiveSide(
     private val verifyPermits = Semaphore(EngineLimits.VERIFY_CONCURRENCY)
     private val flushSignal = Channel<Unit>(Channel.CONFLATED)
     private val ackBatcher = AckBatcher(transferId, run.scope, config.clock) { run.sendControl(it) }
+
+    /** File states go to the [resumeStore] in the order they are decided (a late `PENDING` never overwrites `DONE`). */
+    private val fileStateWrites = Channel<suspend () -> Unit>(Channel.UNLIMITED)
+    private val fileStateJob =
+        run.scope.launch(config.io) {
+            for (write in fileStateWrites) {
+                try {
+                    write()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    // A lost state write only makes a restarted receiver verify the file again.
+                }
+            }
+        }
 
     @Volatile
     var layout: TransferLayout? = null
@@ -122,6 +145,32 @@ internal class ReceiveSide(
     private var completeUnits = 0L
     private var totalUnits = 0L
 
+    // ---- Bluetooth blocks that came before the file list (F-E5), under [lock] ----
+    private class Staged(
+        val unit: TransferUnit,
+        val start: Int,
+        val bytes: ByteArray,
+        /** The frame's XXH3, the unit's own when the frame is the whole unit (place() uses it only then). */
+        val hash: ChunkHash,
+        val acked: Boolean,
+    )
+
+    private val staged = ArrayList<Staged>()
+    private val stagedPrefix = HashMap<TransferUnit, Int>()
+    private val stagedIndexSize = HashMap<TransferUnit, Int>()
+    private val stagedMismatches = ArrayList<Pair<TransferUnit, Int>>()
+    private var stagedBytes = 0
+    private var stagedProgress = 0L
+    private var stagingClosed = false
+
+    // ---- counters (tests, the bench), under [lock] ----
+    var chunkMismatches: Int = 0
+        private set
+    var fileMismatches: Int = 0
+        private set
+    var damagedOnResume: Int = 0
+        private set
+
     // ---- per-file state, under [lock] ----
     private lateinit var fileSha: Array<Sha256Digest?>
     private lateinit var fileState: Array<FileResumeStatus>
@@ -136,6 +185,9 @@ internal class ReceiveSide(
     private var firstBluetoothChunk = false
     private var accepted = false
     private var stopped = false
+
+    /** A resumed transfer's stored units are being re-hashed; files wait with their SHA-256 check until it is done. */
+    private var reverifying = false
     private var clearPartials = false
     private var flusherJob: Job? = null
     private val writerJobs = ArrayList<Job>()
@@ -156,15 +208,23 @@ internal class ReceiveSide(
     // Accept
     // =====================================================================================================
 
-    /** Whether a stored record matches this offer (a resumed transfer, T-07). */
-    val isResume: Boolean get() = record != null && record.summary == ResumeSummary.of(offer)
+    /** Whether a stored record matches this offer and was made with this peer (a resumed transfer, T-07; N3). */
+    val isResume: Boolean
+        get() = record != null && record.summary == ResumeSummary.of(offer) && record.peerIdentityKey.contentEquals(run.peerIdentityKey)
 
     /**
-     * Prepares the `Accept` (§7.2, §7.6): on a resume, the layout and manifests come from the [record] (re-verified
-     * against their stored hashes when [EngineConfig.reverifyOnResume], N5) and `resume` is the missing set. Returns
-     * null when the destination lacks the space for the bytes still missing (§7.8: decline with `storage`).
+     * Prepares the `Accept` (§7.2, §7.6): on a resume, the layout and manifests come from the [record], units whose
+     * `.part` bytes are gone are missing again, and `resume` is the missing set; the stored hashes are checked in the
+     * background after the `Accept` ([EngineConfig.reverifyOnResume], N5), so a large resume answers within the offer
+     * window. Returns null when the destination lacks the space for the bytes still missing (§7.8: decline with
+     * `storage`). Runs on [EngineConfig.io].
      */
     suspend fun prepareAccept(
+        link: LinkIntent?,
+        streamCount: Int,
+    ): Accept? = withContext(config.io) { prepare(link, streamCount) }
+
+    private suspend fun prepare(
         link: LinkIntent?,
         streamCount: Int,
     ): Accept? {
@@ -182,6 +242,7 @@ internal class ReceiveSide(
                 restore(stored, restored)
                 missing = missingUnits()
                 present = bytesDone
+                lock.withLock { reverifying = config.reverifyOnResume }
             } else {
                 resumeStore.delete(transferId)
                 store.deletePartials(partialId)
@@ -215,6 +276,7 @@ internal class ReceiveSide(
                 FileResumeStatus.PENDING -> maybeVerify(f)
             }
         }
+        if (lock.withLock { reverifying }) run.scope.launch(config.io) { reverify(l) }
         checkAllReceived()
     }
 
@@ -266,13 +328,14 @@ internal class ReceiveSide(
                 if (state.sha256 != null) fileSha[f] = state.sha256
             }
         }
-        // Units whose bytes are gone or damaged (the .part is shorter, or re-hashing disagrees) are missing again (N5).
+        // Units whose bytes are gone (the .part is shorter) are missing again; the stored hashes are checked after the
+        // Accept, in the background (N5), because re-reading gigabytes here would outlast the 30 s offer window.
         val damaged = ArrayList<TransferUnit>()
         for (unit in l.units()) {
             if (!lock.withLock { tracker.isReceived(unit) }) continue
             val carried = filesOf(l, unit)
             if (carried.any { lock.withLock { fileState[it] } != FileResumeStatus.PENDING }) continue
-            if (!unitOnDisk(l, unit)) damaged += unit
+            if (!unitPresent(l, unit)) damaged += unit
         }
         lock.withLock {
             for (unit in damaged) tracker.markMissing(unit)
@@ -284,12 +347,7 @@ internal class ReceiveSide(
                     resolved -> {
                         unitState[g.toInt()] = RELEASED
                         completeUnits++
-                        if (carried.any {
-                                fileState[it] == FileResumeStatus.DONE
-                            }
-                        ) {
-                            addProgress(l, unit, 0, l.unitLength(unit), live = false)
-                        }
+                        if (carried.any { fileState[it] == FileResumeStatus.DONE }) addProgress(l, unit, 0, l.unitLength(unit))
                     }
 
                     tracker.isReceived(unit) -> {
@@ -297,7 +355,7 @@ internal class ReceiveSide(
                         completeUnits++
                         tracker.hashOf(unit)?.let { unitHash[g] = it }
                         for (f in carried) if (fileState[f] == FileResumeStatus.PENDING) unitsLeft[f]--
-                        addProgress(l, unit, 0, l.unitLength(unit), live = false)
+                        addProgress(l, unit, 0, l.unitLength(unit))
                     }
 
                     else -> {
@@ -305,7 +363,7 @@ internal class ReceiveSide(
                         if (bytes > 0 && !unit.isBundle) {
                             unitState[g.toInt()] = RECEIVING
                             prefix[g] = bytes
-                            addProgress(l, unit, 0, bytes, live = false)
+                            addProgress(l, unit, 0, bytes)
                         }
                     }
                 }
@@ -333,21 +391,62 @@ internal class ReceiveSide(
         layoutReady.complete(l)
     }
 
-    /** True when [unit]'s bytes are in its `.part` files and (with re-verification) hash to the stored value. */
-    private suspend fun unitOnDisk(
+    /** True when [unit] has a stored hash and every `.part` it writes to is long enough to hold its bytes. */
+    private suspend fun unitPresent(
         l: TransferLayout,
         unit: TransferUnit,
     ): Boolean {
-        val expected = lock.withLock { tracker.hashOf(unit) } ?: return false
+        if (lock.withLock { tracker.hashOf(unit) } == null) return false
         return try {
-            if (!config.reverifyOnResume) return partsPresent(l, unit)
-            val bytes = readUnit(l, unit) ?: return false
-            config.chunkHasher.matches(expected, bytes, 0, bytes.size)
+            partsPresent(l, unit)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             false
         }
+    }
+
+    /**
+     * Re-hashes every stored unit of a resumed transfer against its stored XXH3 (N5) while the missing units stream;
+     * a damaged one is made missing and requested with `Retransmit`. Files wait with their SHA-256 check until this is
+     * done, so none is verified from bytes that are about to be replaced.
+     */
+    private suspend fun reverify(l: TransferLayout) {
+        val damaged = ArrayList<TransferUnit>()
+        try {
+            val buffer = ByteArray(l.chunkSize)
+            for (unit in l.units()) {
+                if (lock.withLock { stopped }) return
+                val g = l.globalIndex(unit).toInt()
+                val expected = lock.withLock { if (unitState[g] == DURABLE) tracker.hashOf(unit) else null } ?: continue
+                val length = l.unitLength(unit)
+                val intact =
+                    try {
+                        readUnit(l, unit, buffer) != null &&
+                            withContext(config.compute) { config.chunkHasher.matches(expected, buffer, 0, length) }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        false
+                    }
+                if (!intact) damaged += unit
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // Whatever was checked stands; the whole-file SHA-256 still catches the rest.
+        }
+        val dirty =
+            lock.withLock {
+                for (unit in damaged) forgetUnit(l, unit)
+                damagedOnResume += damaged.size
+                reverifying = false
+                tracker.dirtyManifests(run.now())
+            }
+        if (dirty.isNotEmpty() && !lock.withLock { stopped }) resumeStore.putManifests(dirty)
+        for (batch in damaged.chunked(RETRANSMIT_BATCH)) run.sendControl(Retransmit(transferId, missingOf(batch)))
+        for (f in 0 until l.fileCount) maybeVerify(f)
+        checkAllReceived()
     }
 
     /** True when every `.part` [unit] writes to is long enough to hold its bytes. */
@@ -366,13 +465,17 @@ internal class ReceiveSide(
             plan.chunkOffset(unit.chunkIndex) + plan.chunkLength(unit.chunkIndex)
     }
 
-    /** Reads [unit]'s plaintext back from the partials (a bundle is rebuilt from its files), or null when short. */
+    /**
+     * Reads [unit]'s plaintext back from the partials (a bundle is rebuilt from its files) into [into] (a new array when
+     * null), or returns null when short.
+     */
     private suspend fun readUnit(
         l: TransferLayout,
         unit: TransferUnit,
+        into: ByteArray? = null,
     ): ByteArray? {
         val length = l.unitLength(unit)
-        val out = ByteArray(length)
+        val out = into ?: ByteArray(length)
         if (unit.isBundle) {
             val bundle = l.bundlePlan.bundles[unit.chunkIndex]
             val index = BundleIndex.encodeIndex(bundle.entries)
@@ -484,7 +587,9 @@ internal class ReceiveSide(
         }
         run.scope.launch(config.io) {
             // The record exists before any chunk is placed, so no manifest write is lost to a later create.
-            resumeStore.create(transferId, ResumeSummary.of(offer), complete, run.now())
+            resumeStore.create(transferId, ResumeSummary.of(offer), complete, run.now(), run.peerIdentityKey)
+            // Blocks that came before the list are placed before any frame that waits for the layout.
+            if (!replayStaged(l)) return@launch
             layoutReady.complete(l)
             for (f in 0 until l.fileCount) if (l.unitCount(f) == 0 && !l.bundlePlan.isBundled(f)) maybeVerify(f)
             checkAllReceived()
@@ -518,8 +623,13 @@ internal class ReceiveSide(
             conn.secure.skipPayload(header)
             return
         }
-        val l = layoutReady.await()
-        val buffer = pool.acquire()
+        val blockFrame = conn.isPrimary && conn.kind == LinkKind.BLUETOOTH
+        if (blockFrame && !layoutReady.isCompleted) {
+            stageBlock(conn, header)
+            return
+        }
+        val l = conn.waitingLocally(config.clock) { layoutReady.await() }
+        val buffer = conn.waitingLocally(config.clock) { pool.acquire() }
         val view: ChunkView
         try {
             if (lock.withLock { stopped }) {
@@ -532,46 +642,224 @@ internal class ReceiveSide(
             buffer.release()
             throw e
         }
-        val chunk = view.header
-        // Wi-Fi streams count their bytes as they arrive (CountingChannel); the Bluetooth stream counts per frame.
-        if (conn.isPrimary) run.arrivals.add(conn.kind, chunk.payloadLength.toLong())
+        countArrival(conn, view.payloadLength)
         try {
-            if (chunk.transferId != transferId) throw ProtocolException("chunk frame for another transfer")
-            l.checkHeader(chunk)
+            if (view.header.transferId != transferId) throw ProtocolException("chunk frame for another transfer")
+            l.checkHeader(view.header)
         } catch (e: ProtocolException) {
             buffer.release()
             throw e
         }
+        val good =
+            withContext(config.compute) {
+                config.chunkHasher.matches(view.header.hash, view.buffer, view.payloadOffset, view.payloadLength)
+            }
+        accept(l, conn, view, buffer, blockFrame, good)
+    }
+
+    /** The Bluetooth stream counts per frame; Wi-Fi streams count as the socket delivers (CountingChannel). */
+    private fun countArrival(
+        conn: Conn,
+        bytes: Int,
+    ) {
+        if (!conn.isPrimary) return
+        run.arrivals.add(conn.kind, bytes.toLong())
+        run.countReceived(bytes.toLong())
+    }
+
+    /** Places the frame in [view] (verified or not, [good]) whose unit the layout [l] knows. */
+    private fun accept(
+        l: TransferLayout,
+        conn: Conn,
+        view: ChunkView,
+        pooled: PooledBuffer?,
+        blockFrame: Boolean,
+        good: Boolean,
+    ) {
+        val chunk = view.header
         val unit = chunk.unit
         val g = l.globalIndex(unit)
-        val blockFrame = conn.isPrimary && conn.kind == LinkKind.BLUETOOTH
-        if (!config.chunkHasher.matches(chunk.hash, view.buffer, view.payloadOffset, view.payloadLength)) {
-            buffer.release()
-            val alreadyHave = lock.withLock { unitState[g.toInt()] >= COMPLETE }
-            if (!alreadyHave) run.reduceLater(TransferEvent.ChunkHashMismatch(unit, filesOf(l, unit), chunk.blockOffset))
+        if (!good) {
+            pooled?.release()
+            mismatchedFrame(l, unit, chunk.blockOffset)
             return
         }
-        if (unit.isBundle && !indexMatchesPlan(l, unit, view)) {
-            buffer.release()
+        if (unit.isBundle && !indexMatchesPlan(l, unit, chunk.blockOffset, view.buffer, view.payloadOffset, view.payloadLength)) {
+            pooled?.release()
             throw ProtocolException("bundle ${unit.chunkIndex} does not match the bundle plan")
         }
         noteLink(conn)
-        place(l, conn, view, buffer, g, blockFrame)
+        place(l, unit, chunk.blockOffset, view.buffer, view.payloadOffset, view.payloadLength, chunk.hash, pooled, g, blockFrame)
     }
 
-    /** The part of the bundle index this frame carries equals the index the plan says (S4). */
+    /** A frame of [unit] from [blockOffset] failed its XXH3-128: the reducer re-requests it (three strikes, §7.8). */
+    private fun mismatchedFrame(
+        l: TransferLayout,
+        unit: TransferUnit,
+        blockOffset: Int,
+    ) {
+        val g = l.globalIndex(unit)
+        val alreadyHave =
+            lock.withLock {
+                val have = unitState[g.toInt()] >= COMPLETE
+                if (!have) chunkMismatches++
+                have
+            }
+        if (!alreadyHave) run.reduceLater(TransferEvent.ChunkHashMismatch(unit, filesOf(l, unit), blockOffset))
+    }
+
+    /**
+     * A Bluetooth block that arrived before the file list is complete (F-E5): verified, checked as far as the `Offer`
+     * allows, kept in memory and acked, so the sender's next block follows at once and progress moves. Beyond
+     * [EngineLimits.MAX_STAGED_BYTES] the ack waits for the list, which holds the sender's one block in flight. Once the
+     * list is complete, [replayStaged] places everything kept; a block that comes while it does is placed normally.
+     */
+    private suspend fun stageBlock(
+        conn: Conn,
+        header: FrameHeader,
+    ) {
+        if (header.payloadLength > MAX_EARLY_FRAME) throw ProtocolException("a ${header.payloadLength}-byte frame before the file list")
+        val view = conn.secure.readChunk(header, ByteArray(header.payloadLength))
+        val chunk = view.header
+        countArrival(conn, chunk.payloadLength)
+        if (chunk.transferId != transferId) throw ProtocolException("chunk frame for another transfer")
+        val unit = chunk.unit
+        val known = if (unit.isBundle) unit.chunkIndex < offer.bundleCount else unit.fileIndex in 0 until offer.fileCount
+        if (!known || chunk.blockOffset.toLong() + chunk.payloadLength > offer.chunkSize) {
+            throw ProtocolException("$unit frame at ${chunk.blockOffset} is outside the offer")
+        }
+        val good =
+            withContext(config.compute) { config.chunkHasher.matches(chunk.hash, view.buffer, view.payloadOffset, view.payloadLength) }
+        noteLink(conn)
+        val start = chunk.blockOffset
+        val end = start + chunk.payloadLength
+        var ack: ChunkRef? = null
+        val kept =
+            lock.withLock {
+                if (stagingClosed) return@withLock false
+                if (!good) {
+                    stagedMismatches += unit to start
+                    chunkMismatches++
+                    return@withLock true
+                }
+                val have = stagedPrefix[unit] ?: 0
+                if (start > have) throw ProtocolException("$unit frame starts at $start but only $have bytes arrived")
+                val ref = ChunkRef(unit.fileIndex, unit.chunkIndex, start)
+                if (end <= have) {
+                    ack = ref
+                    return@withLock true
+                }
+                val bytes = view.buffer.copyOfRange(view.payloadOffset + (have - start), view.payloadOffset + chunk.payloadLength)
+                if (unit.isBundle && have == 0) stagedIndexSize[unit] = stagedIndexSizeOf(bytes)
+                val fileBytes =
+                    if (unit.isBundle) {
+                        (end - maxOf(have, stagedIndexSize[unit] ?: Int.MAX_VALUE)).coerceAtLeast(0)
+                    } else {
+                        end - have
+                    }
+                stagedBytes += bytes.size
+                val ackNow = stagedBytes <= EngineLimits.MAX_STAGED_BYTES
+                staged += Staged(unit, have, bytes, chunk.hash, acked = ackNow)
+                stagedPrefix[unit] = end
+                bytesDone += fileBytes
+                stagedProgress += fileBytes
+                if (ackNow) ack = ref
+                true
+            }
+        if (!kept) {
+            // The list completed meanwhile: this block is placed like any other, after the ones kept before it.
+            val l = conn.waitingLocally(config.clock) { layoutReady.await() }
+            l.checkHeader(chunk)
+            accept(l, conn, view, null, blockFrame = true, good = good)
+            return
+        }
+        run.progressChanged(bytesDone)
+        ack?.let { ackBatcher.add(it, urgent = true) }
+    }
+
+    /** The data-area start of a bundle whose first staged bytes are [bytes] (its `u32 count`), for early progress. */
+    private fun stagedIndexSizeOf(bytes: ByteArray): Int {
+        if (bytes.size < ProtocolConstants.BUNDLE_INDEX_HEADER_SIZE) return Int.MAX_VALUE
+        val count =
+            ((bytes[0].toLong() and 0xFF) shl 24) or ((bytes[1].toLong() and 0xFF) shl 16) or
+                ((bytes[2].toLong() and 0xFF) shl 8) or (bytes[3].toLong() and 0xFF)
+        return if (count in 1..offer.fileCount.toLong()) Bundle.indexSize(count.toInt()) else Int.MAX_VALUE
+    }
+
+    /**
+     * The file list is complete: places the blocks kept before it (their early progress is replaced by the real one),
+     * sends the acks that waited, and reports the frames that failed their hash. False after a protocol violation.
+     */
+    private fun replayStaged(l: TransferLayout): Boolean {
+        val (frames, bad) =
+            lock.withLock {
+                stagingClosed = true
+                bytesDone -= stagedProgress
+                stagedProgress = 0
+                stagedBytes = 0
+                stagedPrefix.clear()
+                stagedIndexSize.clear()
+                val kept = staged.toList()
+                staged.clear()
+                val failed = stagedMismatches.toList()
+                stagedMismatches.clear()
+                kept to failed
+            }
+        for (frame in frames) {
+            val unit = frame.unit
+            if (!l.contains(unit) || frame.start + frame.bytes.size > l.unitLength(unit)) {
+                run.protocolViolation("$unit frame at ${frame.start} is outside the transfer")
+                return false
+            }
+            if (unit.isBundle && !indexMatchesPlan(l, unit, frame.start, frame.bytes, 0, frame.bytes.size)) {
+                run.protocolViolation("bundle ${unit.chunkIndex} does not match the bundle plan")
+                return false
+            }
+            try {
+                place(l, unit, frame.start, frame.bytes, 0, frame.bytes.size, frame.hash, null, l.globalIndex(unit), true, frame.acked)
+            } catch (e: ProtocolException) {
+                run.protocolViolation(e.message ?: "bad early block")
+                return false
+            }
+        }
+        for ((unit, offset) in bad) if (l.contains(unit)) mismatchedFrame(l, unit, offset)
+        return true
+    }
+
+    /** Drops the blocks kept before the list: the session is gone, and the `Resume` after the next one asks again. */
+    fun onSessionLost() {
+        lock.withLock {
+            if (stagingClosed) return
+            bytesDone -= stagedProgress
+            stagedProgress = 0
+            stagedBytes = 0
+            staged.clear()
+            stagedPrefix.clear()
+            stagedIndexSize.clear()
+            stagedMismatches.clear()
+        }
+    }
+
+    /** Parked for up to 24 h (S8): the free receive buffers go back to the heap. */
+    fun onParked() {
+        pool.trim()
+    }
+
+    /** The part of the bundle index that `bytes[offset…]` (from [start] of the unit) carries equals the planned one (S4). */
     private fun indexMatchesPlan(
         l: TransferLayout,
         unit: TransferUnit,
-        view: ChunkView,
+        start: Int,
+        bytes: ByteArray,
+        offset: Int,
+        length: Int,
     ): Boolean {
         val bundle = l.bundlePlan.bundles[unit.chunkIndex]
         val indexSize = Bundle.indexSize(bundle.entries.size)
-        val start = view.header.blockOffset
         if (start >= indexSize) return true
         val expected = BundleIndex.encodeIndex(bundle.entries)
-        val end = minOf(indexSize, start + view.payloadLength)
-        for (i in start until end) if (view.buffer[view.payloadOffset + (i - start)] != expected[i]) return false
+        val end = minOf(indexSize, start + length)
+        for (i in start until end) if (bytes[offset + (i - start)] != expected[i]) return false
         return true
     }
 
@@ -597,23 +885,31 @@ internal class ReceiveSide(
         if (event != null) run.reduceLater(event)
     }
 
-    /** Accepts the verified frame in [view] (in the pooled [buffer]) into the unit's state and queues its writes. */
+    /**
+     * Accepts the verified bytes `src[srcOffset until srcOffset + length]` of [unit] from byte [start] (in the pooled
+     * buffer [pooled], or a heap array when null) into the unit's state, queues their writes, then acks (after the
+     * writes are queued, so the sender cannot hop and complete the unit over Wi-Fi before this block's write is in the
+     * file's queue). [ackSent] skips the ack of a block that was acked when it was kept before the list.
+     */
     private fun place(
         l: TransferLayout,
-        conn: Conn,
-        view: ChunkView,
-        buffer: PooledBuffer,
+        unit: TransferUnit,
+        start: Int,
+        src: ByteArray,
+        srcOffset: Int,
+        length: Int,
+        hash: ChunkHash,
+        pooled: PooledBuffer?,
         g: Long,
         blockFrame: Boolean,
+        ackSent: Boolean = false,
     ) {
-        val chunk = view.header
-        val unit = chunk.unit
         val unitLength = l.unitLength(unit)
-        val start = chunk.blockOffset
-        val end = start + chunk.payloadLength
+        val end = start + length
         val ops = ArrayList<WriteOp>()
         var releaseNow = true
         var completedNow = false
+        val release: () -> Unit = pooled?.let { it::release } ?: {}
         val ack: ChunkRef?
         val urgent = blockFrame
         lock.withLock {
@@ -624,7 +920,7 @@ internal class ReceiveSide(
             } else {
                 val have = prefix[g] ?: 0
                 if (start > have) {
-                    buffer.release()
+                    pooled?.release()
                     throw ProtocolException("$unit frame starts at $start but only $have bytes arrived")
                 }
                 if (end <= have) {
@@ -634,11 +930,23 @@ internal class ReceiveSide(
                     if (unit.isBundle) {
                         if (start == 0 && complete) {
                             releaseNow = false
-                            bundleOps(l, unit, g, view.buffer, view.payloadOffset, buffer, ops)
-                            unitHash[g] = chunk.hash
+                            bundleOps(l, unit, g, src, srcOffset, pooled, ops)
+                            unitHash[g] = hash
                         } else {
-                            val arr = assembly.getOrPut(g) { ByteArray(unitLength) }
-                            view.buffer.copyInto(arr, have, view.payloadOffset + (have - start), view.payloadOffset + chunk.payloadLength)
+                            // Only Bluetooth blocks, and the rest of a bundle after the hop, are assembled in memory.
+                            if (!blockFrame && !complete) {
+                                pooled?.release()
+                                throw ProtocolException("a partial frame of bundle ${unit.chunkIndex} on a data stream")
+                            }
+                            val arr =
+                                assembly[g] ?: run {
+                                    if (assembly.size >= MAX_ASSEMBLIES) {
+                                        pooled?.release()
+                                        throw ProtocolException("more than $MAX_ASSEMBLIES bundles assembled at once")
+                                    }
+                                    ByteArray(unitLength).also { assembly[g] = it }
+                                }
+                            src.copyInto(arr, have, srcOffset + (have - start), srcOffset + length)
                             if (complete) {
                                 assembly.remove(g)
                                 bundleOps(l, unit, g, arr, 0, null, ops)
@@ -652,14 +960,14 @@ internal class ReceiveSide(
                             WriteOp(
                                 unit.fileIndex,
                                 plan.chunkOffset(unit.chunkIndex) + have,
-                                view.buffer,
-                                view.payloadOffset + (have - start),
+                                src,
+                                srcOffset + (have - start),
                                 end - have,
                                 g,
                                 if (complete) -1 else end,
-                                buffer::release,
+                                release,
                             )
-                        if (complete && start == 0) unitHash[g] = chunk.hash
+                        if (complete && start == 0) unitHash[g] = hash
                     }
                     addProgress(l, unit, have, end)
                     if (complete) {
@@ -682,10 +990,11 @@ internal class ReceiveSide(
                 }
             }
         }
-        if (releaseNow) buffer.release()
+        if (releaseNow) pooled?.release()
         run.progressChanged(bytesDone)
-        if (ack != null) ackBatcher.add(ack, urgent)
+        config.debug.beforeWritesQueued(unit, start)
         for (op in ops) submit(op)
+        if (ack != null && !ackSent) ackBatcher.add(ack, urgent)
         if (ops.isEmpty() && completedNow) flushSignal.trySend(Unit)
         if (completedNow) checkAllReceived()
     }
@@ -753,11 +1062,10 @@ internal class ReceiveSide(
             lock.withLock {
                 val left = (writesPending[op.global] ?: 1) - 1
                 if (left <= 0) writesPending.remove(op.global) else writesPending[op.global] = left
-                if (op.prefixAfter > 0) {
-                    prefixWritten[op.global] = maxOf(prefixWritten[op.global] ?: 0, op.prefixAfter)
-                } else if (left <= 0 && unitState[op.global.toInt()] == COMPLETE) {
-                    written[op.global] = true
-                }
+                // The last write of a complete unit makes it ready to flush, whichever op it is (a Bluetooth block's
+                // write can finish after the rest of the unit that came over Wi-Fi).
+                if (op.prefixAfter > 0) prefixWritten[op.global] = maxOf(prefixWritten[op.global] ?: 0, op.prefixAfter)
+                if (left <= 0 && unitState[op.global.toInt()] == COMPLETE) written[op.global] = true
             }
             flushSignal.trySend(Unit)
         }
@@ -788,7 +1096,11 @@ internal class ReceiveSide(
         }
     }
 
-    /** Syncs the partials of every unit whose writes finished, then marks those units in the manifest and stores it. */
+    /**
+     * Syncs the partials of every unit whose writes finished, then marks those units in the manifest and stores it
+     * (N5). A unit is marked only when every pending file it writes to synced; a failed `fsync` ends the transfer like
+     * a failed write, and nothing it covered is marked.
+     */
     suspend fun flush() {
         val l = layout ?: return
         val units: List<Long>
@@ -800,12 +1112,15 @@ internal class ReceiveSide(
             prefixes = HashMap(prefixWritten)
             prefixWritten.clear()
             val set = LinkedHashSet<Int>()
-            for (g in units) filesOf(l, l.unitAt(g)).forEach { set += it }
+            for (g in units) filesOf(l, l.unitAt(g)).forEach { if (fileState[it] == FileResumeStatus.PENDING) set += it }
             for (g in prefixes.keys) set += l.unitAt(g).fileIndex
             toSync = set
         }
         if (units.isEmpty() && prefixes.isEmpty()) return
-        syncAll(toSync)
+        val failed = syncAll(toSync)
+        val failure =
+            lock.withLock { failed.entries.firstOrNull { fileState[it.key] == FileResumeStatus.PENDING && !stopped }?.value }
+        if (failure != null) storageFailed(failure.takeUnless { it is StorageFullException })
         // Units assembled from several frames get their hash from the synced bytes.
         val hashes = HashMap<Long, ChunkHash>()
         for (g in units) {
@@ -823,11 +1138,13 @@ internal class ReceiveSide(
                 for (g in units) {
                     val unit = l.unitAt(g)
                     if (unitState[g.toInt()] != COMPLETE) continue
+                    val carried = filesOf(l, unit)
+                    if (carried.any { fileState[it] == FileResumeStatus.PENDING && (it in failed || it !in toSync) }) continue
                     val hash = hashes[g] ?: continue
                     tracker.markReceived(unit, hash)
                     unitHash[g] = hash
                     unitState[g.toInt()] = DURABLE
-                    for (f in filesOf(l, unit)) {
+                    for (f in carried) {
                         if (fileState[f] != FileResumeStatus.PENDING) continue
                         unitsLeft[f]--
                         if (unitsLeft[f] <= 0) verify += f
@@ -835,6 +1152,7 @@ internal class ReceiveSide(
                 }
                 for ((g, bytes) in prefixes) {
                     val unit = l.unitAt(g)
+                    if (unit.fileIndex in failed) continue
                     if (unitState[g.toInt()] == RECEIVING) tracker.setPartial(unit, bytes)
                 }
                 tracker.dirtyManifests(run.now())
@@ -843,13 +1161,33 @@ internal class ReceiveSide(
         for (f in verify) maybeVerify(f)
     }
 
-    private suspend fun syncAll(fileIndices: Set<Int>) {
-        val handles = lock.withLock { fileIndices.mapNotNull { partials[it] } }
+    /**
+     * `fsync`s the open partials of [fileIndices] ([SYNC_PARALLELISM] at a time); returns the files whose sync failed,
+     * with the error. A file without an open partial was published or failed meanwhile and counts as failed too.
+     */
+    private suspend fun syncAll(fileIndices: Set<Int>): Map<Int, Exception> {
+        val handles = lock.withLock { fileIndices.mapNotNull { f -> partials[f]?.let { f to it } } }
+        val failed = HashMap<Int, Exception>()
+        for (f in fileIndices) if (handles.none { it.first == f }) failed[f] = StorageException("partial of file $f is not open")
         coroutineScope {
             handles.chunked(SYNC_PARALLELISM).forEach { batch ->
-                batch.map { async(config.io) { runCatching { it.sync() } } }.awaitAll()
+                batch
+                    .map { (f, partial) ->
+                        async(config.io) {
+                            try {
+                                partial.sync()
+                                null
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                f to e
+                            }
+                        }
+                    }.awaitAll()
+                    .forEach { if (it != null) failed[it.first] = it.second }
             }
         }
+        return failed
     }
 
     // =====================================================================================================
@@ -874,11 +1212,8 @@ internal class ReceiveSide(
                 fileSha[f] = message.sha256
                 changed
             }
-        if (store) {
-            run.scope.launch(config.io) {
-                resumeStore.putFileState(transferId, f, FileResumeState(FileResumeStatus.PENDING, message.sha256), run.now())
-            }
-        }
+        // Queued before the verification starts, so the publish's DONE is always stored after it.
+        if (store) storeFileStateLater(f, FileResumeState(FileResumeStatus.PENDING, message.sha256))
         maybeVerify(f)
     }
 
@@ -886,7 +1221,11 @@ internal class ReceiveSide(
         val l = layout ?: return
         val start =
             lock.withLock {
-                if (stopped || fileState[f] != FileResumeStatus.PENDING || verifying[f] || fileSha[f] == null || unitsLeft[f] > 0) return
+                if (stopped || reverifying || fileState[f] != FileResumeStatus.PENDING || verifying[f] || fileSha[f] == null ||
+                    unitsLeft[f] > 0
+                ) {
+                    return
+                }
                 verifying[f] = true
                 true
             }
@@ -962,7 +1301,7 @@ internal class ReceiveSide(
         }
         table.setSaved(f, published.uri, published.name)
         table.setStatus(f, FileStatus.DONE)
-        resumeStore.putFileState(transferId, f, FileResumeState(FileResumeStatus.DONE, sha, published.uri), run.now())
+        storeFileState(f, FileResumeState(FileResumeStatus.DONE, sha, published.uri))
         run.reduceLater(TransferEvent.FileVerified(f, l.fileSize(f)))
     }
 
@@ -971,16 +1310,19 @@ internal class ReceiveSide(
         l: TransferLayout,
         f: Int,
     ) {
+        lock.withLock { fileMismatches++ }
         val suspects = ArrayList<TransferUnit>()
         val bundle = l.bundlePlan.bundleOf(f)
         if (bundle != null) {
             suspects += bundle.unit
         } else {
+            val buffer = ByteArray(l.chunkSize)
             for (c in 0 until l.unitCount(f)) {
                 val unit = TransferUnit(f, c)
                 val expected = lock.withLock { tracker.hashOf(unit) }
-                val bytes = runCatching { readUnit(l, unit) }.getOrNull()
-                if (expected == null || bytes == null || !config.chunkHasher.matches(expected, bytes, 0, bytes.size)) suspects += unit
+                val bytes = runCatching { readUnit(l, unit, buffer) }.getOrNull()
+                val length = l.unitLength(unit)
+                if (expected == null || bytes == null || !config.chunkHasher.matches(expected, bytes, 0, length)) suspects += unit
             }
             if (suspects.isEmpty()) for (c in 0 until l.unitCount(f)) suspects += TransferUnit(f, c)
         }
@@ -1065,8 +1407,8 @@ internal class ReceiveSide(
         run.scope.launch(config.io) {
             lock.withLock { partials.remove(f) }?.let { runCatching { it.close() } }
             runCatching { store.deletePartial(partialId, f) }
-            resumeStore.putFileState(transferId, f, FileResumeState(FileResumeStatus.FAILED), run.now())
         }
+        storeFileStateLater(f, FileResumeState(FileResumeStatus.FAILED))
         checkAllReceived()
     }
 
@@ -1076,8 +1418,33 @@ internal class ReceiveSide(
      */
     fun checkAllReceived() {
         if (layout == null || !layoutReady.isCompleted) return
-        val all = lock.withLock { accepted && completeUnits >= totalUnits }
+        val all = lock.withLock { accepted && !reverifying && completeUnits >= totalUnits }
         if (all && !run.machineState.allUnitsAcked) run.reduceLater(TransferEvent.AllChunksAcked)
+    }
+
+    /** Queues a file state write behind the ones decided before it. */
+    private fun storeFileStateLater(
+        f: Int,
+        state: FileResumeState,
+    ) {
+        fileStateWrites.trySend { resumeStore.putFileState(transferId, f, state, run.now()) }
+    }
+
+    /** Queues a file state write and waits until it is stored. */
+    private suspend fun storeFileState(
+        f: Int,
+        state: FileResumeState,
+    ) {
+        val done = CompletableDeferred<Unit>()
+        val queued =
+            fileStateWrites.trySend {
+                try {
+                    resumeStore.putFileState(transferId, f, state, run.now())
+                } finally {
+                    done.complete(Unit)
+                }
+            }
+        if (queued.isSuccess) done.await()
     }
 
     // =====================================================================================================
@@ -1152,7 +1519,6 @@ internal class ReceiveSide(
         unit: TransferUnit,
         from: Int,
         to: Int,
-        live: Boolean = true,
     ) {
         if (from == to) return
         val lo = minOf(from, to)
@@ -1166,7 +1532,6 @@ internal class ReceiveSide(
                 (hi - lo).toLong()
             } * sign
         bytesDone += bytes
-        if (sign > 0 && live) run.meter.add(bytes)
         val table = files ?: return
         if (unit.isBundle) {
             if (hi == l.unitLength(unit)) {
@@ -1198,6 +1563,8 @@ internal class ReceiveSide(
         flusherJob?.cancel()
         if (!clear) withContext(NonCancellable) { runCatching { flush() } }
         ackBatcher.close()
+        fileStateWrites.close()
+        withTimeoutOrNull(FINISH_WAIT_MILLIS) { fileStateJob.join() }
         val handles =
             lock.withLock {
                 val list = partials.values.toList()
@@ -1228,6 +1595,15 @@ internal class ReceiveSide(
         const val VERIFY_BUFFER: Int = ProtocolConstants.MIB
         const val SYNC_PARALLELISM: Int = 8
         const val FINISH_WAIT_MILLIS: Long = 10_000
+
+        /** Bundles assembled in memory at once: the one Bluetooth block in flight, and the rest after a hop. */
+        const val MAX_ASSEMBLIES: Int = 2
+
+        /** Largest frame accepted on the Bluetooth stream before the file list: a 16 KiB block and its overhead. */
+        const val MAX_EARLY_FRAME: Int = ProtocolConstants.BLUETOOTH_BLOCK_SIZE + 4 * ProtocolConstants.KIB
+
+        /** Units per `Retransmit` after a resume re-verification. */
+        const val RETRANSMIT_BATCH: Int = 64
 
         /** Below this much free space a write failure counts as a full disk. */
         const val MIN_FREE_BYTES: Long = 8L * ProtocolConstants.MIB

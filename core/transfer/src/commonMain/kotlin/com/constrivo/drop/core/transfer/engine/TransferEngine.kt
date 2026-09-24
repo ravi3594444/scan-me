@@ -60,6 +60,12 @@ data class TransferStats(
     val sessionEpoch: Int,
     /** Wi-Fi data streams of the current session that are up. */
     val dataConnections: Int,
+    /** Receiver: frames that failed their per-frame XXH3-128 (T-28). */
+    val chunkHashMismatches: Int = 0,
+    /** Receiver: files whose whole-file SHA-256 did not match their `FileDone` (S2). */
+    val fileHashMismatches: Int = 0,
+    /** Receiver: stored units a resumed transfer found damaged on disk and requested again (N5). */
+    val resumeDamagedUnits: Int = 0,
 )
 
 /**
@@ -189,6 +195,8 @@ class IncomingTransfer internal constructor(
             side.discardStored()
             return transfer
         }
+        // The receiver's own stream_count caps the streams it opens as a link's joiner (§7.4).
+        run.setStreamLimit(accept.streamCount)
         val done = CompletableDeferred<Unit>()
         run.call {
             run.reduce(TransferEvent.LocalAccept(accept))
@@ -246,7 +254,16 @@ class Transfer internal constructor(
                 fileBytesSent = run.sender?.fileBytesSent ?: 0,
                 sessionEpoch = run.epoch,
                 dataConnections = run.liveConnections().count { !it.isPrimary },
+                chunkHashMismatches = run.receiver?.chunkMismatches ?: 0,
+                fileHashMismatches = run.receiver?.fileMismatches ?: 0,
+                resumeDamagedUnits = run.receiver?.damagedOnResume ?: 0,
             )
+
+    /**
+     * The transcript hash of the session that carries the transfer now: the same on both devices, and new with every
+     * handshake (N3). The ladder adapter derives its generation base from it.
+     */
+    val sessionTranscriptHash: ByteArray get() = run.session.handshake.transcriptHash
 
     /** Suspends until the transfer ends and returns its final progress. */
     suspend fun await(): TransferProgress = run.result.await()

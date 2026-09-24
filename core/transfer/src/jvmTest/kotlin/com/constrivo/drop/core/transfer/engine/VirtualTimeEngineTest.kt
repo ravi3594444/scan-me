@@ -43,6 +43,7 @@ class VirtualTimeEngineTest {
         primaryBytesPerSecond: Long? = 100_000,
         resume: InMemoryResumeStore = InMemoryResumeStore(),
         senderPower: PowerPolicy? = null,
+        clock: TransferClock = TransferClock { testScheduler.currentTime },
     ): EnginePair {
         val dispatcher = StandardTestDispatcher(testScheduler)
         return EnginePair(
@@ -50,7 +51,7 @@ class VirtualTimeEngineTest {
             primaryBytesPerSecond = primaryBytesPerSecond,
             io = dispatcher,
             dispatcher = dispatcher,
-            clock = TransferClock { testScheduler.currentTime },
+            clock = clock,
             resumeStore = resume,
             senderPower = senderPower,
         )
@@ -59,10 +60,115 @@ class VirtualTimeEngineTest {
     private class FakePower(
         level: ThermalLevel,
     ) : PowerPolicy {
-        override val thermal: StateFlow<ThermalLevel> = MutableStateFlow(level)
+        override val thermal: MutableStateFlow<ThermalLevel> = MutableStateFlow(level)
 
         override fun keepAwake(reason: String): Releasable = Releasable {}
     }
+
+    @Test
+    fun `F-E5 a thousand-file list does not hold back the first progress over 20 KB per s Bluetooth`() =
+        runTest(timeout = 2.minutes) {
+            pair(primaryBytesPerSecond = 20_000).use { pair ->
+                // 1,000 photos' worth of names (about 50 KB of FileList pages, 2.5 s at 20 KB/s) in one bundle.
+                val files =
+                    (0 until 1_000).map {
+                        MemorySource(
+                            "IMG_20260924_%06d.jpg".format(it),
+                            TestSupport.randomBytes(
+                                2_000,
+                                1_000L + it,
+                            ),
+                        )
+                    }
+                val (a, b) = pair.connect()
+                val sending = pair.senderEngine.send(a, files)
+                val incoming = pair.scope.async { pair.receiverEngine.receive(b) }.await()
+                val acceptedAt = currentTime
+                val receiving = incoming.accept()
+                receiving.progress.first { it.bytesDone > 0 }
+                val receiverMillis = currentTime - acceptedAt
+                sending.progress.first { it.bytesDone > 0 }
+                val senderMillis = currentTime - acceptedAt
+                assertTrue(receiverMillis < 1_000, "receiver progress after $receiverMillis ms")
+                assertTrue(senderMillis < 1_000, "sender progress after $senderMillis ms")
+                assertEquals(TransferPhase.DONE, sending.await().phase)
+                assertEquals(TransferPhase.DONE, receiving.await().phase)
+                assertEquals(files.sumOf { it.size }, sending.stats.fileBytesSent, "every byte once, early blocks included")
+                val folder = Files.list(pair.received).use { it.toList() }.single()
+                for (file in files.take(50) + files.takeLast(50)) {
+                    assertEquals(TestSupport.sha256(file.bytes), TestSupport.sha256(folder.resolve(file.name)), file.name)
+                }
+            }
+        }
+
+    @Test
+    fun `a wall clock stepped back an hour mid-transfer interrupts nothing`() =
+        runTest(timeout = 2.minutes) {
+            var stepped = false
+            val clock =
+                object : TransferClock {
+                    override fun nowMillis(): Long = testScheduler.currentTime - if (stepped) 3_600_000 else 0
+
+                    override fun elapsedMillis(): Long = testScheduler.currentTime
+                }
+            pair(clock = clock).use { pair ->
+                val files = listOf(MemorySource("clip.mp4", TestSupport.randomBytes(2 * mib, 97)))
+                val (sending, receiving) = pair.start(files)
+                val phases = HashSet<TransferPhase>()
+                val watch = pair.scope.launch { receiving.progress.collect { phases += it.phase } }
+                receiving.progress.first { it.bytesDone > 200_000 }
+                stepped = true
+                assertEquals(TransferPhase.DONE, sending.await().phase)
+                assertEquals(TransferPhase.DONE, receiving.await().phase)
+                watch.cancel()
+                assertFalse(TransferPhase.RECONNECTING in phases, "heartbeats and acks kept going: $phases")
+                assertEquals(0, sending.stats.sessionEpoch)
+            }
+        }
+
+    @Test
+    fun `F-F6 a device that heats up mid-transfer drops to two streams`() =
+        runTest(timeout = 2.minutes) {
+            val power = FakePower(ThermalLevel.NONE)
+            pair(senderPower = power).use { pair ->
+                val files = listOf(MemorySource("big.bin", TestSupport.randomBytes(64 * mib, 98)))
+                val (sending, receiving) = pair.start(files)
+                pair.attachMemory(sending, receiving, generation = 0, bytesPerSecond = 5_000_000)
+                sending.progress.first { it.streams == 4 }
+                power.thermal.value = ThermalLevel.SEVERE
+                sending.progress.first { it.streams == 2 }
+                assertTrue(HintCode.THERMAL in sending.progress.value.hints)
+                receiving.progress.first { HintCode.THERMAL in it.hints }
+                assertEquals(TransferPhase.DONE, sending.await().phase)
+                assertEquals(TransferPhase.DONE, receiving.await().phase)
+            }
+        }
+
+    @Test
+    fun `N13 a Wi-Fi link that goes silent is dropped by the link watchdog and Bluetooth keeps the session`() =
+        runTest(timeout = 2.minutes) {
+            pair(primaryBytesPerSecond = 200_000).use { pair ->
+                val files = listOf(MemorySource("clip.mp4", TestSupport.randomBytes(24 * mib, 99)))
+                val (sending, receiving) = pair.start(files)
+                val phases = HashSet<TransferPhase>()
+                val watch = pair.scope.launch { receiving.progress.collect { phases += it.phase } }
+                val channels = pair.attachStallable(sending, receiving, generation = 0, bytesPerSecond = 2_000_000)
+                receiving.progress.first { it.linkKind == LinkKind.P2P && it.bytesDone > 6L * mib }
+                // Out of range: the group drops silently. Writes block (a 4 MiB chunk holds the stream's writer),
+                // reads wait; nothing is closed.
+                val stalledAt = currentTime
+                channels.forEach { it.stall() }
+                receiving.progress.first { it.streams == 0 }
+                val detected = currentTime - stalledAt
+                assertTrue(detected in 5_500..9_000, "the link watchdog closed the link after $detected ms")
+                assertEquals(TransferPhase.DONE, sending.await().phase)
+                assertEquals(TransferPhase.DONE, receiving.await().phase)
+                watch.cancel()
+                assertFalse(TransferPhase.RECONNECTING in phases, "Bluetooth kept the session: $phases")
+                assertEquals(0, sending.stats.sessionEpoch)
+                assertEquals(TestSupport.sha256(files[0].bytes), TestSupport.sha256(pair.receivedFile("clip.mp4")))
+            }
+        }
 
     @Test
     fun `F-E5 the first Bluetooth block moves progress within 1 s of Accept at 20 KB per s`() =

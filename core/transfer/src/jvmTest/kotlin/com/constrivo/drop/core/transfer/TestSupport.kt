@@ -223,3 +223,55 @@ internal class FaultyChannel(
         const val SLICE = 1024
     }
 }
+
+/**
+ * A [DataChannel] that can go silent the way a Wi-Fi Direct group does out of range ([stall]): nothing is closed, but
+ * from then on writes block and reads wait until this end is closed (then they fail and end), as a TCP socket without
+ * RST or FIN behaves until the kernel gives up.
+ */
+internal class SilentChannel(
+    private val delegate: DataChannel,
+) : DataChannel by delegate {
+    private val closed = kotlinx.coroutines.CompletableDeferred<Unit>()
+
+    @Volatile
+    private var silent = false
+
+    fun stall() {
+        silent = true
+    }
+
+    override suspend fun read(
+        buffer: ByteArray,
+        offset: Int,
+        length: Int,
+    ): Int {
+        if (silent) {
+            closed.await()
+            return -1
+        }
+        val n = delegate.read(buffer, offset, length)
+        if (silent) {
+            closed.await()
+            return -1
+        }
+        return n
+    }
+
+    override suspend fun write(
+        buffer: ByteArray,
+        offset: Int,
+        length: Int,
+    ) {
+        if (silent) {
+            closed.await()
+            throw java.io.IOException("closed")
+        }
+        delegate.write(buffer, offset, length)
+    }
+
+    override suspend fun close() {
+        closed.complete(Unit)
+        delegate.close()
+    }
+}
