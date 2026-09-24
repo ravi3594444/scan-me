@@ -40,4 +40,16 @@ dependencies {
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.kotlin.test)
     androidTestImplementation(libs.kotlinx.coroutines.test)
+
+    // WP7e/f: the transfer service, MediaStore storage, the encrypted database and the power policy.
+    // DataResumeStore, FileResumePlanStore and PartialsSweeper, shared with the desktops.
+    api(project(":platform:common"))
+    // The browser receive page for a computer without the app (F-D6), served by the service.
+    api(project(":web-receive"))
+    // core/data on Android: SQLDelight's driver over SQLCipher's SupportSQLiteOpenHelper (F-J2).
+    implementation(libs.sqldelight.android.driver)
+    implementation(libs.sqlcipher.android)
+    implementation(libs.androidx.sqlite)
+    // The node and the storage tests run on the JVM against core/data's in-memory SQLite database.
+    testImplementation(libs.sqldelight.sqlite.driver)
 }

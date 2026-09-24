@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The instrumented tests' app: its Application hosts the TransferService (TransferServiceHost). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application android:name="com.constrivo.drop.platform.android.service.TestHostApplication" />
+</manifest>
