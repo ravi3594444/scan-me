@@ -22,6 +22,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.lifecycle.LifecycleOwner
 import com.constrivo.drop.ui.shared.DropApp
 
 /**
@@ -140,7 +141,16 @@ private fun ActivityContent(graph: AppGraph) {
         view.keepScreenOn = keepScreenOn
         onDispose { view.keepScreenOn = false }
     }
-    DropApp(controller, reducedMotion = rememberReducedMotion(), haptics = haptics, applyLanguage = graph.languageInApp)
+    // The activity hosting this content owns the camera's lifecycle.
+    val lifecycleOwner = LocalContext.current as LifecycleOwner
+    DropApp(
+        controller,
+        reducedMotion = rememberReducedMotion(),
+        haptics = haptics,
+        applyLanguage = graph.languageInApp,
+        // Scan to send (design §4.4): the back camera, each decoded code resolved by the service's node.
+        camera = { QrCameraPreview(lifecycleOwner, onText = graph::onScannedText) },
+    )
 }
 
 /** The system's "Remove animations" setting, followed while the activity shows (design §3.3 reduced motion). */

@@ -4,4 +4,49 @@
     <string name="app_name">Drop</string>
     <string name="error_cannot_open">इस फ़ोन पर कोई ऐप इसे नहीं खोल सकता</string>
     <string name="file_untitled">बिना नाम</string>
+    <!-- WP7ef: सूचनाएँ (notifications). NEEDS NATIVE-SPEAKER REVIEW. -->
+    <string name="notification_channel_progress">ट्रांसफ़र</string>
+    <string name="notification_channel_offers">आने वाली फ़ाइलें</string>
+    <string name="notification_channel_completed">पूरे हुए ट्रांसफ़र</string>
+    <string name="notification_channel_visibility">आस-पास के डिवाइस को दिख रहा है</string>
+    <string name="notification_session_title">आस-पास के डिवाइस को दिख रहा है</string>
+    <string name="notification_session_everyone">आस-पास हर कोई यह फ़ोन देख सकता है</string>
+    <string name="notification_session_trusted">आपके भरोसेमंद डिवाइस यह फ़ोन देख सकते हैं</string>
+    <string name="notification_session_hidden">आस-पास के डिवाइस से छिपा है</string>
+    <string name="notification_sending">%1$s को भेजा जा रहा है</string>
+    <string name="notification_receiving">%1$s से मिल रहा है</string>
+    <plurals name="notification_transfers">
+        <item quantity="one">%d ट्रांसफ़र</item>
+        <item quantity="other">%d ट्रांसफ़र</item>
+    </plurals>
+    <string name="notification_connecting">कनेक्ट हो रहा है…</string>
+    <string name="notification_waiting_answer">%1$s के स्वीकार करने का इंतज़ार</string>
+    <string name="notification_reconnecting">फिर से कनेक्ट हो रहा है…</string>
+    <string name="notification_waiting_peer">%1$s का इंतज़ार</string>
+    <string name="notification_verifying">फ़ाइलें जाँची जा रही हैं…</string>
+    <string name="notification_percent">%1$d%%</string>
+    <string name="notification_speed">%1$s MB/s</string>
+    <string name="notification_eta_minutes">%1$d मिनट बाकी</string>
+    <string name="notification_eta_seconds">%1$d सेकंड बाकी</string>
+    <string name="notification_announce">%1$s, %2$d प्रतिशत</string>
+    <string name="notification_offer_title">%1$s भेजना चाहते हैं</string>
+    <plurals name="notification_files">
+        <item quantity="one">%d फ़ाइल</item>
+        <item quantity="other">%d फ़ाइलें</item>
+    </plurals>
+    <string name="notification_offer_code">कोड %1$s: दोनों स्क्रीन पर एक जैसा?</string>
+    <string name="notification_accept">स्वीकार करें</string>
+    <string name="notification_decline">मना करें</string>
+    <string name="notification_cancel">रद्द करें</string>
+    <string name="notification_open">खोलें</string>
+    <string name="notification_sent">%1$s को भेजा गया</string>
+    <string name="notification_received">%1$s से मिला</string>
+    <string name="notification_failed">%1$s के साथ ट्रांसफ़र विफल रहा</string>
+    <string name="notification_cancelled">%1$s के साथ ट्रांसफ़र रद्द हुआ</string>
+    <string name="notification_declined">%1$s ने मना किया</string>
+    <string name="notification_no_answer">%1$s से कोई जवाब नहीं</string>
+    <string name="notification_browser_title">कंप्यूटर के लिए पेज चालू है</string>
+    <string name="notification_browser_starting">शुरू हो रहा है…</string>
+    <string name="notification_browser_ready">%1$s से जुड़ें, फिर %2$s खोलें</string>
+    <string name="error_service_start">Drop शुरू नहीं हो सका: %1$s</string>
 </resources>

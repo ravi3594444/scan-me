@@ -3,30 +3,48 @@ package com.constrivo.drop.ui.android
 import android.app.Application
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.util.Log
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import com.constrivo.drop.R
+import com.constrivo.drop.core.data.SettingKeys
 import com.constrivo.drop.core.discovery.SystemMonotonicClock
 import com.constrivo.drop.core.discovery.SystemWallClock
-import com.constrivo.drop.ui.shared.fake.InMemoryDrop
+import com.constrivo.drop.core.discovery.Visibility
+import com.constrivo.drop.core.protocol.Preview
+import com.constrivo.drop.platform.android.service.CodeScan
 import com.constrivo.drop.ui.shared.model.AppLanguage
 import com.constrivo.drop.ui.shared.model.AttachedFiles
+import com.constrivo.drop.ui.shared.model.ClearPartialsResult
+import com.constrivo.drop.ui.shared.model.FileThumb
+import com.constrivo.drop.ui.shared.model.ScanStatus
 import com.constrivo.drop.ui.shared.model.SelfProfile
+import com.constrivo.drop.ui.shared.model.SettingsValues
 import com.constrivo.drop.ui.shared.presenter.DayCalendar
 import com.constrivo.drop.ui.shared.presenter.DropAppController
 import com.constrivo.drop.ui.shared.presenter.DropDependencies
 import com.constrivo.drop.ui.shared.presenter.FeatureFlags
 import com.constrivo.drop.ui.shared.presenter.OnboardingConfig
+import com.constrivo.drop.ui.shared.presenter.Screen
 import com.constrivo.drop.ui.shared.presenter.SettingsSource
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.UUID
@@ -38,14 +56,15 @@ import java.util.UUID
  * The platform ports are real: permissions ([AndroidPermissions]), radio state ([RadioMonitor]), the gallery
  * ([MediaStoreLibrary]), system screens and files ([AndroidPlatformActions]), onboarding ([AndroidOnboarding]),
  * direct share ([DirectSharePublisher]), the language ([AppLocales]) and the device's calendar. The engine ports
- * (devices, transfers, offers, History, trusted devices, stats, settings, the QR code) are the in-memory [InMemoryDrop]
- * until WP7 connects the `TransferService` (architecture §10.1: the UI binds to it and observes its `StateFlow`s); its
- * radar is empty, so the shell shows the "No devices yet" state. Main-thread confined.
+ * (devices, transfers, offers, History, trusted devices, stats, settings, the QR code) are [ServicePorts] over the
+ * `TransferService`'s node through [TransferServiceClient] (architecture §10.1: the UI binds to it and observes its
+ * `StateFlow`s). Main-thread confined.
  *
  * Shares (design §4.3) are owned by the activity that received them: Android revokes the sender's read grants when
  * that activity is destroyed, so its files are then dropped ([onHostFinished]); a recreated activity adopts its share
  * ([MainActivity], [ShareRestore]).
  */
+@OptIn(ExperimentalCoroutinesApi::class)
 internal class AppGraph(
     private val app: Application,
 ) {
@@ -70,26 +89,91 @@ internal class AppGraph(
     private var reading: Pair<String, Job>? = null
     private var startedHosts = 0
 
-    private val engine =
-        InMemoryDrop(
-            self = SelfProfile(nickname = prefs.nickname.orEmpty(), deviceKey = SELF_KEY),
-            settingsValues = InMemoryDrop.defaultSettings(prefs.nickname.orEmpty()).copy(language = locales.current()),
+    /** The UI's side of the transfer service (bound while an activity is started, architecture §10.1). */
+    val client = TransferServiceClient(app, scope)
+
+    /** The engine ports over the service's node (the radar, transfers, offers, History, devices, stats, the code). */
+    val ports = ServicePorts(client, scope, decodePreview = ::decodePreview, openUri = ::openUri)
+
+    /** The profile picture: kept in the process for now (not yet stored with the settings). */
+    private val avatar = MutableStateFlow<ImageBitmap?>(null)
+
+    private val appVersion: String =
+        try {
+            app.packageManager.getPackageInfo(app.packageName, 0).versionName.orEmpty()
+        } catch (_: PackageManager.NameNotFoundException) {
+            ""
+        }
+
+    private val nickname: Flow<String> = client.node.flatMapLatest { n -> n?.nickname ?: flowOf(prefs.nickname.orEmpty()) }
+
+    private val profile: StateFlow<SelfProfile> =
+        combine(client.node, nickname, avatar) { n, name, picture -> SelfProfile(name, n?.selfDeviceId ?: SELF_KEY, picture) }
+            .stateIn(scope, SharingStarted.Eagerly, SelfProfile(prefs.nickname.orEmpty(), SELF_KEY))
+
+    private fun defaultSettings(
+        name: String,
+        picture: ImageBitmap?,
+    ): SettingsValues =
+        SettingsValues(
+            visibility = Visibility.TRUSTED_ONLY,
+            prefer5Ghz = SettingKeys.PREFER_5_GHZ.defaultValue,
+            keepScreenAwake = SettingKeys.KEEP_SCREEN_AWAKE.defaultValue,
+            bundleSmallFiles = SettingKeys.BUNDLE_SMALL_FILES.defaultValue,
+            saveLocationLabel = null,
+            nickname = name,
+            avatar = picture,
+            language = locales.current(),
+            crashReports = SettingKeys.CRASH_REPORTS.defaultValue,
+            haptics = SettingKeys.HAPTICS.defaultValue,
+            appVersion = appVersion,
         )
 
-    /** Settings from the engine, with the avatar picker, the nickname and the language going through the platform. */
+    /** Settings from the node's database, with the avatar, the nickname and the language going through the platform too. */
     private val settings: SettingsSource =
-        object : SettingsSource by engine {
-            override fun pickAvatar() = requestAvatar(AvatarTarget.SETTINGS)
+        object : SettingsSource {
+            override val settings: Flow<SettingsValues> =
+                combine(client.node.flatMapLatest { n -> n?.settings ?: flowOf(null) }, nickname, avatar) { snapshot, name, picture ->
+                    if (snapshot == null) {
+                        defaultSettings(name, picture)
+                    } else {
+                        val language = NodeMappers.language(snapshot, if (locales.inApp) null else locales.current())
+                        NodeMappers.settings(snapshot, name, picture, language, appVersion)
+                    }
+                }
+
+            override fun setVisibility(mode: Visibility) = ports.setVisibility(mode)
+
+            override fun setPrefer5Ghz(enabled: Boolean) = ports.setSetting(SettingKeys.PREFER_5_GHZ, enabled)
+
+            override fun setKeepScreenAwake(enabled: Boolean) = ports.setSetting(SettingKeys.KEEP_SCREEN_AWAKE, enabled)
+
+            override fun setBundleSmallFiles(enabled: Boolean) = ports.setBundleSmallFiles(enabled)
+
+            // A folder of the user's choice (SAF tree) is not offered yet: media go to the gallery, documents to Downloads.
+            override fun pickSaveLocation() = Unit
+
+            override suspend fun clearPartialFiles(): ClearPartialsResult = ports.clearPartialFiles()
 
             override fun setNickname(nickname: String) {
                 prefs.nickname = nickname
-                engine.setNickname(nickname)
+                ports.setNickname(nickname)
+            }
+
+            override fun pickAvatar() = requestAvatar(AvatarTarget.SETTINGS)
+
+            override fun removeAvatar() {
+                avatar.value = null
             }
 
             override fun setLanguage(language: AppLanguage) {
-                engine.setLanguage(language)
                 locales.apply(language)
+                ports.setSetting(SettingKeys.LANGUAGE, language.tag)
             }
+
+            override fun setCrashReports(enabled: Boolean) = ports.setSetting(SettingKeys.CRASH_REPORTS, enabled)
+
+            override fun setHaptics(enabled: Boolean) = ports.setSetting(SettingKeys.HAPTICS, enabled)
         }
 
     private val onboarding =
@@ -98,7 +182,9 @@ internal class AppGraph(
             bridge = bridge,
             prefs = prefs,
             onFinished = { nickname ->
-                engine.finish(nickname)
+                prefs.nickname = nickname
+                ports.setNickname(nickname)
+                (app as? DropApplication)?.markOnboarded()
                 controller.onboarding
                     ?.state
                     ?.value
@@ -112,26 +198,26 @@ internal class AppGraph(
         DropAppController(
             scope,
             DropDependencies(
-                devices = engine.devices,
-                transfers = engine.transfers,
-                offers = engine.offers,
-                received = engine.receivedFiles,
+                devices = ports.devices,
+                transfers = ports.transfers,
+                offers = ports.offers,
+                received = ports.received,
                 radio = RadioMonitor(app, permissions).state,
-                visibility = engine.visibility,
-                profile = engine.profile,
-                initialProfile = engine.profile.value,
-                radarActions = engine,
-                incomingActions = engine,
-                liveActions = engine,
-                history = engine,
-                trustedDevices = engine,
-                stats = engine,
+                visibility = ports.visibility,
+                profile = profile,
+                initialProfile = profile.value,
+                radarActions = ports,
+                incomingActions = ports,
+                liveActions = ports,
+                history = ports,
+                trustedDevices = ports,
+                stats = ports,
                 settings = settings,
-                initialSettings = engine.settingsState.value,
-                myCode = engine,
+                initialSettings = defaultSettings(prefs.nickname.orEmpty(), null),
+                myCode = ports,
                 media = MediaStoreLibrary(app, permissions, pickerOpen),
                 permissions = permissions,
-                platform = AndroidPlatformActions(app, bridge),
+                platform = AndroidPlatformActions(app, bridge, ports.receivedFiles),
                 calendar = DayCalendar.System,
                 wallClock = SystemWallClock,
                 monotonicClock = SystemMonotonicClock,
@@ -148,6 +234,17 @@ internal class AppGraph(
     init {
         scope.launch { controller.picker.state.collect { pickerOpen.value = it != null } }
         directShare.start(scope, controller.radar.state)
+        // The radar on screen scans in its foreground mode (F-A2); the service hears it through the client.
+        scope.launch { controller.screen.collect { client.setRadarVisible(startedHosts > 0 && it == Screen.RADAR) } }
+        // A permission answered, or changed in Settings: the service reopens what it can (§11).
+        scope.launch { permissions.changes.collect { client.refreshPermissions() } }
+        // A nickname chosen before the service ran (onboarding) reaches the node once it is up.
+        scope.launch {
+            client.node.filterNotNull().collect { n ->
+                val chosen = prefs.nickname
+                if (!chosen.isNullOrBlank() && n.nickname.value != chosen) ports.setNickname(chosen)
+            }
+        }
     }
 
     /** Whether the "Haptic feedback" setting is on (design §11). */
@@ -159,13 +256,32 @@ internal class AppGraph(
     /** An activity started: grants may have changed in Settings meanwhile; the first one brings the UI to the front. */
     fun onHostStarted() {
         permissions.refresh()
-        if (startedHosts++ == 0) controller.onHostStarted()
+        if (startedHosts++ == 0) {
+            client.onUiStarted()
+            client.setRadarVisible(controller.screen.value == Screen.RADAR)
+            controller.onHostStarted()
+        }
     }
 
     /** An activity stopped; when none is started, the UI is in the background. */
     fun onHostStopped() {
         startedHosts = (startedHosts - 1).coerceAtLeast(0)
-        if (startedHosts == 0) controller.onHostStopped()
+        if (startedHosts == 0) {
+            controller.onHostStopped()
+            client.onUiStopped()
+        }
+    }
+
+    /** The camera read [text] from a code (design §4.4): a verified device is selected, anything else says why not. */
+    fun onScannedText(text: String) {
+        scope.launch {
+            val n = client.node.value ?: return@launch
+            when (val result = withContext(Dispatchers.Default) { n.resolveCode(text) }) {
+                is CodeScan.Verified -> controller.onCodeScanned(result.deviceKey)
+                CodeScan.Expired -> controller.onScanProblem(ScanStatus.EXPIRED)
+                is CodeScan.Invalid -> controller.onScanProblem(ScanStatus.INVALID)
+            }
+        }
     }
 
     /**
@@ -283,15 +399,44 @@ internal class AppGraph(
     }
 
     private fun applyAvatar(image: ImageBitmap) {
-        engine.settingsState.update { it.copy(avatar = image) }
-        engine.profile.update { it.copy(avatar = image) }
+        avatar.value = image
+    }
+
+    /** An Offer's preview (N12: at most 4 KiB from a stranger): decoded when it is a small image, else a glyph. */
+    private fun decodePreview(preview: Preview): FileThumb? {
+        if (!preview.mime.startsWith("image/")) return null
+        val bytes = preview.data.toByteArray()
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0 || bounds.outWidth > MAX_PREVIEW_SIDE ||
+            bounds.outHeight > MAX_PREVIEW_SIDE
+        ) {
+            return null
+        }
+        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+        return FileThumb.Picture(bitmap.asImageBitmap())
+    }
+
+    /** Opens a received file from History with the system viewer and a one-time read grant (F-D5: never automatic). */
+    private fun openUri(
+        uri: String,
+        mime: String?,
+    ) {
+        val intent =
+            Intent(Intent.ACTION_VIEW)
+                .setDataAndType(Uri.parse(uri), mime ?: "*/*")
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        if (!bridge.start(intent)) Log.w(TAG, "nothing can open $uri")
     }
 
     private enum class AvatarTarget { ONBOARDING, SETTINGS }
 
     private companion object {
-        /** The in-memory engine's own radar key; the real engine uses the identity key's hash. */
+        /** The radar key of this device until the node reports its device id. */
         const val SELF_KEY = "self"
+
+        /** Largest preview side decoded (the sender makes them 4 KiB JPEGs, N12). */
+        const val MAX_PREVIEW_SIDE = 512
         const val TAG = "Drop"
     }
 }

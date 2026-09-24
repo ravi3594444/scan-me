@@ -119,6 +119,11 @@ class AndroidNodeStores(
 
     override fun forget(transferId: TransferId) = catalog.forget(transferId.toHex())
 
+    override fun partialBytes(transferId: TransferId): Long =
+        index.all(transferId.toHex()).values.sumOf { ref ->
+            runCatching { if (resolver.exists(ref)) resolver.open(ref).use { it.length() } else 0L }.getOrDefault(0L)
+        }
+
     /**
      * The MediaStore volume name received files go to for [saveLocation], or null for the primary volume, for
      * `AndroidCapabilityDetector.setSaveVolume` (capability bit 10) and the `sdcard` hint (T-23).

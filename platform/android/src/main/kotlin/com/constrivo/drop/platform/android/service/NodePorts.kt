@@ -78,6 +78,9 @@ interface NodeStores {
 
     /** [transferId] ended here: what the stores kept in memory about it goes (its files and records on disk stay). */
     fun forget(transferId: TransferId) = Unit
+
+    /** The bytes [transferId]'s partials hold now, wherever they were written (Settings' "Cleared 12 MB"); blocking. */
+    fun partialBytes(transferId: TransferId): Long = 0
 }
 
 /**

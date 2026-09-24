@@ -1864,8 +1864,16 @@ class AndroidNode(
                 .getOrDefault(emptyList())
                 .filter { it.direction == TransferDirection.RECEIVE && it.id !in held }
                 .map { it.id }
-        val report = sweeper.cleaner.clearPartials(interrupted.map { it.id } + leftBehind)
-        return PartialsCleared(report.purged.size, report.failed.size)
+        val candidates = interrupted.map { it.id } + leftBehind
+        // Measured before they go, for "Cleared 12 MB"; an unreadable size counts as nothing freed.
+        val sizes =
+            withContext(config.io) {
+                candidates.associateWith { id ->
+                    runCatching { config.stores.partialBytes(id) }.getOrDefault(0L)
+                }
+            }
+        val report = sweeper.cleaner.clearPartials(candidates)
+        return PartialsCleared(report.purged.size, report.failed.size, report.purged.sumOf { sizes[it] ?: 0L })
     }
 
     /** History "Clear" (F-G2): deletes every finished transfer with its files (partials first); returns how many went. */

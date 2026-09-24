@@ -250,10 +250,11 @@ data class NodeCode(
     val expiresAtMillis: Long,
 )
 
-/** What "Clear partial files" removed (F-G5). */
+/** What "Clear partial files" removed (F-G5): transfers cleared, those that could not be, and the bytes freed. */
 data class PartialsCleared(
     val transfersCleared: Int,
     val failed: Int,
+    val bytesFreed: Long = 0,
 )
 
 /**

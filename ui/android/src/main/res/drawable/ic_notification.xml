@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The notifications' small icon (WP7ef): a single drop, white on transparent as the status bar requires. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,2.5C12,2.5 5.5,9.6 5.5,14.5A6.5,6.5 0,0 0,18.5 14.5C18.5,9.6 12,2.5 12,2.5ZM12,18.5A4,4 0,0 1,8 14.5L10,14.5A2,2 0,0 0,12 16.5L12,18.5Z" />
+</vector>

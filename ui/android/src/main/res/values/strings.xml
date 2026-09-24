@@ -9,4 +9,54 @@
     <string name="error_cannot_open">No app on this phone can open this</string>
     <!-- The name of a shared file whose app gave it none. -->
     <string name="file_untitled">Untitled</string>
+    <!--
+        WP7ef: the transfer service's notifications (design §5, §8.3, §11; AndroidNotificationTexts). One channel per
+        purpose; the ongoing one shows progress, the incoming offer is a heads-up with Accept and Decline.
+    -->
+    <string name="notification_channel_progress">Transfers</string>
+    <string name="notification_channel_offers">Incoming files</string>
+    <string name="notification_channel_completed">Finished transfers</string>
+    <string name="notification_channel_visibility">Visible to nearby devices</string>
+    <string name="notification_session_title">Visible to nearby devices</string>
+    <string name="notification_session_everyone">Everyone nearby can see this phone</string>
+    <string name="notification_session_trusted">Your trusted devices can see this phone</string>
+    <string name="notification_session_hidden">Hidden from nearby devices</string>
+    <string name="notification_sending">Sending to %1$s</string>
+    <string name="notification_receiving">Receiving from %1$s</string>
+    <plurals name="notification_transfers">
+        <item quantity="one">%d transfer</item>
+        <item quantity="other">%d transfers</item>
+    </plurals>
+    <string name="notification_connecting">Connecting…</string>
+    <string name="notification_waiting_answer">Waiting for %1$s to accept</string>
+    <string name="notification_reconnecting">Reconnecting…</string>
+    <string name="notification_waiting_peer">Waiting for %1$s</string>
+    <string name="notification_verifying">Checking files…</string>
+    <string name="notification_percent">%1$d%%</string>
+    <string name="notification_speed">%1$s MB/s</string>
+    <string name="notification_eta_minutes">%1$d min left</string>
+    <string name="notification_eta_seconds">%1$d s left</string>
+    <!-- Read by TalkBack at every 25 % (design §11): the notification's title, then the percentage. -->
+    <string name="notification_announce">%1$s, %2$d percent</string>
+    <string name="notification_offer_title">%1$s wants to send</string>
+    <plurals name="notification_files">
+        <item quantity="one">%d file</item>
+        <item quantity="other">%d files</item>
+    </plurals>
+    <string name="notification_offer_code">Code %1$s: same on both screens?</string>
+    <string name="notification_accept">Accept</string>
+    <string name="notification_decline">Decline</string>
+    <string name="notification_cancel">Cancel</string>
+    <string name="notification_open">Open</string>
+    <string name="notification_sent">Sent to %1$s</string>
+    <string name="notification_received">Received from %1$s</string>
+    <string name="notification_failed">Transfer with %1$s failed</string>
+    <string name="notification_cancelled">Transfer with %1$s cancelled</string>
+    <string name="notification_declined">%1$s declined</string>
+    <string name="notification_no_answer">No answer from %1$s</string>
+    <string name="notification_browser_title">Page for a computer is on</string>
+    <string name="notification_browser_starting">Starting…</string>
+    <string name="notification_browser_ready">Join %1$s, then open %2$s</string>
+    <!-- A toast when the transfer service could not start (a database of a newer app version, an unreadable identity). -->
+    <string name="error_service_start">Drop could not start: %1$s</string>
 </resources>

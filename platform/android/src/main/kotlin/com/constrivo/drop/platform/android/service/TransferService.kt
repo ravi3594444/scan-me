@@ -31,6 +31,7 @@ import com.constrivo.drop.platform.android.notification.TransferNotifications
 import com.constrivo.drop.platform.android.permission.RadioPermissionState
 import com.constrivo.drop.platform.android.permission.RadioPermissions
 import com.constrivo.drop.platform.android.power.AndroidPowerPolicy
+import com.constrivo.drop.platform.android.wifi.AndroidWifiStack
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -116,8 +117,10 @@ class TransferService : Service() {
         val powerPolicy: AndroidPowerPolicy,
         val stores: AndroidNodeStores,
         val background: CoroutineScope,
+        val wifi: AndroidWifiStack,
     ) {
         fun release() {
+            runCatching { wifi.close() }
             runCatching { detector.stop() }
             runCatching { powerPolicy.stop() }
             runCatching { connector.close() }
@@ -298,12 +301,15 @@ class TransferService : Service() {
         val connector = BluetoothChannelConnector(this, deviceLookup = beacon::deviceFor)
         val powerPolicy = AndroidPowerPolicy(this, background, onEvent = log.tagged("power"))
         val stores = AndroidNodeStores(this)
+        // WP7c/d: the phone's own Wi-Fi Direct, hotspot and LAN rungs and its NSD browse; a host may still supply
+        // its own (tests), which then replace the built-in ones.
+        val wifi = AndroidWifiStack(this, detector, AndroidClocks.elapsedRealtime, log.tagged("wifi"))
         val providers =
             try {
-                host.wifiProviders(this)
+                host.wifiProviders(this).ifEmpty { wifi.providers }
             } catch (e: RuntimeException) {
-                log.log(TAG, "no Wi-Fi providers: ${e.message}")
-                emptyList()
+                log.log(TAG, "no Wi-Fi providers from the host: ${e.message}")
+                wifi.providers
             }
         val browserHost = WifiBrowserHost(this, providers, shared.crypto, log = log.tagged("browser"))
         val node =
@@ -323,12 +329,12 @@ class TransferService : Service() {
                     monotonicClock = AndroidClocks.elapsedRealtime,
                     wifiProviders = providers,
                     lanDialer = host.lanDialer(this),
-                    lanEvents = host.lanEvents(this),
+                    lanEvents = merge(host.lanEvents(this), wifi.lanEvents()),
                     browserHost = browserHost.takeIf { it.available },
                     log = log.tagged("node"),
                 ),
             )
-        val held = Running(node, power, beacon, detector, connector, powerPolicy, stores, background)
+        val held = Running(node, power, beacon, detector, connector, powerPolicy, stores, background, wifi)
         detector.start()
         powerPolicy.start()
         try {
