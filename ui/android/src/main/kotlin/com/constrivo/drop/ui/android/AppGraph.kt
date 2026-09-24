@@ -30,6 +30,7 @@ import com.constrivo.drop.ui.shared.presenter.FeatureFlags
 import com.constrivo.drop.ui.shared.presenter.OnboardingConfig
 import com.constrivo.drop.ui.shared.presenter.Screen
 import com.constrivo.drop.ui.shared.presenter.SettingsSource
+import com.constrivo.drop.web.BrowserApprover
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -238,11 +239,18 @@ internal class AppGraph(
         scope.launch { controller.screen.collect { client.setRadarVisible(startedHosts > 0 && it == Screen.RADAR) } }
         // A permission answered, or changed in Settings: the service reopens what it can (§11).
         scope.launch { permissions.changes.collect { client.refreshPermissions() } }
-        // A nickname chosen before the service ran (onboarding) reaches the node once it is up.
+        // A nickname chosen before the service ran (onboarding) reaches the node once it is up; each node also gets
+        // the "Allow this computer?" prompt for its browser page (N15), answered on the main thread by the user.
         scope.launch {
             client.node.filterNotNull().collect { n ->
                 val chosen = prefs.nickname
                 if (!chosen.isNullOrBlank() && n.nickname.value != chosen) ports.setNickname(chosen)
+                n.browserApprover =
+                    BrowserApprover { request ->
+                        withContext(Dispatchers.Main) {
+                            controller.browserApproval.ask(request.browserNumber, request.remoteAddress, request.userAgent)
+                        }
+                    }
             }
         }
     }
