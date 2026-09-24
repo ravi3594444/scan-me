@@ -40,4 +40,8 @@ dependencies {
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.kotlin.test)
     androidTestImplementation(libs.kotlinx.coroutines.test)
+
+    // WP7c/d: the Wi-Fi Direct, hotspot and LAN links hand the engine TCP channels (TcpDataChannel, TcpListener) and
+    // implement its TcpSocketFactory (NetworkBoundSocketFactory), so core/transfer is part of this module's API.
+    api(project(":core:transfer"))
 }
