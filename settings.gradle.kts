@@ -20,6 +20,9 @@ rootProject.name = "drop"
 // Shared core: no Android or JVM-desktop imports (enforced by :tools:arch-test).
 include(":core:crypto", ":core:protocol", ":core:discovery", ":core:transfer", ":core:ladder", ":core:data")
 
+// The app-layer adapters every platform shares (resume store over core/data, the 24 h partials sweep).
+include(":platform:common")
+
 // Desktop platform layers and the shared desktop/browser pieces.
 include(":platform:desktop-win", ":platform:desktop-mac", ":platform:desktop-linux")
 include(":platform:desktop-common")

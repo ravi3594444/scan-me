@@ -1,12 +1,12 @@
-package com.constrivo.drop.platform.desktop.data
+package com.constrivo.drop.platform.common
 
-import com.constrivo.drop.core.crypto.InMemorySecretStorage
 import com.constrivo.drop.core.crypto.JcaCryptoProvider
 import com.constrivo.drop.core.data.DropData
 import com.constrivo.drop.core.data.NewTransfer
 import com.constrivo.drop.core.data.TransferDirection
 import com.constrivo.drop.core.data.TransferOutcome
 import com.constrivo.drop.core.data.TransferStatus
+import com.constrivo.drop.core.data.openJvm
 import com.constrivo.drop.core.discovery.DevicePlatform
 import com.constrivo.drop.core.protocol.ChunkHash
 import com.constrivo.drop.core.protocol.FileEntry
@@ -16,8 +16,8 @@ import com.constrivo.drop.core.transfer.receive.FileResumeState
 import com.constrivo.drop.core.transfer.receive.FileResumeStatus
 import com.constrivo.drop.core.transfer.receive.ResumeSummary
 import com.constrivo.drop.core.transfer.receive.UnitManifest
-import com.constrivo.drop.platform.desktop.data.DataResumeStore.Companion.toChunkManifest
-import com.constrivo.drop.platform.desktop.data.DataResumeStore.Companion.toUnitManifest
+import com.constrivo.drop.platform.common.DataResumeStore.Companion.toChunkManifest
+import com.constrivo.drop.platform.common.DataResumeStore.Companion.toUnitManifest
 import kotlinx.coroutines.runBlocking
 import java.nio.file.Files
 import java.nio.file.Path
@@ -34,7 +34,7 @@ import kotlin.test.assertTrue
 class DataResumeStoreTest {
     private val crypto = JcaCryptoProvider()
     private val dir: Path = Files.createTempDirectory("drop-resume-")
-    private val data: DropData = DesktopDatabase.inMemory(InMemorySecretStorage(), crypto)
+    private val data: DropData = DropData.openJvm(null, crypto = crypto)
     private val errors = ArrayList<String>()
     private val plans = FileResumePlanStore({ id -> dir.resolve(id.toHex()) })
     private val store = DataResumeStore(data, plans) { m, e -> errors += "$m: $e" }

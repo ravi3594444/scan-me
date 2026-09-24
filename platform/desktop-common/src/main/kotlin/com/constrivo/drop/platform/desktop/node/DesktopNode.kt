@@ -85,11 +85,11 @@ import com.constrivo.drop.core.transfer.session.SecureSession
 import com.constrivo.drop.core.transfer.session.SessionConfig
 import com.constrivo.drop.core.transfer.session.SessionHandshake
 import com.constrivo.drop.core.transfer.store.DirectoryFileStore
+import com.constrivo.drop.platform.common.DataResumeStore
+import com.constrivo.drop.platform.common.FileResumePlanStore
+import com.constrivo.drop.platform.common.PartialsSweeper
 import com.constrivo.drop.platform.desktop.DesktopPowerPolicy
-import com.constrivo.drop.platform.desktop.data.DataResumeStore
 import com.constrivo.drop.platform.desktop.data.DesktopDatabase
-import com.constrivo.drop.platform.desktop.data.FileResumePlanStore
-import com.constrivo.drop.platform.desktop.data.PartialsSweeper
 import com.constrivo.drop.platform.desktop.files.MarkingFileStore
 import com.constrivo.drop.platform.desktop.files.PublishedFileEvent
 import com.constrivo.drop.platform.desktop.files.SendFile

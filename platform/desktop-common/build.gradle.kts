@@ -9,6 +9,8 @@ dependencies {
     api(project(":core:ladder"))
     api(project(":core:data"))
     api(project(":web-receive"))
+    // DataResumeStore, FileResumePlanStore and PartialsSweeper, shared with Android.
+    api(project(":platform:common"))
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.jmdns)
     // core/data declares the SQLite JDBC driver compileOnly so it stays out of the APK; desktops bring it (WP6 note).

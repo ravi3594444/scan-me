@@ -1,4 +1,4 @@
-package com.constrivo.drop.platform.desktop.data
+package com.constrivo.drop.platform.common
 
 import com.constrivo.drop.core.data.ChunkManifest
 import com.constrivo.drop.core.data.DropData
