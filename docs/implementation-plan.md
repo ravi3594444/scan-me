@@ -263,6 +263,8 @@ Calendar if sessions run back to back with same‑day review: the device‑free 
 | WP5 Transport ladder core | Done | Planner, S5 negotiation, per-pair stable Wi‑Fi Direct credentials (N7), lifecycle reducer with 5 GHz verify and one re-form, `LadderRunner` racing the LAN probe against Wi‑Fi Direct (N9), desktops and browsers join the phone's group as legacy clients (N8, N10), badge and hint rules. 122 tests. New badge keys and hint copy need design sign-off |
 | WP6 Data layer | Done | SQLDelight schema v1 with the S3 and N5 additions, repositories with Flow, stats that reconcile with History, 24 h resume-data cleaner, driver factory hook for SQLCipher. 134 tests |
 | WP9 Browser receive | Done | Single-file page under 30 KB, Ktor server with token path and per-browser "Allow this computer?" approval (N15), streamed STORED zip with ZIP64, Range, uploads, idle shutdown, a small mDNS responder for `drop.local`, Playwright end-to-end script. 156 tests |
+| WP4 Transfer engine core | Done | Secure sessions (handshake, Finished, StreamOpen), Bluetooth head start in 16 KiB blocks and the hop, work-stealing Wi‑Fi streams (4/8/2), batched acks, heartbeats, Resume and reconnects with a fresh handshake (N3), N5 durability order, file-name sanitising, `DirectoryFileStore`, TCP channels, and `LadderTransferBridge` wiring the ladder to the engine. Measured on loopback: about 104 MB/s, about 74 MB extra heap for a 256 MiB transfer. 99 + 3 tests |
+| WP8 Shared UI and Android shell | Done | Radar, send and receive flows, drop animation, tray, dashboard tabs, onboarding, `en` + `hi` strings (Hindi needs native review), accessibility, presenters, screenshot tests; Android share sheet, direct-share shortcuts, just-in-time permissions. 157 + 20 tests. Not built yet: CameraX/ZXing scanning and progress notifications (need WP7's service) |
 
 ### Carried forward from WP1–WP3
 
@@ -282,3 +284,12 @@ Calendar if sessions run back to back with same‑day review: the device‑free 
 - **WP10:** desktops add the SQLite JDBC driver themselves and can reuse `ReceiveServer` for the no-Bluetooth PC path.
 - **WP11:** the nightly job runs the ZIP64 test (needs about 4.5 GB free disk) and can run the Playwright script.
 - **WP12:** the stable per-pair SSID links a trusted pair's sessions on the air; note it in the privacy review.
+
+### Carried forward from WP4 and WP8
+
+- **WP7** supplies the Android adapters the engine needs: a MediaStore/SAF `FileStore` (N14), a `TcpSocketFactory` bound to the link's `Network`, the Bluetooth `DataChannel`s, a real `PowerPolicy`, and the `TransferService` that replaces the in-memory ports in `ui/android`'s `AppGraph`. It also builds CameraX + ZXing scanning (calling `onCodeScanned` with a verified device key), progress notifications, and the Language setting via `LocaleManager` on 13+.
+- **App layer (WP7e, WP10a):** adapt core/data's manifest and file repositories to the engine's `ResumeStore`, and run the 24 h sweep of partials for transfers that are never resumed.
+- **WP11:** run the nightly sizes (5,000 small files, a 1 GiB throughput run, a 2 GiB memory run with `-Pdrop.nightly=true`).
+- **Crypto follow-up:** reconnect handshakes with a pinned identity are charged against the pairing-attempt limiter; decide whether a pinned expected identity may skip it.
+- **Engine follow-ups:** control shares the first Wi‑Fi stream with chunks, so a control message can wait behind one 4 MiB write; a bundle of more than about 1,360 tiny files delays first progress to the second Bluetooth block.
+- **Design sign-off:** the AA-contrast colour variants (primary button `#285EE8`), new copy keys, and the 150–200% font layouts.
