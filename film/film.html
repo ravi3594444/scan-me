@@ -1,0 +1,856 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>constrivo. launch film</title>
+<style>
+@font-face { font-family: Archivo; src: url(assets/fonts/Archivo-VF.woff2) format('woff2'); font-weight: 100 900; font-stretch: 62% 125%; font-display: block; }
+@font-face { font-family: Geist; src: url(assets/fonts/Geist-Variable.woff2) format('woff2'); font-weight: 100 900; font-display: block; }
+:root {
+  --canvas: #f2efe9;
+  --ink: #0b0b0c;
+  --ui: Geist, system-ui, sans-serif;
+}
+html, body { margin: 0; background: #000; }
+#stage { position: relative; width: 1440px; height: 1440px; overflow: hidden; background: var(--canvas); contain: strict; }
+#world { position: absolute; left: 0; top: 0; width: 1440px; height: 1440px; transform-origin: 0 0; }
+.abs { position: absolute; left: 0; top: 0; }
+.scene { position: absolute; left: 0; top: 0; width: 1440px; height: 1440px; transform-origin: 0 0; }
+.cover { position: absolute; display: block; max-width: none; }
+
+/* wordmark */
+.wm-l { position: absolute; top: 0; font: 800 170px Archivo; font-stretch: 125%; line-height: 1; white-space: pre; color: var(--ink); transform-origin: 0 0; }
+.black { position: absolute; background: var(--ink); overflow: hidden; }
+.mask { position: absolute; overflow: hidden; }
+.label { position: absolute; left: 0; top: 0; width: 100%; text-align: center; font: 600 58px var(--ui); letter-spacing: -0.015em; color: #fff; white-space: nowrap; }
+
+/* liquid glass */
+.glass { position: absolute; overflow: hidden; transform-origin: 50% 50%;
+  box-shadow: 0 14px 34px rgba(24, 18, 10, .20), 0 2px 7px rgba(24, 18, 10, .12); }
+.glass-refr { position: absolute; left: 0; top: 0; overflow: hidden; }
+.glass-bd { position: absolute; left: 0; top: 0; transform-origin: 0 0; filter: saturate(1.4) brightness(1.07) contrast(1.02); }
+.glass-tint { position: absolute; inset: 0; background: rgba(255, 255, 255, .07); }
+.glass-rim { position: absolute; inset: 0; border-radius: inherit; padding: 1.6px;
+  background: conic-gradient(from 200deg, rgba(255,255,255,.95), rgba(255,255,255,.18) 22%, rgba(255,255,255,.08) 34%, rgba(255,255,255,.62) 52%, rgba(255,255,255,.14) 70%, rgba(255,255,255,.10) 82%, rgba(255,255,255,.95));
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor; mask-composite: exclude; }
+.glass-sheen { position: absolute; inset: 0; border-radius: inherit; background: linear-gradient(180deg, rgba(255,255,255,.16), rgba(255,255,255,0) 42%); }
+.gg-wrap { position: absolute; transform-origin: 50% 50%; filter: drop-shadow(0 8px 16px rgba(20, 14, 6, .22)); }
+.gg { position: absolute; left: 0; top: 0; overflow: hidden; -webkit-mask-size: 100% 100%; mask-size: 100% 100%; }
+.gg-hl { position: absolute; inset: 0; background-size: 100% 100%; }
+
+/* cursor */
+#cursor { position: absolute; left: 0; top: 0; width: 34px; height: 50px; transform-origin: 0 0; filter: drop-shadow(0 2px 3px rgba(0,0,0,.28)); z-index: 50; }
+
+/* ui text */
+.ui { font-family: var(--ui); position: absolute; white-space: nowrap; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="world"></div>
+</div>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs id="fx">
+  <filter id="goo" x="-30%" y="-60%" width="160%" height="220%" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceGraphic" stdDeviation="14" result="b"/>
+    <feColorMatrix in="b" type="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 26 -12" result="g"/>
+    <feComposite in="SourceGraphic" in2="g" operator="atop"/>
+  </filter>
+</defs></svg>
+<script>
+'use strict';
+// ============================================================================
+// time
+// ============================================================================
+const BEAT = 0.5;                 // 120 BPM
+const b = n => n * BEAT;          // beat index -> seconds
+const FPS = 60;
+
+const clamp = (x, a = 0, c = 1) => Math.min(c, Math.max(a, x));
+const lerp = (a, c, u) => a + (c - a) * u;
+const inv = (a, c, x) => clamp((x - a) / (c - a));
+
+// Closed-form step response of a damped spring, 0 -> 1, starting at t = 0.
+function spring(t, p) {
+  if (t <= 0) return 0;
+  const { w, z } = p;
+  if (z < 1) {
+    const wd = w * Math.sqrt(1 - z * z);
+    return 1 - Math.exp(-z * w * t) * (Math.cos(wd * t) + (z * w / wd) * Math.sin(wd * t));
+  }
+  return 1 - Math.exp(-w * t) * (1 + w * t);
+}
+// time from start to the first overshoot peak (used to land a move on a beat)
+const peak = p => Math.PI / (p.w * Math.sqrt(1 - p.z * p.z));
+
+const SP = {
+  ui:    { w: 20, z: 0.86 },
+  snap:  { w: 17, z: 0.56 },
+  pop:   { w: 24, z: 0.46 },
+  firm:  { w: 26, z: 0.9 },
+  soft:  { w: 10, z: 0.96 },
+  cam:   { w: 9,  z: 1.0 },
+  drag:  { w: 8,  z: 1.0 },
+  crit:  { w: 16, z: 1.0 },
+};
+
+// A value with many targets: the sum of one spring per change, so it stays a pure function of t.
+function track(t, v0, keys) {
+  let v = v0, prev = v0;
+  for (const k of keys) {
+    const [tk, target, p = SP.ui] = k;
+    v += (target - prev) * spring(t - tk, p);
+    prev = target;
+  }
+  return v;
+}
+function track2(t, p0, keys) {
+  return [track(t, p0[0], keys.map(k => [k[0], k[1][0], k[2]])), track(t, p0[1], keys.map(k => [k[0], k[1][1], k[3] || k[2]]))];
+}
+
+// ============================================================================
+// dom
+// ============================================================================
+const SVGNS = 'http://www.w3.org/2000/svg';
+function el(tag, cls, parent, style) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (style) Object.assign(e.style, style);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+function sv(tag, parent, attrs) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+function box(e, x, y, w, h) {
+  e.style.left = x + 'px'; e.style.top = y + 'px';
+  e.style.width = Math.max(0, w) + 'px'; e.style.height = Math.max(0, h) + 'px';
+}
+const show = (e, on) => { e.style.visibility = on ? 'inherit' : 'hidden'; };
+const px = v => v + 'px';
+
+const stage = document.getElementById('stage');
+const world = document.getElementById('world');
+const fx = document.getElementById('fx');
+
+let pending = [];   // promises a frame must wait for (displacement maps, video seeks)
+
+// ============================================================================
+// assets
+// ============================================================================
+const PHOTOS = {
+  day:    { src: 'assets/photos/taipei-day.jpg',    fx: .5,  fy: .5 },
+  golden: { src: 'assets/photos/taipei-golden.jpg', fx: .5,  fy: .5 },
+  hero:   { src: 'assets/photos/px-5847445.jpg',    fx: .5,  fy: .5 },
+  p1: { src: 'assets/photos/px-11435856.jpg', fx: .5, fy: .5 },
+  p2: { src: 'assets/photos/px-15397751.jpg', fx: .5, fy: .5 },
+  p3: { src: 'assets/photos/px-17697814.jpg', fx: .5, fy: .6 },
+  p4: { src: 'assets/photos/px-3034343.jpg',  fx: .5, fy: .5 },
+  p5: { src: 'assets/photos/px-35209848.jpg', fx: .5, fy: .5 },
+  p6: { src: 'assets/photos/px-35260667.jpg', fx: .5, fy: .5 },
+  p7: { src: 'assets/photos/px-33724910.jpg', fx: .5, fy: .5 },
+};
+async function loadPhotos() {
+  for (const p of Object.values(PHOTOS)) {       // one at a time: parallel decodes of large jpegs can fail
+    const im = new Image(); im.src = p.src;
+    await im.decode().catch(e => { throw new Error('photo ' + p.src + ' ' + e.message); });
+    p.w = im.naturalWidth; p.h = im.naturalHeight; p.im = im;
+  }
+}
+// cover-fit a photo into a box, returns the image rect in the box's coordinates
+function cover(p, w, h, zoom = 1) {
+  const s = Math.max(w / p.w, h / p.h) * zoom;
+  const dw = p.w * s, dh = p.h * s;
+  return { x: (w - dw) * p.fx, y: (h - dh) * p.fy, w: dw, h: dh };
+}
+function photoImg(key, parent) {
+  const im = el('img', 'cover', parent); im.src = PHOTOS[key].src; im.draggable = false; return im;
+}
+// place <img> to cover box (bx,by,bw,bh) (coordinates of the img's parent)
+function placeCover(im, key, bx, by, bw, bh, zoom = 1) {
+  const r = cover(PHOTOS[key], bw, bh, zoom);
+  box(im, bx + r.x, by + r.y, r.w, r.h);
+}
+
+// ============================================================================
+// liquid glass: every glass element holds its own clone of the scene behind it,
+// refracted through an feImage displacement map (rounded-rect distance field),
+// three feDisplacementMaps at slightly different scales for chromatic edges.
+// ============================================================================
+const mapCache = new Map();
+function getMap(key, make) {
+  let m = mapCache.get(key);
+  if (!m) {
+    const url = make();
+    const im = new Image(); im.src = url;
+    m = { url, ready: im.decode().catch(() => {}) };
+    mapCache.set(key, m);
+  }
+  return m;
+}
+// signed distance to a rounded rect centred at origin
+function sdRRect(x, y, hw, hh, r) {
+  const qx = Math.abs(x) - (hw - r), qy = Math.abs(y) - (hh - r);
+  return Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0) - r;
+}
+function rrectMap(w, h, r, o) {
+  const res = o.res;
+  const W = Math.max(2, Math.ceil(w * res)), H = Math.max(2, Math.ceil(h * res));
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const ctx = c.getContext('2d'); const img = ctx.createImageData(W, H); const d = img.data;
+  const hw = w / 2, hh = h / 2, rr = Math.min(r, hw, hh);
+  const bez = Math.max(1, o.lens ? Math.min(hw, hh) : Math.min(o.bezel, hw, hh));
+  const rn = Math.min(Math.max(rr, bez), hw, hh);           // smoother radius for the normals
+  for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+    const x = (i + .5) / res - hw, y = (j + .5) / res - hh;
+    const e = -sdRRect(x, y, hw, hh, rr);                     // depth inside the shape
+    // outward normal from the gradient of the smoothed field
+    const gx = sdRRect(x + .5, y, hw, hh, rn) - sdRRect(x - .5, y, hw, hh, rn);
+    const gy = sdRRect(x, y + .5, hw, hh, rn) - sdRRect(x, y - .5, hw, hh, rn);
+    const gl = Math.hypot(gx, gy) || 1;
+    let m = 0;
+    if (e > 0) {
+      const u = clamp(1 - e / bez);
+      m = o.lens ? (0.55 * u + 0.45 * Math.pow(u, 4)) : Math.pow(u, o.profile);
+    } else m = 1;
+    const k = (j * W + i) * 4;
+    d[k] = 128 - 127 * (gx / gl) * m;                          // sample inward: convex lens
+    d[k + 1] = 128 - 127 * (gy / gl) * m;
+    d[k + 2] = 128; d[k + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  return c.toDataURL();
+}
+let GID = 0;
+function glassFilter(id) {
+  const f = sv('filter', fx, { id, x: 0, y: 0, width: 10, height: 10, filterUnits: 'userSpaceOnUse', primitiveUnits: 'userSpaceOnUse', 'color-interpolation-filters': 'sRGB' });
+  const fi = sv('feImage', f, { result: 'map', preserveAspectRatio: 'none', x: 0, y: 0, width: 10, height: 10 });
+  const mats = {
+    r: '1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0',
+    g: '0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0',
+    b: '0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0',
+  };
+  const dm = {};
+  for (const ch of ['r', 'g', 'b']) {
+    dm[ch] = sv('feDisplacementMap', f, { in: 'SourceGraphic', in2: 'map', scale: 0, xChannelSelector: 'R', yChannelSelector: 'G', result: 'd' + ch });
+    sv('feColorMatrix', f, { in: 'd' + ch, type: 'matrix', values: mats[ch], result: ch });
+  }
+  sv('feComposite', f, { in: 'r', in2: 'g', operator: 'arithmetic', k1: 0, k2: 1, k3: 1, k4: 0, result: 'rg' });
+  sv('feComposite', f, { in: 'rg', in2: 'b', operator: 'arithmetic', k1: 0, k2: 1, k3: 1, k4: 0 });
+  return { f, fi, dm };
+}
+class Glass {
+  constructor(parent, opt = {}) {
+    this.o = Object.assign({ bezel: 24, depth: 20, chroma: 0.14, profile: 2.2, res: 0.5, lens: false, tint: .07 }, opt);
+    this.id = 'gl' + (GID++);
+    this.el = el('div', 'glass', parent);
+    this.refr = el('div', 'glass-refr', this.el);
+    this.bd = el('div', 'glass-bd', this.refr);
+    this.tint = el('div', 'glass-tint', this.el, { background: `rgba(255,255,255,${this.o.tint})` });
+    this.sheen = el('div', 'glass-sheen', this.el);
+    this.rim = el('div', 'glass-rim', this.el);
+    this.ff = glassFilter(this.id);
+    this.refr.style.filter = `url(#${this.id})`;
+  }
+  // geometry in parent coordinates; s scales about the centre
+  set(g) {
+    const w = Math.max(0, g.w), h = Math.max(0, g.h), s = g.s ?? 1;
+    const r = Math.min(g.r ?? h / 2, w / 2, h / 2);
+    const on = w >= 2 && h >= 2 && s > 0.001 && (g.op ?? 1) > 0;
+    show(this.el, on);
+    if (!on) return;
+    box(this.el, g.x, g.y, w, h);
+    Object.assign(this.el.style, { borderRadius: px(r), transform: `scale(${s})`, opacity: g.op ?? 1 });
+    box(this.refr, 0, 0, w, h);
+    // the clone is authored in parent coordinates: undo the element's own placement and scale
+    this.bd.style.transform = `translate(${w / 2}px,${h / 2}px) scale(${1 / s}) translate(${-g.x - w / 2}px,${-g.y - h / 2}px)`;
+    const o = this.o;
+    const q = v => Math.round(v);
+    const key = `rr|${q(w)}|${q(h)}|${q(r)}|${o.bezel}|${o.profile}|${o.lens}|${o.res}`;
+    const m = getMap(key, () => rrectMap(w, h, r, o));
+    pending.push(m.ready);
+    const { f, fi, dm } = this.ff;
+    fi.setAttribute('href', m.url);
+    for (const n of [f, fi]) { n.setAttribute('width', w); n.setAttribute('height', h); }
+    const bz = o.lens ? Math.min(w, h) / 2 : Math.min(o.bezel, w / 2, h / 2);
+    const dmax = o.lens ? 0.85 * bz / 2.35 : 0.85 * bz / o.profile;   // keep e + D*m(e) monotonic: no folded rims
+    const dp = 2 * Math.min(g.depth ?? o.depth, dmax), c = o.chroma;
+    dm.r.setAttribute('scale', dp * (1 - c)); dm.g.setAttribute('scale', dp); dm.b.setAttribute('scale', dp * (1 + c));
+    this.g = { x: g.x, y: g.y, w, h, r, s };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// glass glyphs: a canvas distance field per glyph gives the map, mask and highlights
+// ---------------------------------------------------------------------------
+function edt1(f, n, d, v, z) {           // Felzenszwalb squared distance transform, 1D
+  let k = 0; v[0] = 0; z[0] = -Infinity; z[1] = Infinity;
+  for (let q = 1; q < n; q++) {
+    let s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+    while (s <= z[k]) { k--; s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]); }
+    k++; v[k] = q; z[k] = s; z[k + 1] = Infinity;
+  }
+  k = 0;
+  for (let q = 0; q < n; q++) { while (z[k + 1] < q) k++; d[q] = (q - v[k]) * (q - v[k]) + f[v[k]]; }
+}
+function edt(inside, W, H) {             // distance from inside pixels to the nearest outside pixel
+  const INF = 1e20, g = new Float64Array(W * H);
+  for (let i = 0; i < W * H; i++) g[i] = inside[i] ? INF : 0;
+  const n = Math.max(W, H), f = new Float64Array(n), d = new Float64Array(n), v = new Int32Array(n), z = new Float64Array(n + 1);
+  for (let x = 0; x < W; x++) { for (let y = 0; y < H; y++) f[y] = g[y * W + x]; edt1(f, H, d, v, z); for (let y = 0; y < H; y++) g[y * W + x] = d[y]; }
+  for (let y = 0; y < H; y++) { for (let x = 0; x < W; x++) f[x] = g[y * W + x]; edt1(f, W, d, v, z); for (let x = 0; x < W; x++) g[y * W + x] = Math.sqrt(d[x]); }
+  return g;
+}
+function glyphAssets(text, font, stretch, o) {
+  const cm = document.createElement('canvas').getContext('2d');
+  cm.font = font; cm.fontStretch = stretch;
+  const m = cm.measureText(text);
+  const P = Math.ceil(o.bezel + 6);
+  const inkL = -m.actualBoundingBoxLeft, inkR = m.actualBoundingBoxRight;
+  const W = Math.ceil(inkR - inkL + 2 * P), H = Math.ceil(m.actualBoundingBoxAscent + m.actualBoundingBoxDescent + 2 * P);
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const ctx = c.getContext('2d'); ctx.font = font; ctx.fontStretch = stretch; ctx.fillStyle = '#fff';
+  const ox = P - inkL, oy = P + m.actualBoundingBoxAscent;
+  ctx.fillText(text, ox, oy);
+  const a = ctx.getImageData(0, 0, W, H).data;
+  const inside = new Uint8Array(W * H);
+  for (let i = 0; i < W * H; i++) inside[i] = a[i * 4 + 3] > 127 ? 1 : 0;
+  const D0 = edt(inside, W, H);
+  // soften the field so its gradient is smooth
+  const D = new Float64Array(W * H);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    let s = 0, n = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const xx = x + dx, yy = y + dy; if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
+      s += D0[yy * W + xx]; n++;
+    }
+    D[y * W + x] = s / n;
+  }
+  const map = ctx.createImageData(W, H), hl = ctx.createImageData(W, H);
+  const Lx = -0.55, Ly = -0.83;           // light from the top left
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = y * W + x, k = i * 4;
+    const dxv = (D[y * W + Math.min(W - 1, x + 1)] - D[y * W + Math.max(0, x - 1)]) / 2;
+    const dyv = (D[Math.min(H - 1, y + 1) * W + x] - D[Math.max(0, y - 1) * W + x]) / 2;
+    const gl = Math.hypot(dxv, dyv) || 1;
+    const nx = dxv / gl, ny = dyv / gl;     // points inward
+    const e = D0[i];
+    let mm = 0;
+    if (inside[i]) mm = Math.pow(clamp(1 - e / o.bezel), o.profile);
+    map.data[k] = 128 + 127 * nx * mm; map.data[k + 1] = 128 + 127 * ny * mm; map.data[k + 2] = 128; map.data[k + 3] = 255;
+    // rim light on the edge facing the light, a darker rim on the far edge
+    const alpha = a[k + 3] / 255;
+    if (alpha > 0) {
+      const facing = -(nx * Lx + ny * Ly);   // outward normal . light
+      const band = clamp(1 - e / 3.2);
+      const band2 = clamp(1 - e / 7);
+      const lit = clamp(facing) ** 1.4 * band * 0.95 + 0.22 * band;
+      const shade = clamp(-facing) ** 1.2 * band2 * 0.22;
+      if (lit >= shade) { hl.data[k] = 255; hl.data[k + 1] = 255; hl.data[k + 2] = 255; hl.data[k + 3] = 255 * clamp(lit) * alpha; }
+      else { hl.data[k] = 20; hl.data[k + 1] = 14; hl.data[k + 2] = 6; hl.data[k + 3] = 255 * shade * alpha; }
+    }
+  }
+  const toURL = id => { const cc = document.createElement('canvas'); cc.width = W; cc.height = H; cc.getContext('2d').putImageData(id, 0, 0); return cc.toDataURL(); };
+  const mask = c.toDataURL();
+  return { W, H, ox, oy, adv: m.width, map: toURL(map), mask, hl: toURL(hl) };
+}
+class GlassGlyph {
+  constructor(parent, text, font, stretch, opt = {}) {
+    this.o = Object.assign({ bezel: 12, depth: 12, chroma: 0.18, profile: 1.8 }, opt);
+    this.a = glyphAssets(text, font, stretch, this.o);
+    const { W, H } = this.a;
+    this.wrap = el('div', 'gg-wrap', parent, { width: px(W), height: px(H) });
+    this.el = el('div', 'gg', this.wrap, { width: px(W), height: px(H), webkitMaskImage: `url(${this.a.mask})`, maskImage: `url(${this.a.mask})` });
+    this.refr = el('div', 'glass-refr', this.el, { width: px(W), height: px(H) });
+    this.bd = el('div', 'glass-bd', this.refr);
+    this.tint = el('div', 'glass-tint', this.el, { background: `rgba(255,255,255,${this.o.frost ?? .10})` });
+    this.hl = el('div', 'gg-hl', this.el, { backgroundImage: `url(${this.a.hl})` });
+    this.id = 'gg' + (GID++);
+    this.ff = glassFilter(this.id);
+    const { f, fi, dm } = this.ff;
+    for (const n of [f, fi]) { n.setAttribute('width', W); n.setAttribute('height', H); }
+    fi.setAttribute('href', this.a.map);
+    const dp = 2 * Math.min(this.o.depth, 0.85 * this.o.bezel / this.o.profile), c = this.o.chroma;
+    dm.r.setAttribute('scale', dp * (1 - c)); dm.g.setAttribute('scale', dp); dm.b.setAttribute('scale', dp * (1 + c));
+    this.refr.style.filter = `url(#${this.id})`;
+    const im = new Image(); im.src = this.a.map; this.ready = im.decode().catch(e => { throw new Error('glyph ' + text + ' ' + this.a.W + 'x' + this.a.H + ' ' + this.a.map.slice(0, 40)); });
+  }
+  // place by pen origin (baseline x,y) in parent coordinates
+  set(x, y, s = 1, op = 1) {
+    const { W, H, ox, oy } = this.a;
+    const gx = x - ox, gy = y - oy;
+    show(this.wrap, s > 0.001 && op > 0);
+    this.wrap.style.left = px(gx); this.wrap.style.top = px(gy);
+    this.wrap.style.transform = `scale(${s})`; this.wrap.style.opacity = op;
+    this.bd.style.transform = `translate(${W / 2}px,${H / 2}px) scale(${1 / s}) translate(${-gx - W / 2}px,${-gy - H / 2}px)`;
+  }
+}
+
+// ============================================================================
+// iris: six blades around a hexagonal aperture. Each blade is its two vertices,
+// both edge extensions and the short arc between them (the housing clips the arc).
+// ============================================================================
+class Iris {
+  constructor(parent) {
+    this.svg = sv('svg', parent, { class: 'abs', overflow: 'visible' });
+    this.svg.style.position = 'absolute';
+    const d = sv('defs', this.svg, {});
+    this.grads = []; this.blades = []; this.edges = [];
+    this.gid = 'ir' + (GID++);
+    for (let i = 0; i < 6; i++) {
+      const g = sv('linearGradient', d, { id: `${this.gid}g${i}`, gradientUnits: 'userSpaceOnUse' });
+      sv('stop', g, { offset: 0, 'stop-color': '#2b2b2f' });
+      sv('stop', g, { offset: 0.35, 'stop-color': '#18181b' });
+      sv('stop', g, { offset: 1, 'stop-color': '#0d0d0f' });
+      this.grads.push(g);
+    }
+    for (let i = 0; i < 6; i++) this.blades.push(sv('path', this.svg, { fill: `url(#${this.gid}g${i})` }));
+    for (let i = 0; i < 6; i++) this.edges.push(sv('path', this.svg, { stroke: 'rgba(255,255,255,.16)', 'stroke-width': 1.4, fill: 'none' }));
+  }
+  // w,h: housing size (the housing element clips); a: aperture radius; rot: radians
+  set(w, h, a, rot) {
+    const svg = this.svg;
+    svg.setAttribute('width', w); svg.setAttribute('height', h);
+    svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+    const cx = w / 2, cy = h / 2, L = 4 * Math.hypot(w, h) + 10;
+    const hid = a > Math.hypot(w, h) / 2 / Math.cos(Math.PI / 6) + 2;
+    show(svg, !hid);
+    if (hid) return;
+    const V = k => [cx + a * Math.cos(rot + k * Math.PI / 3), cy + a * Math.sin(rot + k * Math.PI / 3)];
+    const D = k => { const an = rot + k * Math.PI / 3 + 2 * Math.PI / 3; return [Math.cos(an), Math.sin(an)]; };
+    for (let i = 0; i < 6; i++) {
+      const vi = V(i), vj = V(i + 1), di = D(i), dp = D(i - 1);
+      // blade i: V_i -> V_i+1 -> extension of edge i -> (arc, clipped) -> extension of edge i-1 -> V_i
+      const f1 = [vi[0] + L * di[0], vi[1] + L * di[1]];
+      const f2 = [vi[0] + L * dp[0], vi[1] + L * dp[1]];
+      this.blades[i].setAttribute('d', `M${vi[0]},${vi[1]} L${vj[0]},${vj[1]} L${f1[0]},${f1[1]} L${f2[0]},${f2[1]} Z`);
+      // the visible seam: edge i-1 extended past V_i
+      this.edges[i].setAttribute('d', `M${vi[0]},${vi[1]} L${f2[0]},${f2[1]}`);
+      // shade across the blade: bright along the aperture edge, dark towards the rim
+      const nx = -di[1], ny = di[0];          // normal of edge i (outward for this winding)
+      const g = this.grads[i];
+      const mx = (vi[0] + vj[0]) / 2, my = (vi[1] + vj[1]) / 2;
+      g.setAttribute('x1', mx); g.setAttribute('y1', my);
+      g.setAttribute('x2', mx - nx * Math.max(w, h) * .6); g.setAttribute('y2', my - ny * Math.max(w, h) * .6);
+    }
+  }
+}
+
+// ============================================================================
+// cursor (world space, so it scales with the camera)
+// ============================================================================
+const cursor = el('div', '', null);
+cursor.id = 'cursor';
+cursor.innerHTML = `<svg width="34" height="50" viewBox="-2 -2 22 32"><path d="M0 0 L0 23.2 L5.6 17.9 L9.4 26.9 L13.1 25.3 L9.3 16.5 L16.6 16.5 Z" fill="#0b0b0c" stroke="#fff" stroke-width="1.7" stroke-linejoin="round"/></svg>`;
+function setCursor(x, y, press, vis = true, scale = 1) {
+  show(cursor, vis);
+  cursor.style.transform = `translate(${x}px,${y}px) scale(${scale * (1 - 0.16 * press)})`;
+}
+// presses: list of [down, up]
+function pressAmt(t, presses) {
+  let v = 0;
+  for (const [d, u] of presses) v += spring(t - d, SP.firm) - spring(t - u, SP.snap);
+  return clamp(v, 0, 1.2);
+}
+
+// ============================================================================
+// camera
+// ============================================================================
+function setCamera(x, y, s) {
+  world.style.transform = `translate(720px,720px) scale(${s}) translate(${-x}px,${-y}px)`;
+}
+
+// ============================================================================
+// SCENE 1 - OPEN: wordmark -> dot -> pill -> label -> iris -> photo
+// ============================================================================
+const WM = { text: 'constrivo', size: 170 };
+const open = {};
+function buildOpen() {
+  const root = el('div', 'scene', world); open.root = root;
+  // measure glyph advances at every wdth we need
+  const meas = el('span', 'wm-l', stage, { visibility: 'hidden' });
+  const adv = (ch, wd) => { meas.style.fontVariationSettings = `'wdth' ${wd}, 'wght' 800`; meas.textContent = ch; return meas.getBoundingClientRect().width; };
+  open.letters = [...WM.text].map(ch => {
+    const tab = []; for (let wd = 62; wd <= 125; wd++) tab.push(adv(ch, wd));
+    return { ch, tab, a125: tab[tab.length - 1], a62: tab[0] };
+  });
+  const cm = document.createElement('canvas').getContext('2d');
+  cm.font = `800 ${WM.size}px Archivo`; cm.fontStretch = 'expanded';
+  const dm = cm.measureText('.');
+  meas.style.fontVariationSettings = `'wdth' 125, 'wght' 800`; meas.textContent = '.';
+  const dotAdv = meas.getBoundingClientRect().width;
+  meas.textContent = 'x';
+  cm.font = `800 ${WM.size}px Archivo`; const xm = cm.measureText('x');
+  meas.remove();
+  const total = open.letters.reduce((s, l) => s + l.a125, 0) + dotAdv;
+  const x0 = 720 - total / 2;
+  const baseline = 720 + xm.actualBoundingBoxAscent / 2;
+  let x = x0;
+  open.letters.forEach(l => { l.x = x; x += l.a125; });
+  open.xRef = x;                                  // letters converge on the start of the period
+  open.dot = { x: x - dm.actualBoundingBoxLeft, y: baseline - dm.actualBoundingBoxAscent, w: dm.actualBoundingBoxLeft + dm.actualBoundingBoxRight, h: dm.actualBoundingBoxAscent + dm.actualBoundingBoxDescent };
+  open.dot.cx = open.dot.x + open.dot.w / 2; open.dot.cy = open.dot.y + open.dot.h / 2;
+  open.baseline = baseline;
+  // cap-line of the glyph box: the span's top sits at baseline - ascent of the em box
+  const em = document.createElement('canvas').getContext('2d'); em.font = `800 ${WM.size}px Archivo`;
+  const fm = em.measureText('c');
+  open.boxTop = baseline - fm.fontBoundingBoxAscent;
+  open.letters.forEach(l => { l.el = el('span', 'wm-l', root); l.el.textContent = l.ch; l.el.style.top = px(open.boxTop); });
+  // the dot, which becomes the pill (the housing of the iris)
+  open.shape = el('div', 'black', root);
+  open.labelMask = el('div', 'mask', open.shape);
+  open.label = el('div', 'label', open.labelMask); open.label.textContent = 'Make it real';
+  open.photo = photoImg('day', open.shape);
+  open.iris = new Iris(open.shape);
+}
+function wdthFor(l, target) {           // wdth whose advance equals target, or null if narrower than wdth 62
+  if (target >= l.a125) return 125;
+  if (target <= l.a62) return null;
+  const tab = l.tab;
+  for (let i = 1; i < tab.length; i++) if (tab[i] >= target) { const u = (target - tab[i - 1]) / (tab[i] - tab[i - 1]); return 62 + i - 1 + u; }
+  return 125;
+}
+function drawWordmark(f) {                // f = 1 natural, 0 fully squeezed into the dot
+  for (const l of open.letters) {
+    const x = open.xRef + f * (l.x - open.xRef);
+    const want = f * l.a125;
+    show(l.el, want > 0.4);
+    let wd = wdthFor(l, want), sx = 1;
+    if (wd === null) { wd = 62; sx = want / l.a62; }
+    else if (want > l.a125) sx = want / l.a125;
+    l.el.style.left = px(x);
+    l.el.style.fontVariationSettings = `'wdth' ${wd.toFixed(3)}, 'wght' 800`;
+    l.el.style.transform = `scaleX(${sx})`;
+  }
+}
+// timeline
+const O = {
+  squeeze: b(1), pill: b(2), label: b(3), click: b(4), morph: b(4) + 0.2, swap: b(4) + 0.3, open: b(5),
+};
+const PILL = { w: 600, h: 180 };
+const CIRCLE = 520;
+function updateOpen(t) {
+  // letters: squeeze into the period
+  const f = 1 - spring(t - O.squeeze, { w: 17, z: 1 });
+  drawWordmark(clamp(f, 0, 2));
+  const d = open.dot;
+  // dot -> pill -> circle (housing)
+  const gp = spring(t - O.pill, SP.snap);
+  const gm = spring(t - O.morph, { w: 22, z: 0.8 });
+  const w = lerp(lerp(d.w, PILL.w, gp), CIRCLE, gm);
+  const h = lerp(lerp(d.h, PILL.h, gp), CIRCLE, gm);
+  const r = lerp(lerp(0, PILL.h / 2, clamp(gp)), CIRCLE / 2, gm);
+  const cx = d.cx, cy = d.cy;
+  box(open.shape, cx - w / 2, cy - h / 2, w, h);
+  open.shape.style.borderRadius = px(Math.min(r, w / 2, h / 2));
+  // label rises out of its own mask line
+  const lm = 72;
+  box(open.labelMask, 0, h / 2 - lm / 2, w, lm);
+  const lr = spring(t - O.label, { w: 18, z: 0.84 });
+  open.label.style.transform = `translateY(${lerp(lm + 6, 0, lr)}px)`;
+  open.label.style.lineHeight = px(lm);
+  show(open.labelMask, t < O.swap);
+  // photo lives in the housing once the blades have closed over the label
+  show(open.photo, t >= O.swap);
+  placeCover(open.photo, 'day', 0, 0, w, h);
+  // iris
+  const a0 = Math.hypot(PILL.w, PILL.h) / 2 / Math.cos(Math.PI / 6) * 1.06;
+  const a1 = CIRCLE / 2 / Math.cos(Math.PI / 6) * 1.08;
+  const a = track(t, a0, [[O.click, 0, { w: 22, z: 0.92 }], [O.open, a1, SP.snap]]);
+  const rot = 0.26 + 1.25 * (1 - clamp(a / a1));
+  open.iris.set(w, h, Math.max(0, a), rot);
+  // camera: follow the dot as it becomes the pill
+  const cam = [
+    track(t, 720, [[O.squeeze, d.cx, SP.cam]]),
+    track(t, 720, [[O.squeeze, d.cy, SP.cam]]),
+    track(t, 1, [[O.squeeze, 1.22, SP.cam], [O.click, 1.6, SP.soft]]),
+  ];
+  // cursor: glides in, clicks the pill
+  const cx0 = d.cx + 640, cy0 = d.cy + 520;
+  const tgt = [d.cx + 150, d.cy + 34];
+  const cxx = track(t, cx0, [[b(2.6), tgt[0], { w: 7.5, z: 1 }], [O.open + 0.25, tgt[0] + 170, { w: 6, z: 1 }]]);
+  const cyy = track(t, cy0, [[b(2.6), tgt[1], { w: 9, z: 1 }], [O.open + 0.25, tgt[1] + 260, { w: 7, z: 1 }]]);
+  return { cam, cursor: [cxx, cyy, pressAmt(t, [[O.click - 0.05, O.click + 0.1]]), t > b(2.6)] };
+}
+
+// ============================================================================
+// SCENE 2 - GLASS: relight Taipei from day to golden hour with a glass slider
+// ============================================================================
+const G = { word: b(13), melt: b(14), bar: b(15), adjust: b(16), slider: b(17), press: b(18), drag: b(19), release: b(21) };
+const SL = { x0: 150, x1: 1290, y: 1262, h: 100, t0: 232, t1: 1208 };
+const glass = {};
+function photoClone(parent) {        // day + golden, same geometry as the scene photo
+  const w = el('div', 'abs', parent);
+  const d = photoImg('day', w), g = photoImg('golden', w);
+  box(d, 0, 0, 1440, 1440); box(g, 0, 0, 1440, 1440);
+  return { w, d, g };
+}
+function buildGlass() {
+  const root = el('div', 'scene', world); glass.root = root;
+  glass.photo = photoClone(root);
+  glass.bar = new Glass(root, { bezel: 22, depth: 9, chroma: 0.06, profile: 2, tint: .12 });
+  glass.barClone = photoClone(glass.bar.bd);
+  glass.track = el('div', 'abs', root, { height: '6px', borderRadius: '3px', background: 'rgba(255,255,255,.42)' });
+  glass.fill = el('div', 'abs', root, { height: '6px', borderRadius: '3px', background: 'rgba(255,255,255,.96)' });
+  glass.ticks = el('div', 'abs', root);
+  for (let i = 0; i <= 24; i++) el('div', 'abs', glass.ticks, { left: px(i * (SL.t1 - SL.t0) / 24 - 1), top: '0px', width: '2px', height: i % 6 ? '10px' : '18px', borderRadius: '1px', background: 'rgba(255,255,255,.55)' });
+  glass.lens = new Glass(root, { lens: true, depth: 30, chroma: 0.05, res: 0.5, tint: .05 });
+  glass.lensClone = photoClone(glass.lens.bd);
+  glass.lens.rim.style.padding = '2.6px';
+  glass.lens.el.style.boxShadow = '0 16px 34px rgba(24,18,10,.28), 0 3px 8px rgba(24,18,10,.18), inset 0 0 0 1px rgba(255,255,255,.25)';
+  glass.chip = new Glass(root, { bezel: 18, depth: 7, chroma: 0.04, profile: 2, tint: .18 });
+  glass.chipClone = photoClone(glass.chip.bd);
+  glass.chipText = el('div', 'ui', root, { font: '600 27px Geist', color: '#fff', letterSpacing: '-0.01em', textShadow: '0 1px 2px rgba(0,0,0,.25)' });
+}
+function setWipe(clone, wx) { clone.g.style.clipPath = `inset(0 ${Math.max(0, 1440 - wx)}px 0 0)`; }
+function fmtTime(mins) { let h = Math.floor(mins / 60), m = Math.round(mins % 60); if (m === 60) { h++; m = 0; } const ap = h >= 12 ? 'PM' : 'AM'; const hh = ((h + 11) % 12) + 1; return `${hh}:${String(m).padStart(2, '0')} ${ap}`; }
+function updateGlass(t) {
+  // knob position follows the cursor drag
+  const kx = track(t, SL.t0, [[G.drag, SL.t1, SP.drag]]);
+  const u = inv(SL.t0, SL.t1, kx);
+  const wx = u * 1440;
+  for (const c of [glass.photo, glass.barClone, glass.lensClone, glass.chipClone]) setWipe(c, wx);
+  // slider capsule
+  const sw = SL.x1 - SL.x0;
+  glass.bar.set({ x: SL.x0, y: SL.y - SL.h / 2, w: sw, h: SL.h, r: SL.h / 2 });
+  // track
+  box(glass.track, SL.t0, SL.y - 3, SL.t1 - SL.t0, 6);
+  box(glass.fill, SL.t0, SL.y - 3, kx - SL.t0, 6);
+  box(glass.ticks, SL.t0, SL.y + 22, SL.t1 - SL.t0, 20);
+  // knob -> lens while held
+  const held = spring(t - G.press, SP.pop) - spring(t - G.release, SP.ui);
+  const d = lerp(58, 176, clamp(held, 0, 1.3));
+  glass.lens.set({ x: kx - d / 2, y: SL.y - d / 2, w: d, h: d, r: d / 2 });
+  // time-of-day chip above the lens
+  const cw = 196, ch = 62, cy = SL.y - d / 2 - 26 - ch;
+  const chipOn = spring(t - G.press - 0.06, SP.pop) - spring(t - G.release, SP.ui);
+  glass.chip.set({ x: kx - cw / 2, y: cy, w: cw, h: ch, r: ch / 2, s: clamp(chipOn, 0, 1.3) });
+  glass.chipText.textContent = fmtTime(lerp(14 * 60 + 40, 18 * 60 + 42, u));
+  const tw = 140;
+  box(glass.chipText, kx - tw / 2, cy + 14, tw, 34);
+  glass.chipText.style.textAlign = 'center';
+  glass.chipText.style.transform = `scale(${clamp(chipOn, 0, 1.3)})`;
+  show(glass.chipText, chipOn > 0.01);
+  return { cam: [720, 720, 1], cursor: [kx + 4, SL.y + 6, pressAmt(t, [[G.press - 0.05, G.release]]), true] };
+}
+
+// ============================================================================
+// SCENE 3 - STAGE: phone + Mac, drag the wallpaper onto a Safari tab
+// ============================================================================
+const ST = { press: b(31), drag: b(31.3), drop: b(34) };
+const PH = { x: 96, y: 286, w: 404, h: 876 };
+const MAC = { x: 580, y: 300, w: 800, h: 610 };
+const stg = {};
+function buildStage() {
+  const root = el('div', 'scene', world); stg.root = root;
+  // phone
+  const P = PH;
+  stg.phone = el('div', 'abs', root, { left: px(P.x), top: px(P.y), width: px(P.w), height: px(P.h), borderRadius: '72px', background: 'linear-gradient(145deg,#3a3a3e,#1a1a1c 40%,#2c2c30)', boxShadow: '0 40px 70px rgba(30,22,10,.22), 0 6px 14px rgba(30,22,10,.18)' });
+  el('div', 'abs', stg.phone, { left: '3px', top: '3px', right: '3px', bottom: '3px', width: 'auto', height: 'auto', borderRadius: '69px', background: '#050506' });
+  const S = { x: 15, y: 15, w: P.w - 30, h: P.h - 30 };
+  stg.screenBox = S;
+  stg.screen = el('div', 'abs', stg.phone, { left: px(S.x), top: px(S.y), width: px(S.w), height: px(S.h), borderRadius: '58px', overflow: 'hidden', background: '#111' });
+  stg.wall = photoImg('hero', stg.screen); placeCover(stg.wall, 'hero', 0, 0, S.w, S.h);
+  // lock screen: date, glass clock, music player, home bar
+  stg.date = el('div', 'ui', stg.screen, { left: '0px', width: px(S.w), top: '88px', textAlign: 'center', font: '600 21px Geist', color: 'rgba(255,255,255,.94)', letterSpacing: '0.005em', textShadow: '0 1px 3px rgba(0,0,0,.25)' });
+  stg.date.textContent = 'Saturday, September 26';
+  stg.clock = [];
+  const font = '800 152px Geist';
+  let x = 0; const digits = ['9', ':', '4', '1'];
+  const cm = document.createElement('canvas').getContext('2d'); cm.font = font;
+  const widths = digits.map(c => cm.measureText(c).width - (c === ':' ? 8 : 6));
+  const tot = widths.reduce((s, v) => s + v, 0);
+  x = (S.w - tot) / 2;
+  digits.forEach((c, i) => {
+    const g = new GlassGlyph(stg.screen, c, font, 'normal', { bezel: 16, depth: 9, chroma: 0.06, profile: 1.5, frost: .30 });
+    const clone = el('div', 'abs', g.bd); const im = photoImg('hero', clone); placeCover(im, 'hero', 0, 0, S.w, S.h);
+    stg.clock.push({ g, x, c }); x += widths[i];
+  });
+  stg.player = new Glass(stg.screen, { bezel: 26, depth: 11, chroma: 0.05, profile: 2, tint: .06 });
+  stg.player.tint.style.background = 'linear-gradient(rgba(38,34,30,.34), rgba(38,34,30,.42))';
+  const pc = el('div', 'abs', stg.player.bd); const pim = photoImg('hero', pc); placeCover(pim, 'hero', 0, 0, S.w, S.h);
+  const PL = { x: 18, y: S.h - 142, w: S.w - 36, h: 96 };
+  stg.playerBox = PL;
+  stg.player.set({ x: PL.x, y: PL.y, w: PL.w, h: PL.h, r: 34 });
+  const art = el('div', 'abs', stg.screen, { left: px(PL.x + 16), top: px(PL.y + 16), width: '64px', height: '64px', borderRadius: '14px', overflow: 'hidden' });
+  const aim = photoImg('golden', art); placeCover(aim, 'golden', 0, 0, 64, 64, 1.6);
+  el('div', 'ui', stg.screen, { left: px(PL.x + 94), top: px(PL.y + 22), font: '600 20px Geist', color: '#fff' }).textContent = 'Winter Breeze';
+  el('div', 'ui', stg.screen, { left: px(PL.x + 94), top: px(PL.y + 50), font: '500 16px Geist', color: 'rgba(255,255,255,.72)' }).textContent = 'Arulo';
+  const ctl = sv('svg', stg.screen, { width: 76, height: 30, viewBox: '0 0 76 30' });
+  Object.assign(ctl.style, { position: 'absolute', left: px(PL.x + PL.w - 96), top: px(PL.y + 33) });
+  sv('path', ctl, { d: 'M4 3 L4 27 M14 3 L14 27', stroke: '#fff', 'stroke-width': 6, 'stroke-linecap': 'round' });
+  sv('path', ctl, { d: 'M40 5 L54 15 L40 25 Z M56 5 L70 15 L56 25 Z', fill: '#fff' });
+  el('div', 'abs', stg.screen, { left: px(S.w / 2 - 68), top: px(S.h - 22), width: '136px', height: '5px', borderRadius: '3px', background: 'rgba(255,255,255,.9)' });
+  // dynamic island
+  el('div', 'abs', stg.screen, { left: px(S.w / 2 - 62), top: '18px', width: '124px', height: '36px', borderRadius: '18px', background: '#000' });
+
+  // Mac window with Safari
+  const M = MAC;
+  stg.mac = el('div', 'abs', root, { left: px(M.x), top: px(M.y), width: px(M.w), height: px(M.h), borderRadius: '24px', overflow: 'hidden', background: '#f7f6f3', boxShadow: '0 40px 80px rgba(30,22,10,.20), 0 0 0 1px rgba(0,0,0,.06), 0 8px 18px rgba(30,22,10,.12)' });
+  const bar = el('div', 'abs', stg.mac, { width: px(M.w), height: '98px', background: '#fbfbfa', borderBottom: '1px solid rgba(0,0,0,.08)' });
+  ['#ff5f57', '#febc2e', '#28c840'].forEach((c, i) => el('div', 'abs', bar, { left: px(22 + i * 22), top: '22px', width: '13px', height: '13px', borderRadius: '50%', background: c, boxShadow: 'inset 0 0 0 .5px rgba(0,0,0,.12)' }));
+  const chev = sv('svg', bar, { width: 60, height: 20, viewBox: '0 0 60 20' });
+  Object.assign(chev.style, { position: 'absolute', left: '112px', top: '19px' });
+  sv('path', chev, { d: 'M10 3 L3 10 L10 17 M36 3 L43 10 L36 17', stroke: '#8e8e93', 'stroke-width': 2.2, fill: 'none', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' });
+  const addr = el('div', 'abs', bar, { left: px(M.w / 2 - 190), top: '12px', width: '380px', height: '34px', borderRadius: '17px', background: 'rgba(0,0,0,.055)' });
+  el('div', 'ui', addr, { left: '0px', width: '380px', top: '8px', textAlign: 'center', font: '500 15px Geist', color: '#8a8a8e' }).textContent = 'Search or enter website name';
+  // tabs
+  const tab1 = el('div', 'abs', bar, { left: '14px', top: '56px', width: '230px', height: '34px', borderRadius: '10px', background: '#fff', boxShadow: '0 1px 2px rgba(0,0,0,.08), 0 0 0 .5px rgba(0,0,0,.06)' });
+  el('div', 'ui', tab1, { left: '44px', top: '8px', font: '500 15px Geist', color: '#1d1d1f' }).textContent = 'Start Page';
+  el('div', 'abs', tab1, { left: '16px', top: '9px', width: '16px', height: '16px', borderRadius: '5px', background: '#d9d6cf' });
+  stg.drop = el('div', 'abs', bar, { left: '252px', top: '56px', width: '230px', height: '34px', borderRadius: '10px', background: 'rgba(10,132,255,.10)', boxShadow: 'inset 0 0 0 2px rgba(10,132,255,.9)' });
+  el('div', 'ui', stg.drop, { left: '96px', top: '8px', font: '600 15px Geist', color: '#0a84ff' }).textContent = 'New Tab';
+  el('div', 'ui', stg.drop, { left: '74px', top: '4px', font: '500 21px Geist', color: '#0a84ff' }).textContent = '+';
+  el('div', 'ui', bar, { left: px(M.w - 44), top: '58px', font: '400 26px Geist', color: '#8e8e93' }).textContent = '+';
+  // start page
+  const page = el('div', 'abs', stg.mac, { left: '0px', top: '99px', width: px(M.w), height: px(M.h - 99) });
+  el('div', 'ui', page, { left: '64px', top: '48px', font: '700 22px Geist', color: '#1d1d1f', letterSpacing: '-0.01em' }).textContent = 'Favorites';
+  const fav = [['#1d1d1f', 'c'], ['#c8553d', 'A'], ['#2f5d8a', 'M'], ['#6f7d5c', 'P'], ['#b08a4a', 'D'], ['#7b6a8f', 'S']];
+  fav.forEach(([c, l], i) => {
+    const t = el('div', 'abs', page, { left: px(64 + i * 112), top: '96px', width: '76px', height: '76px', borderRadius: '18px', background: c });
+    el('div', 'ui', t, { left: '0px', width: '76px', top: '18px', textAlign: 'center', font: '700 32px Geist', color: '#fff' }).textContent = l;
+    el('div', 'abs', page, { left: px(64 + i * 112 + 8), top: '184px', width: '60px', height: '10px', borderRadius: '5px', background: '#dedbd4' });
+  });
+  el('div', 'ui', page, { left: '64px', top: '242px', font: '700 22px Geist', color: '#1d1d1f', letterSpacing: '-0.01em' }).textContent = 'Frequently Visited';
+  for (let i = 0; i < 4; i++) {
+    el('div', 'abs', page, { left: px(64 + i * 172), top: '290px', width: '152px', height: '112px', borderRadius: '14px', background: '#e7e4dd' });
+    el('div', 'abs', page, { left: px(64 + i * 172), top: '414px', width: '110px', height: '10px', borderRadius: '5px', background: '#dedbd4' });
+  }
+  // the lifted wallpaper card
+  stg.card = el('div', 'abs', root, { borderRadius: '30px', overflow: 'hidden', boxShadow: '0 30px 60px rgba(20,14,6,.32), 0 6px 14px rgba(20,14,6,.2)', transformOrigin: '50% 12%' });
+  stg.cardImg = photoImg('hero', stg.card);
+}
+function updateStage(t) {
+  const S = stg.screenBox;
+  stg.clock.forEach(({ g, x }) => g.set(x, 300, 1, 1));
+  // lifted card follows the cursor from the phone to the tab
+  const start = [PH.x + PH.w / 2, PH.y + PH.h / 2];
+  const tab = [MAC.x + 252 + 60, MAC.y + 73];
+  const cx = track(t, start[0], [[ST.drag, tab[0], { w: 6.4, z: 1 }]]);
+  const cy = track(t, start[1], [[ST.drag, tab[1], { w: 6.6, z: 1 }]]);
+  const lift = spring(t - ST.press, SP.pop);
+  const shrink = spring(t - ST.drag - 0.25, SP.ui);           // the preview tightens once it leaves the phone
+  const cw = lerp(lerp(S.w, 176, clamp(lift)), 132, shrink), chh = cw * S.h / S.w;
+  const hang = lerp(0.12, 0, shrink);
+  box(stg.card, cx - cw * lerp(0.5, 0.18, shrink), cy - chh * hang + lerp(0, 26, shrink), cw, chh);
+  stg.card.style.transform = `rotate(${lerp(0, -4, clamp(lift))}deg)`;
+  placeCover(stg.cardImg, 'hero', 0, 0, cw, chh);
+  show(stg.card, t >= ST.press);
+  const hover = inv(ST.drag + 0.45, ST.drag + 0.62, t);
+  stg.drop.style.opacity = hover;
+  return { cam: [742, 700, 1.07], cursor: [cx - 4, cy - 2, pressAmt(t, [[ST.press - 0.05, ST.drop]]), true] };
+}
+
+// ============================================================================
+// SCENE 6 - WALL: the framed print on the real wall (all-intra footage)
+// ============================================================================
+const WL = { start: b(45), clip0: 1.6 };
+const PR = { cx: 720, cy: 612, w: 520, h: 660, mold: 24, mat: 60 };
+const wall = {};
+async function loadWall() {
+  const blob = await (await fetch('assets/video/wall-intra.webm')).blob();
+  const v = document.createElement('video');
+  v.muted = true; v.preload = 'auto'; v.playsInline = true;
+  v.src = URL.createObjectURL(blob);
+  await new Promise((res, rej) => { v.onloadeddata = res; v.onerror = rej; });
+  wall.video = v;
+}
+function buildWall() {
+  const root = el('div', 'scene', world); wall.root = root;
+  wall.canvas = el('canvas', 'abs', root); wall.canvas.width = 1440; wall.canvas.height = 1440;
+  const P = PR;
+  const x = P.cx - P.w / 2, y = P.cy - P.h / 2;
+  wall.frame = el('div', 'abs', root, { left: px(x), top: px(y), width: px(P.w), height: px(P.h),
+    background: 'linear-gradient(135deg,#232325,#101011 55%,#1b1b1d)',
+    boxShadow: '0 30px 44px rgba(46,38,26,.30), 0 8px 12px rgba(46,38,26,.22), 0 1px 2px rgba(46,38,26,.3), inset 0 0 0 1px rgba(255,255,255,.07)' });
+  wall.mat = el('div', 'abs', wall.frame, { left: px(P.mold), top: px(P.mold), width: px(P.w - 2 * P.mold), height: px(P.h - 2 * P.mold), background: '#f7f5f0',
+    boxShadow: 'inset 0 2px 5px rgba(0,0,0,.28), inset 0 0 0 1px rgba(0,0,0,.18)' });
+  const iw = P.w - 2 * (P.mold + P.mat), ih = P.h - 2 * (P.mold + P.mat);
+  wall.win = el('div', 'abs', wall.mat, { left: px(P.mat), top: px(P.mat), width: px(iw), height: px(ih), overflow: 'hidden', background: '#0b0b0c',
+    boxShadow: '0 0 0 1px rgba(0,0,0,.06)' });
+  wall.photo = photoImg('hero', wall.win); placeCover(wall.photo, 'hero', 0, 0, iw, ih);
+  wall.iris = new Iris(wall.win);
+  wall.bevel = el('div', 'abs', wall.mat, { left: px(P.mat - 3), top: px(P.mat - 3), width: px(iw + 6), height: px(ih + 6), boxShadow: 'inset 0 0 0 3px #fbfaf6, inset 0 0 0 4px rgba(0,0,0,.08)' });
+  wall.win.style.zIndex = 1;
+  // the plant shadow falls across the print too: multiply the (levelled) footage over it
+  wall.over = el('canvas', 'abs', root, { mixBlendMode: 'multiply', left: px(x), top: px(y) });
+  wall.over.width = P.w; wall.over.height = P.h;
+  wall.winSize = { w: iw, h: ih };
+}
+function wallLevel() {                  // brightness that maps the bare wall to white
+  const c = document.createElement('canvas'); c.width = 64; c.height = 64;
+  const ctx = c.getContext('2d'); ctx.drawImage(wall.video, 0, 0, 1800, 600, 0, 0, 64, 64);
+  const d = ctx.getImageData(0, 0, 64, 64).data; let s = 0;
+  for (let i = 0; i < d.length; i += 4) s += 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+  return 255 / (s / (d.length / 4));
+}
+async function seekVideo(v, time) {
+  const tt = clamp(time, 0, v.duration - 0.05);
+  if (Math.abs(v.currentTime - tt) < 1e-4 && v.readyState >= 2) return;
+  await new Promise(res => { v.onseeked = () => res(); v.currentTime = tt; });
+}
+async function updateWall(t) {
+  const ft = WL.clip0 + (t - WL.start);
+  await seekVideo(wall.video, ft);
+  const ctx = wall.canvas.getContext('2d');
+  ctx.drawImage(wall.video, 0, 0, 1440, 1440);
+  const P = PR, x = P.cx - P.w / 2, y = P.cy - P.h / 2, k = 1440 / 1800;
+  const o = wall.over.getContext('2d');
+  o.clearRect(0, 0, P.w, P.h);
+  o.filter = `brightness(${wall.lev}) contrast(1.08)`;
+  // the frame stands off the wall, so its shadow lands a little lower and to the left
+  const sx = (x + 10) / k, sy = (y - 14) / k;
+  o.drawImage(wall.video, sx, sy, P.w / k, P.h / k, 0, 0, P.w, P.h);
+  o.filter = 'none';
+  const ws = wall.winSize;
+  const a1 = Math.hypot(ws.w, ws.h) / 2 / Math.cos(Math.PI / 6) * 1.08;
+  const a = track(t, 0, [[b(46), a1, SP.snap], [b(48), 0, { w: 22, z: 0.92 }]]);
+  wall.iris.set(ws.w, ws.h, a, 0.26 + 1.25 * (1 - clamp(a / a1)));
+  return { cam: [720, 720, 1], cursor: [0, 0, 0, false] };
+}
+
+// ============================================================================
+// seek(t): every style is computed from time; nothing carries over between frames
+// ============================================================================
+const SCENES = [
+  { name: 'open',  t0: 0,     t1: 6,     root: () => open.root,  update: updateOpen },
+  { name: 'glass', t0: 6,     t1: 13,    root: () => glass.root, update: updateGlass },
+  { name: 'stage', t0: 13,    t1: 20,    root: () => stg.root,   update: updateStage },
+  { name: 'wall',  t0: 22,    t1: 24.5,  root: () => wall.root,  update: updateWall },
+];
+async function seek(t) {
+  pending = [];
+  let out = { cam: [720, 720, 1], cursor: [0, 0, 0, false] };
+  for (const s of SCENES) {
+    const on = t >= s.t0 && t < s.t1;
+    show(s.root(), on);
+    if (on) out = await s.update(t);
+  }
+  const [cx, cy, cs] = out.cam;
+  setCamera(cx, cy, cs);
+  const [ux, uy, up, uv] = out.cursor;
+  setCursor(ux, uy, up, uv);
+  await Promise.all(pending);
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+}
+window.seek = seek;
+
+window.filmReady = (async () => {
+  await Promise.all([document.fonts.load('800 170px Archivo'), document.fonts.load('600 20px Geist'), document.fonts.load('800 150px Geist')]);
+  await loadPhotos();
+  await loadWall();
+  buildOpen();
+  buildGlass();
+  buildStage();
+  buildWall();
+  world.appendChild(cursor);
+  wall.lev = wallLevel();
+  const glyphs = stg.clock.map(c => c.g.ready);
+  await Promise.all(glyphs);
+  await seek(0);
+})();
+</script>
+</body>
+</html>
