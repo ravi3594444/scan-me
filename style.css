@@ -1,0 +1,231 @@
+:root {
+  --bg: #eef2f7;
+  --card: #ffffff;
+  --text: #1c2430;
+  --muted: #6b7686;
+  --accent: #2f6fed;
+  --border: #dde3ec;
+  --bar: #f4a340;
+  --radius: 14px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f141b;
+    --card: #1a212b;
+    --text: #e6ebf2;
+    --muted: #8d98a8;
+    --accent: #5b8ff9;
+    --border: #2a3340;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.4;
+}
+
+.app {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 24px 16px 40px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+}
+
+.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.topbar h1 {
+  margin: 0;
+  font-size: 1.5rem;
+  margin-right: auto;
+}
+
+.search {
+  display: flex;
+  gap: 6px;
+  flex: 1 1 280px;
+}
+
+.search input {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--card);
+  color: var(--text);
+  font-size: 1rem;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 10px 14px;
+}
+
+.search button[type="submit"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.units {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.units button {
+  border: 0;
+  border-radius: 0;
+  padding: 10px 12px;
+}
+
+.units button.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.status {
+  margin: 0;
+  min-height: 1.4em;
+  color: var(--muted);
+}
+
+.status.error { color: #d9534f; }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+}
+
+.card h3 {
+  margin: 0 0 12px;
+  font-size: 1rem;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.muted { color: var(--muted); }
+
+.current-main {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 4px 16px;
+}
+
+.current-main h2 { margin: 0; font-size: 1.4rem; }
+.current-main p { margin: 0; }
+
+.current-temp {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 3rem;
+  font-weight: 300;
+  grid-row: span 2;
+}
+
+.icon-lg { font-size: 3rem; }
+
+.current-desc { font-size: 1.1rem; }
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  margin: 20px 0 0;
+}
+
+.stats div {
+  background: var(--bg);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+.stats dt { font-size: 0.8rem; color: var(--muted); }
+.stats dd { margin: 2px 0 0; font-size: 1.1rem; font-weight: 600; }
+
+.hourly {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 6px;
+}
+
+.hour {
+  flex: 0 0 64px;
+  text-align: center;
+  background: var(--bg);
+  border-radius: 10px;
+  padding: 10px 4px;
+  font-size: 0.9rem;
+}
+
+.hour .icon { font-size: 1.4rem; display: block; margin: 4px 0; }
+.hour .pop { color: var(--accent); font-size: 0.75rem; }
+
+.daily {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.day {
+  display: grid;
+  grid-template-columns: 90px 36px 48px 1fr 48px;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+}
+
+.day:first-child { border-top: 0; }
+.day .icon { font-size: 1.4rem; text-align: center; }
+.day .lo { color: var(--muted); text-align: right; }
+.day .hi { font-weight: 600; }
+
+.range {
+  position: relative;
+  height: 6px;
+  background: var(--bg);
+  border-radius: 3px;
+}
+
+.range span {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-radius: 3px;
+  background: linear-gradient(90deg, var(--accent), var(--bar));
+}
+
+footer { text-align: center; font-size: 0.85rem; }
+footer a { color: var(--accent); }
+
+@media (max-width: 600px) {
+  .stats { grid-template-columns: repeat(2, 1fr); }
+  .current-temp { font-size: 2.4rem; }
+  .icon-lg { font-size: 2.4rem; }
+  .day { grid-template-columns: 70px 30px 40px 1fr 40px; gap: 8px; }
+}

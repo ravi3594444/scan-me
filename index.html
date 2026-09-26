@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Weather Dashboard</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="app">
+    <header class="topbar">
+      <h1>Weather</h1>
+      <form id="search-form" class="search" autocomplete="off">
+        <input id="search-input" type="search" placeholder="Search a city…" aria-label="City name" required>
+        <button type="submit">Search</button>
+        <button type="button" id="locate-btn" title="Use my location" aria-label="Use my location">📍</button>
+      </form>
+      <div class="units" role="group" aria-label="Units">
+        <button type="button" data-unit="celsius" class="active">°C</button>
+        <button type="button" data-unit="fahrenheit">°F</button>
+      </div>
+    </header>
+
+    <p id="status" class="status" role="status"></p>
+
+    <section id="current" class="card current" hidden>
+      <div class="current-main">
+        <div>
+          <h2 id="place"></h2>
+          <p id="updated" class="muted"></p>
+        </div>
+        <div class="current-temp">
+          <span id="current-icon" class="icon-lg"></span>
+          <span id="current-temp"></span>
+        </div>
+        <p id="current-desc" class="current-desc"></p>
+      </div>
+      <dl class="stats">
+        <div><dt>Feels like</dt><dd id="feels"></dd></div>
+        <div><dt>Humidity</dt><dd id="humidity"></dd></div>
+        <div><dt>Wind</dt><dd id="wind"></dd></div>
+        <div><dt>Precipitation</dt><dd id="precip"></dd></div>
+      </dl>
+    </section>
+
+    <section id="hourly-card" class="card" hidden>
+      <h3>Next 24 hours</h3>
+      <div id="hourly" class="hourly"></div>
+    </section>
+
+    <section id="daily-card" class="card" hidden>
+      <h3>7-day forecast</h3>
+      <ul id="daily" class="daily"></ul>
+    </section>
+
+    <footer class="muted">Data from <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a></footer>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
