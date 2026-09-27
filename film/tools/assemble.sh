@@ -10,7 +10,7 @@ cd "$(dirname "$0")/../out/film"
 python3 ../../tools/mix.py
 LAST=1619
 ffmpeg -v error -y -i master.mkv -vf "trim=end_frame=$LAST,setpts=N/(60*TB)" -r 60 -an \
-  -c:v libx264 -preset slow -crf 13 -pix_fmt yuv420p -profile:v high partA.mp4
+  -c:v libx264 -preset slow -crf 14 -pix_fmt yuv420p -profile:v high partA.mp4
 ffmpeg -v error -y -i partA.mp4 -frames:v 1 -c copy first_au.mp4
 printf "file 'partA.mp4'\nfile 'first_au.mp4'\n" > loop.txt
 ffmpeg -v error -y -f concat -safe 0 -i loop.txt -i ../audio/soundtrack.wav -map 0:v -map 1:a \

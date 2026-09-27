@@ -43,7 +43,7 @@ The first and last frames render identically. `assemble.sh` encodes frames 0–1
 ## Result
 
 `out/constrivo-film.mp4`:
-- 27.00 s, 1440 × 1440, 60 fps, H.264 High 4:2:0 with 320 kb/s AAC
+- 27.00 s, 1440 × 1440, 60 fps, H.264 High 4:2:0 (CRF 14, about 8 Mb/s) with 320 kb/s AAC
 - 1620 frames with no single-frame pops
 - the first and last frames are identical: same md5, max diff 0
 - -14.0 LUFS integrated, true peak -1.2 dBTP
