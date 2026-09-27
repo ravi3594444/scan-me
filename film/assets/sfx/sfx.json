@@ -1,0 +1,299 @@
+{
+ "squeeze": {
+  "file": "squeeze.mp3",
+  "mixkit_id": 175,
+  "title": "Short transition sweep",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/175/175-preview.mp3",
+  "duration": 0.606,
+  "peak": 0.463,
+  "onset": 0.273
+ },
+ "pop_soft": {
+  "file": "pop_soft.mp3",
+  "mixkit_id": 3005,
+  "title": "Explainer video pops whoosh light pop",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/3005/3005-preview.mp3",
+  "duration": 0.18,
+  "peak": 0.034,
+  "onset": 0.01
+ },
+ "tick": {
+  "file": "tick.mp3",
+  "mixkit_id": 3124,
+  "title": "Modern technology select",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/3124/3124-preview.mp3",
+  "duration": 0.5,
+  "peak": 0.018,
+  "onset": 0.0
+ },
+ "pop_icon": {
+  "file": "pop_icon.mp3",
+  "mixkit_id": 2364,
+  "title": "Hard pop click",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/2364/2364-preview.mp3",
+  "duration": 1.175,
+  "peak": 0.047,
+  "onset": 0.0
+ },
+ "click": {
+  "file": "click.mp3",
+  "mixkit_id": 1116,
+  "title": "Single classic click",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/1116/1116-preview.mp3",
+  "duration": 0.231,
+  "peak": 0.117,
+  "onset": 0.108
+ },
+ "shutter_close": {
+  "file": "shutter_close.mp3",
+  "mixkit_id": 1439,
+  "title": "Camera closing lens",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/1439/1439-preview.mp3",
+  "duration": 1.232,
+  "peak": 0.097,
+  "onset": 0.007
+ },
+ "shutter_open": {
+  "file": "shutter_open.mp3",
+  "mixkit_id": 1433,
+  "title": "Camera lens shutter",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/1433/1433-preview.mp3",
+  "duration": 1.419,
+  "peak": 0.026,
+  "onset": 0.003
+ },
+ "swoosh_small": {
+  "file": "swoosh_small.mp3",
+  "mixkit_id": 1462,
+  "title": "Quick swoosh",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/1462/1462-preview.mp3",
+  "duration": 1.25,
+  "peak": 0.164,
+  "onset": 0.008
+ },
+ "paper_flap": {
+  "file": "paper_flap.mp3",
+  "mixkit_id": 1104,
+  "title": "Page turn single",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/1104/1104-preview.mp3",
+  "duration": 0.452,
+  "peak": 0.142,
+  "onset": 0.115
+ },
+ "paper_flap_big": {
+  "file": "paper_flap_big.mp3",
+  "mixkit_id": 1105,
+  "title": "Big paper page turn",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/1105/1105-preview.mp3",
+  "duration": 0.831,
+  "peak": 0.326,
+  "onset": 0.072
+ },
+ "riser_whoosh": {
+  "file": "riser_whoosh.mp3",
+  "mixkit_id": 772,
+  "title": "Quick zoom impact",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/772/772-preview.mp3",
+  "duration": 1.222,
+  "peak": 0.517,
+  "onset": 0.127
+ },
+ "glass_tap": {
+  "file": "glass_tap.mp3",
+  "mixkit_id": 2936,
+  "title": "Wine glass clink",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/2936/2936-preview.mp3",
+  "duration": 1.2,
+  "peak": 0.014,
+  "onset": 0.004
+ },
+ "bloop": {
+  "file": "bloop.mp3",
+  "mixkit_id": 3000,
+  "title": "Liquid bubble",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/3000/3000-preview.mp3",
+  "duration": 1.047,
+  "peak": 0.057,
+  "onset": 0.004
+ },
+ "stretch": {
+  "file": "stretch.mp3",
+  "mixkit_id": 1466,
+  "title": "Elevating swoosh",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/1466/1466-preview.mp3",
+  "duration": 1.03,
+  "peak": 0.142,
+  "onset": 0.017
+ },
+ "haptic": {
+  "file": "haptic.mp3",
+  "mixkit_id": 2299,
+  "title": "Short bass hit",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/2299/2299-preview.mp3",
+  "duration": 1.101,
+  "peak": 0.085,
+  "onset": 0.06
+ },
+ "slide": {
+  "file": "slide.mp3",
+  "mixkit_id": 1527,
+  "title": "Glass plate slide",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/1527/1527-preview.mp3",
+  "duration": 1.132,
+  "peak": 0.269,
+  "onset": 0.049
+ },
+ "bubble": {
+  "file": "bubble.mp3",
+  "mixkit_id": 1317,
+  "title": "Water bubble",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/1317/1317-preview.mp3",
+  "duration": 0.424,
+  "peak": 0.123,
+  "onset": 0.063
+ },
+ "whoosh": {
+  "file": "whoosh.mp3",
+  "mixkit_id": 2605,
+  "title": "Quick air woosh",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/2605/2605-preview.mp3",
+  "duration": 1.511,
+  "peak": 0.246,
+  "onset": 0.034
+ },
+ "blind_roll": {
+  "file": "blind_roll.mp3",
+  "mixkit_id": 2383,
+  "title": "Paper scroll in an office",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/2383/2383-preview.mp3",
+  "duration": 1.5,
+  "peak": 0.41,
+  "onset": 0.0
+ },
+ "swipe": {
+  "file": "swipe.mp3",
+  "mixkit_id": 2627,
+  "title": "Fast swipe zoom",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/2627/2627-preview.mp3",
+  "duration": 1.056,
+  "peak": 0.26,
+  "onset": 0.118
+ },
+ "drop_thud": {
+  "file": "drop_thud.mp3",
+  "mixkit_id": 2070,
+  "title": "Light impact on the ground",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/2070/2070-preview.mp3",
+  "duration": 1.017,
+  "peak": 0.009,
+  "onset": 0.0
+ },
+ "scroll_ticks": {
+  "file": "scroll_ticks.mp3",
+  "mixkit_id": 1140,
+  "title": "Tech click",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/1140/1140-preview.mp3",
+  "duration": 0.423,
+  "peak": 0.055,
+  "onset": 0.019
+ },
+ "wood_tap": {
+  "file": "wood_tap.mp3",
+  "mixkit_id": 2182,
+  "title": "Wood hard hit",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/2182/2182-preview.mp3",
+  "duration": 0.417,
+  "peak": 0.06,
+  "onset": 0.05
+ },
+ "brush": {
+  "file": "brush.mp3",
+  "mixkit_id": 174,
+  "title": "Fast sweep transition",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/174/174-preview.mp3",
+  "duration": 1.002,
+  "peak": 0.491,
+  "onset": 0.315
+ },
+ "success": {
+  "file": "success.mp3",
+  "mixkit_id": 2865,
+  "title": "Success software tone",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/2865/2865-preview.mp3",
+  "duration": 1.619,
+  "peak": 0.262,
+  "onset": 0.002
+ },
+ "printer": {
+  "file": "printer.mp3",
+  "mixkit_id": 3117,
+  "title": "Mechanical technology movements",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/3117/3117-preview.mp3",
+  "duration": 2.5,
+  "peak": 0.231,
+  "onset": 0.066
+ },
+ "van": {
+  "file": "van.mp3",
+  "mixkit_id": 1557,
+  "title": "Sci-Fi vehicle movement",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/1557/1557-preview.mp3",
+  "duration": 2.805,
+  "peak": 0.808,
+  "onset": 0.51
+ },
+ "doorbell": {
+  "file": "doorbell.mp3",
+  "mixkit_id": 333,
+  "title": "Doorbell single press",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/333/333-preview.mp3",
+  "duration": 1.583,
+  "peak": 0.005,
+  "onset": 0.0
+ },
+ "boom_low": {
+  "file": "boom_low.mp3",
+  "mixkit_id": 498,
+  "title": "Deep heartbeat impact",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/498/498-preview.mp3",
+  "duration": 3.469,
+  "peak": 0.096,
+  "onset": 0.038
+ },
+ "reverse_whoosh": {
+  "file": "reverse_whoosh.mp3",
+  "mixkit_id": 1465,
+  "title": "Vacuum swoosh transition",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/1465/1465-preview.mp3",
+  "duration": 2.257,
+  "peak": 1.551,
+  "onset": 0.52
+ },
+ "reverse_short": {
+  "file": "reverse_short.mp3",
+  "mixkit_id": 1533,
+  "title": "Futuristic slide",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/1533/1533-preview.mp3",
+  "duration": 0.643,
+  "peak": 0.376,
+  "onset": 0.225
+ },
+ "room_tone": {
+  "file": "room_tone.mp3",
+  "mixkit_id": 3199,
+  "title": "Cinematic room tone loop",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/3199/3199-preview.mp3",
+  "duration": 12.381,
+  "peak": 3.399,
+  "onset": 0.005
+ },
+ "impact": {
+  "file": "impact.mp3",
+  "mixkit_id": 1143,
+  "title": "Cinematic whoosh deep impact",
+  "source_url": "https://assets.mixkit.co/active_storage/sfx/1143/1143-preview.mp3",
+  "duration": 4.063,
+  "peak": 0.552,
+  "onset": 0.275
+ }
+}

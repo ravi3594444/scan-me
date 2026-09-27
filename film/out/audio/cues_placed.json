@@ -1,0 +1,712 @@
+[
+ {
+  "t": 0.6,
+  "effect": "squeeze",
+  "rate": 1,
+  "ref": 0.463,
+  "file_start": 0.137,
+  "level_dbfs": -30.5,
+  "vs_local_music": -10.0,
+  "vs_song_rms": -16.9
+ },
+ {
+  "t": 1.08,
+  "effect": "pop_soft",
+  "rate": 1,
+  "ref": 0.034,
+  "file_start": 1.046,
+  "level_dbfs": -29.0,
+  "vs_local_music": -8.0,
+  "vs_song_rms": -15.4
+ },
+ {
+  "t": 1.56,
+  "effect": "tick",
+  "rate": 1,
+  "ref": 0.018,
+  "file_start": 1.542,
+  "level_dbfs": -32.9,
+  "vs_local_music": -12.0,
+  "vs_song_rms": -19.3
+ },
+ {
+  "t": 1.96,
+  "effect": "click",
+  "rate": 1,
+  "ref": 0.117,
+  "file_start": 1.843,
+  "level_dbfs": -31.8,
+  "vs_local_music": -11.1,
+  "vs_song_rms": -18.2
+ },
+ {
+  "t": 2.14,
+  "effect": "shutter_close",
+  "rate": 1,
+  "ref": 0.097,
+  "file_start": 2.043,
+  "level_dbfs": -27.8,
+  "vs_local_music": -7.0,
+  "vs_song_rms": -14.2
+ },
+ {
+  "t": 2.56,
+  "effect": "shutter_open",
+  "rate": 1,
+  "ref": 0.026,
+  "file_start": 2.534,
+  "level_dbfs": -26.9,
+  "vs_local_music": -6.0,
+  "vs_song_rms": -13.3
+ },
+ {
+  "t": 3.08,
+  "effect": "tick",
+  "rate": 1,
+  "ref": 0.018,
+  "file_start": 3.062,
+  "level_dbfs": -34.1,
+  "vs_local_music": -13.0,
+  "vs_song_rms": -20.5
+ },
+ {
+  "t": 3.58,
+  "effect": "swoosh_small",
+  "rate": 1,
+  "ref": 0.164,
+  "file_start": 3.416,
+  "level_dbfs": -30.5,
+  "vs_local_music": -10.0,
+  "vs_song_rms": -16.9
+ },
+ {
+  "t": 4.08,
+  "effect": "paper_flap",
+  "rate": 1,
+  "ref": 0.142,
+  "file_start": 3.938,
+  "level_dbfs": -34.6,
+  "vs_local_music": -15.3,
+  "vs_song_rms": -21.0
+ },
+ {
+  "t": 4.58,
+  "effect": "paper_flap_big",
+  "rate": 1,
+  "ref": 0.326,
+  "file_start": 4.254,
+  "level_dbfs": -26.7,
+  "vs_local_music": -9.0,
+  "vs_song_rms": -13.1
+ },
+ {
+  "t": 5.12,
+  "effect": "swoosh_small",
+  "rate": 1.12,
+  "ref": 0.146,
+  "file_start": 4.974,
+  "level_dbfs": -27.5,
+  "vs_local_music": -10.0,
+  "vs_song_rms": -13.9
+ },
+ {
+  "t": 5.46,
+  "effect": "click",
+  "rate": 1,
+  "ref": 0.117,
+  "file_start": 5.343,
+  "level_dbfs": -30.1,
+  "vs_local_music": -11.1,
+  "vs_song_rms": -16.5
+ },
+ {
+  "t": 6.0,
+  "effect": "riser_whoosh",
+  "rate": 1,
+  "ref": 0.517,
+  "file_start": 5.483,
+  "level_dbfs": -17.0,
+  "vs_local_music": -3.0,
+  "vs_song_rms": -3.4
+ },
+ {
+  "t": 6.596,
+  "effect": "glass_tap",
+  "rate": 1,
+  "ref": 0.014,
+  "file_start": 6.582,
+  "level_dbfs": -23.8,
+  "vs_local_music": -12.0,
+  "vs_song_rms": -10.2
+ },
+ {
+  "t": 6.651,
+  "effect": "glass_tap",
+  "rate": 1.125,
+  "ref": 0.013,
+  "file_start": 6.638,
+  "level_dbfs": -23.8,
+  "vs_local_music": -12.0,
+  "vs_song_rms": -10.2
+ },
+ {
+  "t": 6.706,
+  "effect": "glass_tap",
+  "rate": 1.25,
+  "ref": 0.012,
+  "file_start": 6.694,
+  "level_dbfs": -23.8,
+  "vs_local_music": -12.0,
+  "vs_song_rms": -10.2
+ },
+ {
+  "t": 6.761,
+  "effect": "glass_tap",
+  "rate": 1.5,
+  "ref": 0.011,
+  "file_start": 6.75,
+  "level_dbfs": -23.8,
+  "vs_local_music": -12.0,
+  "vs_song_rms": -10.2
+ },
+ {
+  "t": 6.816,
+  "effect": "glass_tap",
+  "rate": 1.6666666666666667,
+  "ref": 0.011,
+  "file_start": 6.805,
+  "level_dbfs": -23.8,
+  "vs_local_music": -12.0,
+  "vs_song_rms": -10.2
+ },
+ {
+  "t": 7.18,
+  "effect": "bloop",
+  "rate": 1,
+  "ref": 0.057,
+  "file_start": 7.123,
+  "level_dbfs": -19.8,
+  "vs_local_music": -8.0,
+  "vs_song_rms": -6.3
+ },
+ {
+  "t": 7.6,
+  "effect": "stretch",
+  "rate": 1,
+  "ref": 0.142,
+  "file_start": 7.458,
+  "level_dbfs": -21.8,
+  "vs_local_music": -10.0,
+  "vs_song_rms": -8.2
+ },
+ {
+  "t": 7.776,
+  "effect": "pop_icon",
+  "rate": 1.0,
+  "ref": 0.047,
+  "file_start": 7.729,
+  "level_dbfs": -23.8,
+  "vs_local_music": -12.0,
+  "vs_song_rms": -10.2
+ },
+ {
+  "t": 7.826,
+  "effect": "pop_icon",
+  "rate": 1.06,
+  "ref": 0.044,
+  "file_start": 7.782,
+  "level_dbfs": -23.8,
+  "vs_local_music": -12.0,
+  "vs_song_rms": -10.2
+ },
+ {
+  "t": 7.876,
+  "effect": "pop_icon",
+  "rate": 1.12,
+  "ref": 0.042,
+  "file_start": 7.834,
+  "level_dbfs": -23.8,
+  "vs_local_music": -12.0,
+  "vs_song_rms": -10.2
+ },
+ {
+  "t": 7.926,
+  "effect": "pop_icon",
+  "rate": 1.18,
+  "ref": 0.04,
+  "file_start": 7.886,
+  "level_dbfs": -23.8,
+  "vs_local_music": -12.0,
+  "vs_song_rms": -10.2
+ },
+ {
+  "t": 7.97,
+  "effect": "click",
+  "rate": 1,
+  "ref": 0.117,
+  "file_start": 7.853,
+  "level_dbfs": -22.9,
+  "vs_local_music": -11.1,
+  "vs_song_rms": -9.3
+ },
+ {
+  "t": 8.56,
+  "effect": "tick",
+  "rate": 1,
+  "ref": 0.018,
+  "file_start": 8.542,
+  "level_dbfs": -23.8,
+  "vs_local_music": -12.0,
+  "vs_song_rms": -10.2
+ },
+ {
+  "t": 8.98,
+  "effect": "haptic",
+  "rate": 1,
+  "ref": 0.085,
+  "file_start": 8.895,
+  "level_dbfs": -17.8,
+  "vs_local_music": -6.0,
+  "vs_song_rms": -4.2
+ },
+ {
+  "t": 9.5,
+  "effect": "slide",
+  "rate": 1,
+  "ref": 0.049,
+  "file_start": 9.451,
+  "level_dbfs": -22.8,
+  "vs_local_music": -11.0,
+  "vs_song_rms": -9.2
+ },
+ {
+  "t": 10.6,
+  "effect": "bubble",
+  "rate": 1,
+  "ref": 0.123,
+  "file_start": 10.477,
+  "level_dbfs": -19.8,
+  "vs_local_music": -8.0,
+  "vs_song_rms": -6.2
+ },
+ {
+  "t": 11.1,
+  "effect": "pop_soft",
+  "rate": 0.9,
+  "ref": 0.04,
+  "file_start": 11.06,
+  "level_dbfs": -19.8,
+  "vs_local_music": -8.0,
+  "vs_song_rms": -6.2
+ },
+ {
+  "t": 11.62,
+  "effect": "whoosh",
+  "rate": 1,
+  "ref": 0.246,
+  "file_start": 11.374,
+  "level_dbfs": -21.9,
+  "vs_local_music": -10.0,
+  "vs_song_rms": -8.3
+ },
+ {
+  "t": 11.736,
+  "effect": "glass_tap",
+  "rate": 1,
+  "ref": 0.014,
+  "file_start": 11.722,
+  "level_dbfs": -22.9,
+  "vs_local_music": -11.0,
+  "vs_song_rms": -9.3
+ },
+ {
+  "t": 11.796,
+  "effect": "glass_tap",
+  "rate": 1.25,
+  "ref": 0.012,
+  "file_start": 11.784,
+  "level_dbfs": -22.9,
+  "vs_local_music": -11.0,
+  "vs_song_rms": -9.3
+ },
+ {
+  "t": 11.856,
+  "effect": "glass_tap",
+  "rate": 1.5,
+  "ref": 0.011,
+  "file_start": 11.845,
+  "level_dbfs": -22.9,
+  "vs_local_music": -11.0,
+  "vs_song_rms": -9.3
+ },
+ {
+  "t": 11.916,
+  "effect": "glass_tap",
+  "rate": 2,
+  "ref": 0.009,
+  "file_start": 11.907,
+  "level_dbfs": -22.9,
+  "vs_local_music": -11.0,
+  "vs_song_rms": -9.3
+ },
+ {
+  "t": 12.05,
+  "effect": "tick",
+  "rate": 1,
+  "ref": 0.018,
+  "file_start": 12.032,
+  "level_dbfs": -23.9,
+  "vs_local_music": -12.0,
+  "vs_song_rms": -10.3
+ },
+ {
+  "t": 12.5,
+  "effect": "whoosh",
+  "rate": 1,
+  "ref": 0.034,
+  "file_start": 12.466,
+  "level_dbfs": -22.9,
+  "vs_local_music": -11.0,
+  "vs_song_rms": -9.3
+ },
+ {
+  "t": 12.66,
+  "effect": "stretch",
+  "rate": 0.9,
+  "ref": 0.158,
+  "file_start": 12.502,
+  "level_dbfs": -21.9,
+  "vs_local_music": -10.0,
+  "vs_song_rms": -8.3
+ },
+ {
+  "t": 13.1,
+  "effect": "haptic",
+  "rate": 1,
+  "ref": 0.085,
+  "file_start": 13.015,
+  "level_dbfs": -19.9,
+  "vs_local_music": -8.0,
+  "vs_song_rms": -6.3
+ },
+ {
+  "t": 13.62,
+  "effect": "stretch",
+  "rate": 1,
+  "ref": 0.142,
+  "file_start": 13.478,
+  "level_dbfs": -20.8,
+  "vs_local_music": -9.0,
+  "vs_song_rms": -7.2
+ },
+ {
+  "t": 14.08,
+  "effect": "bloop",
+  "rate": 1.12,
+  "ref": 0.052,
+  "file_start": 14.028,
+  "level_dbfs": -19.8,
+  "vs_local_music": -8.0,
+  "vs_song_rms": -6.2
+ },
+ {
+  "t": 14.1,
+  "effect": "whoosh",
+  "rate": 1,
+  "ref": 0.034,
+  "file_start": 14.066,
+  "level_dbfs": -22.8,
+  "vs_local_music": -11.0,
+  "vs_song_rms": -9.2
+ },
+ {
+  "t": 14.6,
+  "effect": "pop_soft",
+  "rate": 1,
+  "ref": 0.034,
+  "file_start": 14.566,
+  "level_dbfs": -19.9,
+  "vs_local_music": -8.0,
+  "vs_song_rms": -6.3
+ },
+ {
+  "t": 15.0,
+  "effect": "blind_roll",
+  "rate": 1,
+  "ref": 0.0,
+  "file_start": 15.0,
+  "level_dbfs": -20.9,
+  "vs_local_music": -9.0,
+  "vs_song_rms": -7.3
+ },
+ {
+  "t": 15.5,
+  "effect": "click",
+  "rate": 1,
+  "ref": 0.117,
+  "file_start": 15.383,
+  "level_dbfs": -23.9,
+  "vs_local_music": -12.1,
+  "vs_song_rms": -10.3
+ },
+ {
+  "t": 15.8,
+  "effect": "haptic",
+  "rate": 1,
+  "ref": 0.085,
+  "file_start": 15.715,
+  "level_dbfs": -17.8,
+  "vs_local_music": -6.0,
+  "vs_song_rms": -4.2
+ },
+ {
+  "t": 15.86,
+  "effect": "slide",
+  "rate": 1,
+  "ref": 0.049,
+  "file_start": 15.811,
+  "level_dbfs": -23.8,
+  "vs_local_music": -12.0,
+  "vs_song_rms": -10.2
+ },
+ {
+  "t": 16.24,
+  "effect": "tick",
+  "rate": 1,
+  "ref": 0.018,
+  "file_start": 16.222,
+  "level_dbfs": -23.8,
+  "vs_local_music": -12.0,
+  "vs_song_rms": -10.2
+ },
+ {
+  "t": 16.6,
+  "effect": "swipe",
+  "rate": 1,
+  "ref": 0.26,
+  "file_start": 16.34,
+  "level_dbfs": -20.9,
+  "vs_local_music": -9.0,
+  "vs_song_rms": -7.3
+ },
+ {
+  "t": 17.0,
+  "effect": "drop_thud",
+  "rate": 1,
+  "ref": 0.009,
+  "file_start": 16.991,
+  "level_dbfs": -18.8,
+  "vs_local_music": -6.9,
+  "vs_song_rms": -5.2
+ },
+ {
+  "t": 17.52,
+  "effect": "scroll_ticks",
+  "rate": 1,
+  "ref": 0.019,
+  "file_start": 17.501,
+  "level_dbfs": -22.8,
+  "vs_local_music": -11.0,
+  "vs_song_rms": -9.2
+ },
+ {
+  "t": 18.1,
+  "effect": "wood_tap",
+  "rate": 1,
+  "ref": 0.06,
+  "file_start": 18.04,
+  "level_dbfs": -19.8,
+  "vs_local_music": -8.0,
+  "vs_song_rms": -6.2
+ },
+ {
+  "t": 18.47,
+  "effect": "click",
+  "rate": 1,
+  "ref": 0.117,
+  "file_start": 18.352,
+  "level_dbfs": -22.9,
+  "vs_local_music": -11.1,
+  "vs_song_rms": -9.3
+ },
+ {
+  "t": 18.56,
+  "effect": "brush",
+  "rate": 1,
+  "ref": 0.315,
+  "file_start": 18.245,
+  "level_dbfs": -21.9,
+  "vs_local_music": -10.0,
+  "vs_song_rms": -8.3
+ },
+ {
+  "t": 18.97,
+  "effect": "click",
+  "rate": 1,
+  "ref": 0.117,
+  "file_start": 18.852,
+  "level_dbfs": -22.9,
+  "vs_local_music": -11.1,
+  "vs_song_rms": -9.3
+ },
+ {
+  "t": 19.52,
+  "effect": "whoosh",
+  "rate": 1,
+  "ref": 0.034,
+  "file_start": 19.486,
+  "level_dbfs": -22.9,
+  "vs_local_music": -11.0,
+  "vs_song_rms": -9.3
+ },
+ {
+  "t": 19.97,
+  "effect": "click",
+  "rate": 1,
+  "ref": 0.117,
+  "file_start": 19.852,
+  "level_dbfs": -22.0,
+  "vs_local_music": -10.1,
+  "vs_song_rms": -8.4
+ },
+ {
+  "t": 20.02,
+  "effect": "success",
+  "rate": 1,
+  "ref": 0.002,
+  "file_start": 20.018,
+  "level_dbfs": -18.9,
+  "vs_local_music": -7.0,
+  "vs_song_rms": -5.3
+ },
+ {
+  "t": 20.58,
+  "effect": "printer",
+  "rate": 1,
+  "ref": 0.066,
+  "file_start": 20.514,
+  "level_dbfs": -25.0,
+  "vs_local_music": -13.0,
+  "vs_song_rms": -11.4
+ },
+ {
+  "t": 21.28,
+  "effect": "van",
+  "rate": 1,
+  "ref": 0.808,
+  "file_start": 20.472,
+  "level_dbfs": -23.0,
+  "vs_local_music": -11.0,
+  "vs_song_rms": -9.4
+ },
+ {
+  "t": 21.56,
+  "effect": "doorbell",
+  "rate": 1,
+  "ref": 0.005,
+  "file_start": 21.555,
+  "level_dbfs": -20.7,
+  "vs_local_music": -8.0,
+  "vs_song_rms": -7.1
+ },
+ {
+  "t": 21.9,
+  "effect": "boom_low",
+  "rate": 1,
+  "ref": 0.096,
+  "file_start": 21.804,
+  "level_dbfs": -15.1,
+  "vs_local_music": -1.0,
+  "vs_song_rms": -1.5
+ },
+ {
+  "t": 22.55,
+  "effect": "room_tone",
+  "rate": 1,
+  "ref": 0.005,
+  "file_start": 22.545,
+  "level_dbfs": -32.6,
+  "vs_local_music": -10.0,
+  "vs_song_rms": -19.0
+ },
+ {
+  "t": 22.85,
+  "effect": "reverse_whoosh",
+  "rate": 1,
+  "ref": 1.551,
+  "file_start": 21.299,
+  "level_dbfs": -26.2,
+  "vs_local_music": -6.0,
+  "vs_song_rms": -12.6
+ },
+ {
+  "t": 22.97,
+  "effect": "click",
+  "rate": 1,
+  "ref": 0.117,
+  "file_start": 22.852,
+  "level_dbfs": -31.6,
+  "vs_local_music": -11.1,
+  "vs_song_rms": -18.0
+ },
+ {
+  "t": 23.06,
+  "effect": "shutter_open",
+  "rate": 1,
+  "ref": 0.026,
+  "file_start": 23.034,
+  "level_dbfs": -26.7,
+  "vs_local_music": -6.0,
+  "vs_song_rms": -13.1
+ },
+ {
+  "t": 24.12,
+  "effect": "shutter_close",
+  "rate": 1,
+  "ref": 0.097,
+  "file_start": 24.023,
+  "level_dbfs": -29.6,
+  "vs_local_music": -3.5,
+  "vs_song_rms": -16.0
+ },
+ {
+  "t": 24.7,
+  "effect": "boom_low",
+  "rate": 1.06,
+  "ref": 0.09,
+  "file_start": 24.61,
+  "level_dbfs": -22.9,
+  "vs_local_music": -2.0,
+  "vs_song_rms": -9.3
+ },
+ {
+  "t": 25.35,
+  "effect": "reverse_short",
+  "rate": 1,
+  "ref": 0.376,
+  "file_start": 24.974,
+  "level_dbfs": -29.2,
+  "vs_local_music": -7.0,
+  "vs_song_rms": -15.6
+ },
+ {
+  "t": 25.56,
+  "effect": "tick",
+  "rate": 1,
+  "ref": 0.018,
+  "file_start": 25.542,
+  "level_dbfs": -28.8,
+  "vs_local_music": -11.0,
+  "vs_song_rms": -15.2
+ },
+ {
+  "t": 26.0,
+  "effect": "impact",
+  "rate": 1,
+  "ref": 0.552,
+  "file_start": 25.448,
+  "level_dbfs": -16.3,
+  "vs_local_music": -2.0,
+  "vs_song_rms": -2.7
+ }
+]

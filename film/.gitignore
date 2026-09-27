@@ -1,3 +1,12 @@
 tools/node_modules/
-out/stills/
-assets/video/wall-intra.webm
+__pycache__/
+out/*
+!out/review/
+!out/constrivo-film.mp4
+!out/qc/
+!out/audio/
+out/audio/*
+!out/audio/soundtrack.png
+!out/audio/cues_placed.json
+assets/video/wall-intra*.webm
+tmp/

@@ -17,12 +17,13 @@ html, body { margin: 0; background: #000; }
 .abs { position: absolute; left: 0; top: 0; }
 .scene { position: absolute; left: 0; top: 0; width: 1440px; height: 1440px; transform-origin: 0 0; }
 .cover { position: absolute; display: block; max-width: none; }
+.clip { position: absolute; overflow: hidden; }
 
 /* wordmark */
 .wm-l { position: absolute; top: 0; font: 800 170px Archivo; font-stretch: 125%; line-height: 1; white-space: pre; color: var(--ink); transform-origin: 0 0; }
 .black { position: absolute; background: var(--ink); overflow: hidden; }
-.mask { position: absolute; overflow: hidden; }
 .label { position: absolute; left: 0; top: 0; width: 100%; text-align: center; font: 600 58px var(--ui); letter-spacing: -0.015em; color: #fff; white-space: nowrap; }
+.tile { position: absolute; overflow: hidden; background: #d9d4ca; }
 
 /* liquid glass */
 .glass { position: absolute; overflow: hidden; transform-origin: 50% 50%;
@@ -34,7 +35,8 @@ html, body { margin: 0; background: #000; }
   background: conic-gradient(from 200deg, rgba(255,255,255,.95), rgba(255,255,255,.18) 22%, rgba(255,255,255,.08) 34%, rgba(255,255,255,.62) 52%, rgba(255,255,255,.14) 70%, rgba(255,255,255,.10) 82%, rgba(255,255,255,.95));
   -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor; mask-composite: exclude; }
 .glass-sheen { position: absolute; inset: 0; border-radius: inherit; background: linear-gradient(180deg, rgba(255,255,255,.16), rgba(255,255,255,0) 42%); }
-.gg-wrap { position: absolute; transform-origin: 50% 50%; filter: drop-shadow(0 8px 16px rgba(20, 14, 6, .22)); }
+.gg-wrap { position: absolute; transform-origin: 50% 50%; }
+.gg-wrap.shadow { filter: drop-shadow(0 8px 16px rgba(20, 14, 6, .22)); }
 .gg { position: absolute; left: 0; top: 0; overflow: hidden; -webkit-mask-size: 100% 100%; mask-size: 100% 100%; }
 .gg-hl { position: absolute; inset: 0; background-size: 100% 100%; }
 
@@ -43,19 +45,14 @@ html, body { margin: 0; background: #000; }
 
 /* ui text */
 .ui { font-family: var(--ui); position: absolute; white-space: nowrap; }
+.num { font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
 <div id="stage">
   <div id="world"></div>
 </div>
-<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs id="fx">
-  <filter id="goo" x="-30%" y="-60%" width="160%" height="220%" color-interpolation-filters="sRGB">
-    <feGaussianBlur in="SourceGraphic" stdDeviation="14" result="b"/>
-    <feColorMatrix in="b" type="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 26 -12" result="g"/>
-    <feComposite in="SourceGraphic" in2="g" operator="atop"/>
-  </filter>
-</defs></svg>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs id="fx"></defs></svg>
 <script>
 'use strict';
 // ============================================================================
@@ -63,11 +60,12 @@ html, body { margin: 0; background: #000; }
 // ============================================================================
 const BEAT = 0.5;                 // 120 BPM
 const b = n => n * BEAT;          // beat index -> seconds
-const FPS = 60;
+const DURATION = 27;
 
 const clamp = (x, a = 0, c = 1) => Math.min(c, Math.max(a, x));
 const lerp = (a, c, u) => a + (c - a) * u;
 const inv = (a, c, x) => clamp((x - a) / (c - a));
+const snap = (v, target, eps) => Math.abs(v - target) < eps ? target : v;   // settled springs land exactly
 
 // Closed-form step response of a damped spring, 0 -> 1, starting at t = 0.
 function spring(t, p) {
@@ -79,8 +77,14 @@ function spring(t, p) {
   }
   return 1 - Math.exp(-w * t) * (1 + w * t);
 }
-// time from start to the first overshoot peak (used to land a move on a beat)
-const peak = p => Math.PI / (p.w * Math.sqrt(1 - p.z * p.z));
+// an underdamped spring whose first crossing of the target happens `dur` seconds after it starts
+function landing(z, dur) {
+  const wn = Math.sqrt(1 - z * z);
+  return { w: (Math.PI - Math.atan(wn / z)) / (wn * dur), z };
+}
+const crossing = p => { const wn = Math.sqrt(1 - p.z * p.z); return (Math.PI - Math.atan(wn / p.z)) / (p.w * wn); };
+// a spring that stops at its first arrival (a hard landing, no undershoot afterwards)
+const arrive = (t, p) => t >= crossing(p) ? 1 : spring(t, p);
 
 const SP = {
   ui:    { w: 20, z: 0.86 },
@@ -103,8 +107,19 @@ function track(t, v0, keys) {
   }
   return v;
 }
+// camera / cursor tracks: [t, [x, y, (s)], spring]; scale is sprung in log space
 function track2(t, p0, keys) {
   return [track(t, p0[0], keys.map(k => [k[0], k[1][0], k[2]])), track(t, p0[1], keys.map(k => [k[0], k[1][1], k[3] || k[2]]))];
+}
+function camTrack(t, c0, keys) {
+  const [x, y] = track2(t, c0, keys);
+  return [x, y, Math.exp(track(t, Math.log(c0[2]), keys.map(k => [k[0], Math.log(k[1][2]), k[2]])))];
+}
+// text that swaps inside a shape rises out of (and into) its own mask line
+function riseY(t, h, tin, tout) {
+  let y = tin === null ? 0 : lerp(h * 1.08, 0, spring(t - tin, { w: 19, z: 0.86 }));
+  if (tout !== undefined && tout !== null) y -= h * 1.1 * spring(t - tout, { w: 24, z: 0.95 });
+  return y;
 }
 
 // ============================================================================
@@ -128,8 +143,19 @@ function box(e, x, y, w, h) {
   e.style.left = x + 'px'; e.style.top = y + 'px';
   e.style.width = Math.max(0, w) + 'px'; e.style.height = Math.max(0, h) + 'px';
 }
+function cbox(e, cx, cy, w, h, r) {        // by centre, with radius
+  box(e, cx - w / 2, cy - h / 2, w, h);
+  if (r !== undefined) e.style.borderRadius = Math.max(0, Math.min(r, w / 2, h / 2)) + 'px';
+}
 const show = (e, on) => { e.style.visibility = on ? 'inherit' : 'hidden'; };
 const px = v => v + 'px';
+function txt(parent, s, style) { const e = el('div', 'ui', parent, style); e.textContent = s; return e; }
+function svgEl(parent, w, h, inner, style) {
+  const s = sv('svg', parent, { width: w, height: h, viewBox: `0 0 ${w} ${h}` });
+  s.innerHTML = inner; s.style.position = 'absolute'; s.style.overflow = 'visible';
+  if (style) Object.assign(s.style, style);
+  return s;
+}
 
 const stage = document.getElementById('stage');
 const world = document.getElementById('world');
@@ -159,19 +185,22 @@ async function loadPhotos() {
     p.w = im.naturalWidth; p.h = im.naturalHeight; p.im = im;
   }
 }
-// cover-fit a photo into a box, returns the image rect in the box's coordinates
 function cover(p, w, h, zoom = 1) {
   const s = Math.max(w / p.w, h / p.h) * zoom;
   const dw = p.w * s, dh = p.h * s;
   return { x: (w - dw) * p.fx, y: (h - dh) * p.fy, w: dw, h: dh };
 }
 function photoImg(key, parent) {
-  const im = el('img', 'cover', parent); im.src = PHOTOS[key].src; im.draggable = false; return im;
+  const p = PHOTOS[key];
+  const im = el('img', 'cover', parent, { transformOrigin: '0 0' }); im.src = p.src; im.draggable = false;
+  box(im, 0, 0, p.w, p.h);
+  return im;
 }
-// place <img> to cover box (bx,by,bw,bh) (coordinates of the img's parent)
+// animated photos are sized by a transform on their natural-size box: layout sizes get pixel-snapped,
+// so a slow resize would resample the whole image at once each time its rounded size flips
 function placeCover(im, key, bx, by, bw, bh, zoom = 1) {
-  const r = cover(PHOTOS[key], bw, bh, zoom);
-  box(im, bx + r.x, by + r.y, r.w, r.h);
+  const p = PHOTOS[key], r = cover(p, bw, bh, zoom);
+  im.style.transform = `translate(${bx + r.x}px,${by + r.y}px) scale(${r.w / p.w})`;
 }
 
 // ============================================================================
@@ -182,31 +211,29 @@ function placeCover(im, key, bx, by, bw, bh, zoom = 1) {
 const mapCache = new Map();
 function getMap(key, make) {
   let m = mapCache.get(key);
-  if (!m) {
-    const url = make();
-    const im = new Image(); im.src = url;
-    m = { url, ready: im.decode().catch(() => {}) };
-    mapCache.set(key, m);
-  }
+  if (m) { mapCache.delete(key); mapCache.set(key, m); return m; }
+  const url = make();
+  const im = new Image(); im.src = url;
+  m = { url, ready: im.decode().catch(() => {}) };
+  mapCache.set(key, m);
+  if (mapCache.size > 400) mapCache.delete(mapCache.keys().next().value);
   return m;
 }
-// signed distance to a rounded rect centred at origin
 function sdRRect(x, y, hw, hh, r) {
   const qx = Math.abs(x) - (hw - r), qy = Math.abs(y) - (hh - r);
   return Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0) - r;
 }
-function rrectMap(w, h, r, o) {
+function rrectMap(w, h, r, bezel, o) {
   const res = o.res;
   const W = Math.max(2, Math.ceil(w * res)), H = Math.max(2, Math.ceil(h * res));
   const c = document.createElement('canvas'); c.width = W; c.height = H;
   const ctx = c.getContext('2d'); const img = ctx.createImageData(W, H); const d = img.data;
   const hw = w / 2, hh = h / 2, rr = Math.min(r, hw, hh);
-  const bez = Math.max(1, o.lens ? Math.min(hw, hh) : Math.min(o.bezel, hw, hh));
-  const rn = Math.min(Math.max(rr, bez), hw, hh);           // smoother radius for the normals
+  const bez = Math.max(1, o.lens ? Math.min(hw, hh) : Math.min(bezel, hw, hh));
+  const rn = Math.min(Math.max(rr, bez), hw, hh);
   for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
     const x = (i + .5) / res - hw, y = (j + .5) / res - hh;
-    const e = -sdRRect(x, y, hw, hh, rr);                     // depth inside the shape
-    // outward normal from the gradient of the smoothed field
+    const e = -sdRRect(x, y, hw, hh, rr);
     const gx = sdRRect(x + .5, y, hw, hh, rn) - sdRRect(x - .5, y, hw, hh, rn);
     const gy = sdRRect(x, y + .5, hw, hh, rn) - sdRRect(x, y - .5, hw, hh, rn);
     const gl = Math.hypot(gx, gy) || 1;
@@ -216,12 +243,18 @@ function rrectMap(w, h, r, o) {
       m = o.lens ? (0.55 * u + 0.45 * Math.pow(u, 4)) : Math.pow(u, o.profile);
     } else m = 1;
     const k = (j * W + i) * 4;
-    d[k] = 128 - 127 * (gx / gl) * m;                          // sample inward: convex lens
+    d[k] = 128 - 127 * (gx / gl) * m;
     d[k + 1] = 128 - 127 * (gy / gl) * m;
     d[k + 2] = 128; d[k + 3] = 255;
   }
   ctx.putImageData(img, 0, 0);
   return c.toDataURL();
+}
+// the backdrop clone undoes its glass element's placement; at scale 1 through layout offsets,
+// which the compositor snaps together with the parent (a float translate would jitter by a pixel)
+function placeClone(bd, x, y, w, h, s) {
+  if (s === 1) { bd.style.left = px(-x); bd.style.top = px(-y); bd.style.transform = 'none'; }
+  else { bd.style.left = '0px'; bd.style.top = '0px'; bd.style.transform = `translate(${w / 2}px,${h / 2}px) scale(${1 / s}) translate(${-x - w / 2}px,${-y - h / 2}px)`; }
 }
 let GID = 0;
 function glassFilter(id) {
@@ -243,13 +276,14 @@ function glassFilter(id) {
 }
 class Glass {
   constructor(parent, opt = {}) {
-    this.o = Object.assign({ bezel: 24, depth: 20, chroma: 0.14, profile: 2.2, res: 0.5, lens: false, tint: .07 }, opt);
+    this.o = Object.assign({ bezel: 24, depth: 20, chroma: 0.06, profile: 2, res: 0.5, lens: false, tint: .07 }, opt);
     this.id = 'gl' + (GID++);
     this.el = el('div', 'glass', parent);
     this.refr = el('div', 'glass-refr', this.el);
     this.bd = el('div', 'glass-bd', this.refr);
     this.tint = el('div', 'glass-tint', this.el, { background: `rgba(255,255,255,${this.o.tint})` });
     this.sheen = el('div', 'glass-sheen', this.el);
+    this.inner = el('div', 'abs', this.el, { width: '100%', height: '100%' });     // content above the glass, below the rim
     this.rim = el('div', 'glass-rim', this.el);
     this.ff = glassFilter(this.id);
     this.refr.style.filter = `url(#${this.id})`;
@@ -258,23 +292,26 @@ class Glass {
   set(g) {
     const w = Math.max(0, g.w), h = Math.max(0, g.h), s = g.s ?? 1;
     const r = Math.min(g.r ?? h / 2, w / 2, h / 2);
-    const on = w >= 2 && h >= 2 && s > 0.001 && (g.op ?? 1) > 0;
+    const on = w >= 1 && h >= 1 && s > 0.002;
     show(this.el, on);
+    this.on = on;
     if (!on) return;
     box(this.el, g.x, g.y, w, h);
-    Object.assign(this.el.style, { borderRadius: px(r), transform: `scale(${s})`, opacity: g.op ?? 1 });
+    Object.assign(this.el.style, { borderRadius: px(r), transform: `scale(${s})` });
     box(this.refr, 0, 0, w, h);
-    // the clone is authored in parent coordinates: undo the element's own placement and scale
-    this.bd.style.transform = `translate(${w / 2}px,${h / 2}px) scale(${1 / s}) translate(${-g.x - w / 2}px,${-g.y - h / 2}px)`;
-    const o = this.o;
+    show(this.refr, !g.noMap);
+    this.g = { x: g.x, y: g.y, w, h, r, s };
+    if (g.noMap) return;              // fully covered by its contents: no refraction to compute
+    placeClone(this.bd, g.x, g.y, w, h, s);
+    const o = this.o, bezel = g.bezel ?? o.bezel;
     const q = v => Math.round(v);
-    const key = `rr|${q(w)}|${q(h)}|${q(r)}|${o.bezel}|${o.profile}|${o.lens}|${o.res}`;
-    const m = getMap(key, () => rrectMap(w, h, r, o));
+    const key = `rr|${q(w)}|${q(h)}|${q(r)}|${q(bezel)}|${o.profile}|${o.lens}|${o.res}`;
+    const m = getMap(key, () => rrectMap(q(w) || 1, q(h) || 1, q(r), bezel, o));
     pending.push(m.ready);
     const { f, fi, dm } = this.ff;
     fi.setAttribute('href', m.url);
     for (const n of [f, fi]) { n.setAttribute('width', w); n.setAttribute('height', h); }
-    const bz = o.lens ? Math.min(w, h) / 2 : Math.min(o.bezel, w / 2, h / 2);
+    const bz = o.lens ? Math.min(w, h) / 2 : Math.min(bezel, w / 2, h / 2);
     const dmax = o.lens ? 0.85 * bz / 2.35 : 0.85 * bz / o.profile;   // keep e + D*m(e) monotonic: no folded rims
     const dp = 2 * Math.min(g.depth ?? o.depth, dmax), c = o.chroma;
     dm.r.setAttribute('scale', dp * (1 - c)); dm.g.setAttribute('scale', dp); dm.b.setAttribute('scale', dp * (1 + c));
@@ -285,7 +322,7 @@ class Glass {
 // ---------------------------------------------------------------------------
 // glass glyphs: a canvas distance field per glyph gives the map, mask and highlights
 // ---------------------------------------------------------------------------
-function edt1(f, n, d, v, z) {           // Felzenszwalb squared distance transform, 1D
+function edt1(f, n, d, v, z) {
   let k = 0; v[0] = 0; z[0] = -Infinity; z[1] = Infinity;
   for (let q = 1; q < n; q++) {
     let s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
@@ -295,7 +332,7 @@ function edt1(f, n, d, v, z) {           // Felzenszwalb squared distance transf
   k = 0;
   for (let q = 0; q < n; q++) { while (z[k + 1] < q) k++; d[q] = (q - v[k]) * (q - v[k]) + f[v[k]]; }
 }
-function edt(inside, W, H) {             // distance from inside pixels to the nearest outside pixel
+function edt(inside, W, H) {
   const INF = 1e20, g = new Float64Array(W * H);
   for (let i = 0; i < W * H; i++) g[i] = inside[i] ? INF : 0;
   const n = Math.max(W, H), f = new Float64Array(n), d = new Float64Array(n), v = new Int32Array(n), z = new Float64Array(n + 1);
@@ -303,11 +340,12 @@ function edt(inside, W, H) {             // distance from inside pixels to the n
   for (let y = 0; y < H; y++) { for (let x = 0; x < W; x++) f[x] = g[y * W + x]; edt1(f, W, d, v, z); for (let x = 0; x < W; x++) g[y * W + x] = Math.sqrt(d[x]); }
   return g;
 }
+// font is given at canvas resolution (display size * res)
 function glyphAssets(text, font, stretch, o) {
   const cm = document.createElement('canvas').getContext('2d');
   cm.font = font; cm.fontStretch = stretch;
   const m = cm.measureText(text);
-  const P = Math.ceil(o.bezel + 6);
+  const P = Math.ceil(o.bezel + 6 * o.res);
   const inkL = -m.actualBoundingBoxLeft, inkR = m.actualBoundingBoxRight;
   const W = Math.ceil(inkR - inkL + 2 * P), H = Math.ceil(m.actualBoundingBoxAscent + m.actualBoundingBoxDescent + 2 * P);
   const c = document.createElement('canvas'); c.width = W; c.height = H;
@@ -318,73 +356,97 @@ function glyphAssets(text, font, stretch, o) {
   const inside = new Uint8Array(W * H);
   for (let i = 0; i < W * H; i++) inside[i] = a[i * 4 + 3] > 127 ? 1 : 0;
   const D0 = edt(inside, W, H);
-  // soften the field so its gradient is smooth
+  const rad = Math.max(1, Math.round(o.res));
   const D = new Float64Array(W * H);
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
     let s = 0, n = 0;
-    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+    for (let dy = -rad; dy <= rad; dy++) for (let dx = -rad; dx <= rad; dx++) {
       const xx = x + dx, yy = y + dy; if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
       s += D0[yy * W + xx]; n++;
     }
     D[y * W + x] = s / n;
   }
   const map = ctx.createImageData(W, H), hl = ctx.createImageData(W, H);
-  const Lx = -0.55, Ly = -0.83;           // light from the top left
+  const Lx = -0.55, Ly = -0.83;
+  const b1 = 3.2 * o.res, b2 = 7 * o.res;
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
     const i = y * W + x, k = i * 4;
     const dxv = (D[y * W + Math.min(W - 1, x + 1)] - D[y * W + Math.max(0, x - 1)]) / 2;
     const dyv = (D[Math.min(H - 1, y + 1) * W + x] - D[Math.max(0, y - 1) * W + x]) / 2;
     const gl = Math.hypot(dxv, dyv) || 1;
-    const nx = dxv / gl, ny = dyv / gl;     // points inward
+    const nx = dxv / gl, ny = dyv / gl;
     const e = D0[i];
     let mm = 0;
     if (inside[i]) mm = Math.pow(clamp(1 - e / o.bezel), o.profile);
     map.data[k] = 128 + 127 * nx * mm; map.data[k + 1] = 128 + 127 * ny * mm; map.data[k + 2] = 128; map.data[k + 3] = 255;
-    // rim light on the edge facing the light, a darker rim on the far edge
     const alpha = a[k + 3] / 255;
     if (alpha > 0) {
-      const facing = -(nx * Lx + ny * Ly);   // outward normal . light
-      const band = clamp(1 - e / 3.2);
-      const band2 = clamp(1 - e / 7);
-      const lit = clamp(facing) ** 1.4 * band * 0.95 + 0.22 * band;
-      const shade = clamp(-facing) ** 1.2 * band2 * 0.22;
+      const facing = -(nx * Lx + ny * Ly);
+      const band = clamp(1 - e / b1);
+      const band2 = clamp(1 - e / b2);
+      const lit = clamp(facing) ** 1.4 * band * 0.95 + 0.24 * band;
+      const shade = clamp(-facing) ** 1.2 * band2 * 0.34;
       if (lit >= shade) { hl.data[k] = 255; hl.data[k + 1] = 255; hl.data[k + 2] = 255; hl.data[k + 3] = 255 * clamp(lit) * alpha; }
       else { hl.data[k] = 20; hl.data[k + 1] = 14; hl.data[k + 2] = 6; hl.data[k + 3] = 255 * shade * alpha; }
     }
   }
   const toURL = id => { const cc = document.createElement('canvas'); cc.width = W; cc.height = H; cc.getContext('2d').putImageData(id, 0, 0); return cc.toDataURL(); };
-  const mask = c.toDataURL();
-  return { W, H, ox, oy, adv: m.width, map: toURL(map), mask, hl: toURL(hl) };
+  return { W, H, ox, oy, adv: m.width, map: toURL(map), mask: c.toDataURL(), hl: toURL(hl) };
 }
 class GlassGlyph {
-  constructor(parent, text, font, stretch, opt = {}) {
-    this.o = Object.assign({ bezel: 12, depth: 12, chroma: 0.18, profile: 1.8 }, opt);
-    this.a = glyphAssets(text, font, stretch, this.o);
+  // size: display font size; res: canvas pixels per display pixel
+  constructor(parent, text, weight, family, size, stretch, opt = {}) {
+    this.o = Object.assign({ bezel: 12, depth: 12, chroma: 0.06, profile: 1.6, res: 1, frost: .10, shadow: true }, opt);
+    const R = this.o.res;
+    const a = glyphAssets(text, `${weight} ${size * R}px ${family}`, stretch, { bezel: this.o.bezel * R, profile: this.o.profile, res: R });
+    this.a = { W: a.W / R, H: a.H / R, ox: a.ox / R, oy: a.oy / R, adv: a.adv / R };
     const { W, H } = this.a;
-    this.wrap = el('div', 'gg-wrap', parent, { width: px(W), height: px(H) });
-    this.el = el('div', 'gg', this.wrap, { width: px(W), height: px(H), webkitMaskImage: `url(${this.a.mask})`, maskImage: `url(${this.a.mask})` });
+    this.wrap = el('div', 'gg-wrap' + (this.o.shadow ? ' shadow' : ''), parent, { width: px(W), height: px(H) });
+    this.el = el('div', 'gg', this.wrap, { width: px(W), height: px(H), webkitMaskImage: `url(${a.mask})`, maskImage: `url(${a.mask})` });
     this.refr = el('div', 'glass-refr', this.el, { width: px(W), height: px(H) });
     this.bd = el('div', 'glass-bd', this.refr);
-    this.tint = el('div', 'glass-tint', this.el, { background: `rgba(255,255,255,${this.o.frost ?? .10})` });
-    this.hl = el('div', 'gg-hl', this.el, { backgroundImage: `url(${this.a.hl})` });
+    this.tint = el('div', 'glass-tint', this.el, { background: `rgba(255,255,255,${this.o.frost})` });
+    this.hl = el('div', 'gg-hl', this.el, { backgroundImage: `url(${a.hl})` });
     this.id = 'gg' + (GID++);
     this.ff = glassFilter(this.id);
     const { f, fi, dm } = this.ff;
     for (const n of [f, fi]) { n.setAttribute('width', W); n.setAttribute('height', H); }
-    fi.setAttribute('href', this.a.map);
+    fi.setAttribute('href', a.map);
     const dp = 2 * Math.min(this.o.depth, 0.85 * this.o.bezel / this.o.profile), c = this.o.chroma;
     dm.r.setAttribute('scale', dp * (1 - c)); dm.g.setAttribute('scale', dp); dm.b.setAttribute('scale', dp * (1 + c));
     this.refr.style.filter = `url(#${this.id})`;
-    const im = new Image(); im.src = this.a.map; this.ready = im.decode().catch(e => { throw new Error('glyph ' + text + ' ' + this.a.W + 'x' + this.a.H + ' ' + this.a.map.slice(0, 40)); });
+    const im = new Image(); im.src = a.map; this.ready = im.decode();
   }
-  // place by pen origin (baseline x,y) in parent coordinates
-  set(x, y, s = 1, op = 1) {
+  // pen origin (baseline x, y) in parent coordinates
+  set(x, y, s = 1) {
     const { W, H, ox, oy } = this.a;
     const gx = x - ox, gy = y - oy;
-    show(this.wrap, s > 0.001 && op > 0);
+    show(this.wrap, s > 0.002);
     this.wrap.style.left = px(gx); this.wrap.style.top = px(gy);
-    this.wrap.style.transform = `scale(${s})`; this.wrap.style.opacity = op;
-    this.bd.style.transform = `translate(${W / 2}px,${H / 2}px) scale(${1 / s}) translate(${-gx - W / 2}px,${-gy - H / 2}px)`;
+    s = snap(s, 1, 1e-3);
+    this.wrap.style.transform = s === 1 ? 'none' : `scale(${s})`;
+    placeClone(this.bd, gx, gy, W, H, Math.max(s, 1e-3));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// goo: blur + alpha threshold, then the source composited atop it so glass stays sharp inside.
+// strength 0 is an exact identity, so the filter can come and go without a pop.
+// ---------------------------------------------------------------------------
+class Goo {
+  constructor(x, y, w, h, sigma) {
+    this.id = 'goo' + (GID++); this.sigma = sigma;
+    this.f = sv('filter', fx, { id: this.id, x, y, width: w, height: h, filterUnits: 'userSpaceOnUse', primitiveUnits: 'userSpaceOnUse', 'color-interpolation-filters': 'sRGB' });
+    this.blur = sv('feGaussianBlur', this.f, { in: 'SourceGraphic', stdDeviation: 0, result: 'b' });
+    this.mat = sv('feColorMatrix', this.f, { in: 'b', type: 'matrix', values: '', result: 'g' });
+    sv('feComposite', this.f, { in: 'SourceGraphic', in2: 'g', operator: 'atop' });
+  }
+  apply(target, k, after = '') {
+    if (k <= 0.0005) { target.style.filter = after || 'none'; return; }
+    const A = lerp(1, 22, k), B = (A - 1) / 2;
+    this.blur.setAttribute('stdDeviation', this.sigma * k);
+    this.mat.setAttribute('values', `1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 ${A} ${-B}`);
+    target.style.filter = `url(#${this.id}) ${after}`;
   }
 }
 
@@ -393,24 +455,24 @@ class GlassGlyph {
 // both edge extensions and the short arc between them (the housing clips the arc).
 // ============================================================================
 class Iris {
-  constructor(parent) {
-    this.svg = sv('svg', parent, { class: 'abs', overflow: 'visible' });
-    this.svg.style.position = 'absolute';
+  constructor(parent, flat = false) {
+    this.flat = flat;
+    this.svg = sv('svg', parent, { overflow: 'visible' });
+    this.svg.style.position = 'absolute'; this.svg.style.left = '0px'; this.svg.style.top = '0px';
     const d = sv('defs', this.svg, {});
     this.grads = []; this.blades = []; this.edges = [];
     this.gid = 'ir' + (GID++);
     for (let i = 0; i < 6; i++) {
       const g = sv('linearGradient', d, { id: `${this.gid}g${i}`, gradientUnits: 'userSpaceOnUse' });
-      sv('stop', g, { offset: 0, 'stop-color': '#2b2b2f' });
-      sv('stop', g, { offset: 0.35, 'stop-color': '#18181b' });
-      sv('stop', g, { offset: 1, 'stop-color': '#0d0d0f' });
+      sv('stop', g, { offset: 0, 'stop-color': flat ? '#0b0b0c' : '#2b2b2f' });
+      sv('stop', g, { offset: 0.35, 'stop-color': flat ? '#0b0b0c' : '#18181b' });
+      sv('stop', g, { offset: 1, 'stop-color': flat ? '#0b0b0c' : '#0d0d0f' });
       this.grads.push(g);
     }
-    for (let i = 0; i < 6; i++) this.blades.push(sv('path', this.svg, { fill: `url(#${this.gid}g${i})` }));
-    for (let i = 0; i < 6; i++) this.edges.push(sv('path', this.svg, { stroke: 'rgba(255,255,255,.16)', 'stroke-width': 1.4, fill: 'none' }));
+    for (let i = 0; i < 6; i++) this.blades.push(sv('path', this.svg, flat ? { fill: '#0b0b0c', stroke: '#0b0b0c', 'stroke-width': 1.6, 'stroke-linejoin': 'round' } : { fill: `url(#${this.gid}g${i})` }));
+    for (let i = 0; i < 6; i++) this.edges.push(sv('path', this.svg, { stroke: flat ? 'rgba(255,255,255,.10)' : 'rgba(255,255,255,.16)', 'stroke-width': 1.4, fill: 'none' }));
   }
-  // w,h: housing size (the housing element clips); a: aperture radius; rot: radians
-  set(w, h, a, rot) {
+  set(w, h, a, rot, seam = 1) {
     const svg = this.svg;
     svg.setAttribute('width', w); svg.setAttribute('height', h);
     svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
@@ -422,14 +484,12 @@ class Iris {
     const D = k => { const an = rot + k * Math.PI / 3 + 2 * Math.PI / 3; return [Math.cos(an), Math.sin(an)]; };
     for (let i = 0; i < 6; i++) {
       const vi = V(i), vj = V(i + 1), di = D(i), dp = D(i - 1);
-      // blade i: V_i -> V_i+1 -> extension of edge i -> (arc, clipped) -> extension of edge i-1 -> V_i
       const f1 = [vi[0] + L * di[0], vi[1] + L * di[1]];
       const f2 = [vi[0] + L * dp[0], vi[1] + L * dp[1]];
       this.blades[i].setAttribute('d', `M${vi[0]},${vi[1]} L${vj[0]},${vj[1]} L${f1[0]},${f1[1]} L${f2[0]},${f2[1]} Z`);
-      // the visible seam: edge i-1 extended past V_i
       this.edges[i].setAttribute('d', `M${vi[0]},${vi[1]} L${f2[0]},${f2[1]}`);
-      // shade across the blade: bright along the aperture edge, dark towards the rim
-      const nx = -di[1], ny = di[0];          // normal of edge i (outward for this winding)
+      this.edges[i].setAttribute('stroke-width', 1.4 * seam);
+      const nx = -di[1], ny = di[0];
       const g = this.grads[i];
       const mx = (vi[0] + vj[0]) / 2, my = (vi[1] + vj[1]) / 2;
       g.setAttribute('x1', mx); g.setAttribute('y1', my);
@@ -444,32 +504,46 @@ class Iris {
 const cursor = el('div', '', null);
 cursor.id = 'cursor';
 cursor.innerHTML = `<svg width="34" height="50" viewBox="-2 -2 22 32"><path d="M0 0 L0 23.2 L5.6 17.9 L9.4 26.9 L13.1 25.3 L9.3 16.5 L16.6 16.5 Z" fill="#0b0b0c" stroke="#fff" stroke-width="1.7" stroke-linejoin="round"/></svg>`;
-function setCursor(x, y, press, vis = true, scale = 1) {
-  show(cursor, vis);
+function setCursor(x, y, press, scale) {
   cursor.style.transform = `translate(${x}px,${y}px) scale(${scale * (1 - 0.16 * press)})`;
 }
-// presses: list of [down, up]
 function pressAmt(t, presses) {
   let v = 0;
   for (const [d, u] of presses) v += spring(t - d, SP.firm) - spring(t - u, SP.snap);
   return clamp(v, 0, 1.2);
 }
-
-// ============================================================================
-// camera
-// ============================================================================
 function setCamera(x, y, s) {
   world.style.transform = `translate(720px,720px) scale(${s}) translate(${-x}px,${-y}px)`;
 }
 
 // ============================================================================
-// SCENE 1 - OPEN: wordmark -> dot -> pill -> label -> iris -> photo
+// the timeline (beats from beatmap.json)
+// ============================================================================
+const T = {
+  squeeze: b(1), pill: b(2), label: b(3), irisClose: b(4), irisMorph: b(4) + 0.2, irisSwap: b(4) + 0.3, irisOpen: b(5),
+  square: b(6), shrink: b(7), plus: b(8), corners: b(9), bento: b(10), tileClick: b(11), zoom: b(11) + 0.04, drop: b(12),
+  word: b(13), melt: b(14), bar: b(15), adjust: b(16), slider: b(17), press: b(18), drag: b(19), release: b(21),
+  orbPhoto: b(22), lockSwitch: b(22.8), lock: b(23), date: b(24), pullback: b(25),
+  phone: b(26), island: b(27), pinch: b(28), window: b(29), blind: b(30),
+  longpress: b(31), lift: b(31.6), dragCard: b(31.7), tabHover: b(32.4), push: b(33), dropCard: b(34), cardSwap: b(35),
+  scroll: b(35), mat: b(35.4), molding: b(36), color: b(37), size: b(38), buyFly: b(39),
+  ordered: b(40), printing: b(41), way: b(42), delivered: b(43), flood1: b(43.4),
+  seg2: b(44) + 0.04, contract: b(45), wallIris: b(46), pushIn: b(46.8), wallClose: b(48), flood2: b(49),
+  seg3: b(49) + 0.32, pill2: b(50), dot2: b(51), letters: b(52),
+};
+
+// ============================================================================
+// SCENE 1 - OPEN: wordmark -> dot -> pill -> label -> iris -> photo -> grid -> bento
+// (the same elements close the film: pill -> dot -> letters)
 // ============================================================================
 const WM = { text: 'constrivo', size: 170 };
+const PILL = { w: 600, h: 180 };
+const CIRCLE = 520, TILE = 300, GAP = 16;
 const open = {};
+const SP_UNFOLD = { w: 18, z: 0.62 };
+const SP_BENTO = { w: 17, z: 0.8 };
 function buildOpen() {
   const root = el('div', 'scene', world); open.root = root;
-  // measure glyph advances at every wdth we need
   const meas = el('span', 'wm-l', stage, { visibility: 'hidden' });
   const adv = (ch, wd) => { meas.style.fontVariationSettings = `'wdth' ${wd}, 'wght' 800`; meas.textContent = ch; return meas.getBoundingClientRect().width; };
   open.letters = [...WM.text].map(ch => {
@@ -481,7 +555,6 @@ function buildOpen() {
   const dm = cm.measureText('.');
   meas.style.fontVariationSettings = `'wdth' 125, 'wght' 800`; meas.textContent = '.';
   const dotAdv = meas.getBoundingClientRect().width;
-  meas.textContent = 'x';
   cm.font = `800 ${WM.size}px Archivo`; const xm = cm.measureText('x');
   meas.remove();
   const total = open.letters.reduce((s, l) => s + l.a125, 0) + dotAdv;
@@ -489,30 +562,50 @@ function buildOpen() {
   const baseline = 720 + xm.actualBoundingBoxAscent / 2;
   let x = x0;
   open.letters.forEach(l => { l.x = x; x += l.a125; });
-  open.xRef = x;                                  // letters converge on the start of the period
+  open.xRef = x;
   open.dot = { x: x - dm.actualBoundingBoxLeft, y: baseline - dm.actualBoundingBoxAscent, w: dm.actualBoundingBoxLeft + dm.actualBoundingBoxRight, h: dm.actualBoundingBoxAscent + dm.actualBoundingBoxDescent };
-  open.dot.cx = open.dot.x + open.dot.w / 2; open.dot.cy = open.dot.y + open.dot.h / 2;
-  open.baseline = baseline;
-  // cap-line of the glyph box: the span's top sits at baseline - ascent of the em box
+  const d = open.dot; d.cx = d.x + d.w / 2; d.cy = d.y + d.h / 2;
   const em = document.createElement('canvas').getContext('2d'); em.font = `800 ${WM.size}px Archivo`;
-  const fm = em.measureText('c');
-  open.boxTop = baseline - fm.fontBoundingBoxAscent;
+  open.boxTop = baseline - em.measureText('c').fontBoundingBoxAscent;
+  // grid of nine tiles (3x3 around the dot) and the bento they reflow into (4x4 cells)
+  const tileKeys = [['p4', 'p3', 'p5'], ['p2', 'day', 'hero'], ['p7', 'p6', 'p1']];
+  const hinge = { '0,1': ['50% 100%', 'y', T.plus], '2,1': ['50% 0%', 'y', T.plus], '1,0': ['100% 50%', 'x', T.plus], '1,2': ['0% 50%', 'x', T.plus],
+    '0,0': ['100% 50%', 'x', T.corners], '0,2': ['0% 50%', 'x', T.corners], '2,0': ['100% 50%', 'x', T.corners], '2,2': ['0% 50%', 'x', T.corners] };
+  const BO = { x: d.cx - 466, y: d.cy - 466 }, CELL = 221;
+  const cell = (c, r, cw, ch) => ({ x: BO.x + c * (CELL + GAP), y: BO.y + r * (CELL + GAP), w: cw * CELL + (cw - 1) * GAP, h: ch * CELL + (ch - 1) * GAP });
+  const bento = { day: cell(0, 0, 2, 2), p3: cell(2, 0, 1, 2), p4: cell(3, 0, 1, 1), p5: cell(3, 1, 1, 1), p2: cell(0, 2, 1, 1), p6: cell(1, 2, 2, 1), hero: cell(3, 2, 1, 2), p7: cell(0, 3, 1, 1), p1: cell(1, 3, 2, 1) };
+  open.bento = bento;
+  open.tiles = [];
+  for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) {
+    if (r === 1 && c === 1) continue;
+    const key = tileKeys[r][c];
+    const e = el('div', 'tile', root);
+    const im = photoImg(key, e);
+    const [origin, axis, t0] = hinge[`${r},${c}`];
+    e.style.transformOrigin = origin;
+    const g = { x: d.cx - TILE / 2 + (c - 1) * (TILE + GAP), y: d.cy - TILE / 2 + (r - 1) * (TILE + GAP), w: TILE, h: TILE };
+    const dist = Math.hypot(bento[key].x - g.x, bento[key].y - g.y);
+    open.tiles.push({ key, e, im, axis, t0, g, bt: bento[key], lag: 0.012 * (r + c) + dist / 30000 });
+  }
   open.letters.forEach(l => { l.el = el('span', 'wm-l', root); l.el.textContent = l.ch; l.el.style.top = px(open.boxTop); });
-  // the dot, which becomes the pill (the housing of the iris)
   open.shape = el('div', 'black', root);
-  open.labelMask = el('div', 'mask', open.shape);
+  open.labelMask = el('div', 'clip', open.shape);
   open.label = el('div', 'label', open.labelMask); open.label.textContent = 'Make it real';
   open.photo = photoImg('day', open.shape);
   open.iris = new Iris(open.shape);
+  const bc = bento.day;
+  open.tc = { x: bc.x + bc.w / 2, y: bc.y + bc.h / 2 };
 }
-function wdthFor(l, target) {           // wdth whose advance equals target, or null if narrower than wdth 62
+function wdthFor(l, target) {
   if (target >= l.a125) return 125;
   if (target <= l.a62) return null;
   const tab = l.tab;
   for (let i = 1; i < tab.length; i++) if (tab[i] >= target) { const u = (target - tab[i - 1]) / (tab[i] - tab[i - 1]); return 62 + i - 1 + u; }
   return 125;
 }
-function drawWordmark(f) {                // f = 1 natural, 0 fully squeezed into the dot
+// every letter moves toward the dot by the same factor and its drawn width follows,
+// so neighbours stay touching: narrow the wdth axis first, then scale what's left
+function drawWordmark(f) {
   for (const l of open.letters) {
     const x = open.xRef + f * (l.x - open.xRef);
     const want = f * l.a125;
@@ -525,232 +618,603 @@ function drawWordmark(f) {                // f = 1 natural, 0 fully squeezed int
     l.el.style.transform = `scaleX(${sx})`;
   }
 }
-// timeline
-const O = {
-  squeeze: b(1), pill: b(2), label: b(3), click: b(4), morph: b(4) + 0.2, swap: b(4) + 0.3, open: b(5),
-};
-const PILL = { w: 600, h: 180 };
-const CIRCLE = 520;
+const SP_LETTERS = SP.snap;
 function updateOpen(t) {
-  // letters: squeeze into the period
-  const f = 1 - spring(t - O.squeeze, { w: 17, z: 1 });
-  drawWordmark(clamp(f, 0, 2));
-  const d = open.dot;
-  // dot -> pill -> circle (housing)
-  const gp = spring(t - O.pill, SP.snap);
-  const gm = spring(t - O.morph, { w: 22, z: 0.8 });
-  const w = lerp(lerp(d.w, PILL.w, gp), CIRCLE, gm);
-  const h = lerp(lerp(d.h, PILL.h, gp), CIRCLE, gm);
-  const r = lerp(lerp(0, PILL.h / 2, clamp(gp)), CIRCLE / 2, gm);
-  const cx = d.cx, cy = d.cy;
-  box(open.shape, cx - w / 2, cy - h / 2, w, h);
-  open.shape.style.borderRadius = px(Math.min(r, w / 2, h / 2));
+  const d = open.dot, end = t >= T.seg3;
+  const f = end ? spring(t - (T.letters - crossing(SP_LETTERS)), SP_LETTERS) : 1 - spring(t - T.squeeze, { w: 17, z: 1 });
+  drawWordmark(snap(Math.max(0, f), 1, 2e-3));
+  const bc = open.bento.day, SPM = { w: 22, z: 0.8 };
+  let cx, cy, w, h, r;
+  if (!end) {
+    cx = track(t, d.cx, [[T.bento, bc.x + bc.w / 2, SP_BENTO]]);
+    cy = track(t, d.cy, [[T.bento, bc.y + bc.h / 2, SP_BENTO]]);
+    w = track(t, d.w, [[T.pill, PILL.w, SP.snap], [T.irisMorph, CIRCLE, SPM], [T.shrink, TILE, SP.ui], [T.bento, bc.w, SP_BENTO]]);
+    h = track(t, d.h, [[T.pill, PILL.h, SP.snap], [T.irisMorph, CIRCLE, SPM], [T.shrink, TILE, SP.ui], [T.bento, bc.h, SP_BENTO]]);
+    r = track(t, 0, [[T.pill, PILL.h / 2, SP.snap], [T.irisMorph, CIRCLE / 2, SPM], [T.square, 40, SP.ui], [T.shrink, 26, SP.ui], [T.zoom, 0, SP.firm]]);
+  } else {
+    const SPC = { w: 13, z: 0.82 }, SPD = { w: 18, z: 0.9 };
+    cx = d.cx; cy = d.cy;
+    w = snap(track(t, 3600, [[T.pill2, PILL.w, SPC], [T.dot2, d.w, SPD]]), d.w, 0.02);
+    h = snap(track(t, 3600, [[T.pill2, PILL.h, SPC], [T.dot2, d.h, SPD]]), d.h, 0.02);
+    r = snap(track(t, 1800, [[T.pill2, PILL.h / 2, SPC], [T.dot2, 0, SPD]]), 0, 0.02);
+  }
+  cbox(open.shape, cx, cy, w, h, r);
   // label rises out of its own mask line
   const lm = 72;
   box(open.labelMask, 0, h / 2 - lm / 2, w, lm);
-  const lr = spring(t - O.label, { w: 18, z: 0.84 });
-  open.label.style.transform = `translateY(${lerp(lm + 6, 0, lr)}px)`;
+  open.label.style.transform = `translateY(${riseY(t, lm, T.label)}px)`;
   open.label.style.lineHeight = px(lm);
-  show(open.labelMask, t < O.swap);
-  // photo lives in the housing once the blades have closed over the label
-  show(open.photo, t >= O.swap);
+  show(open.labelMask, !end && t < T.irisSwap);
+  show(open.photo, !end && t >= T.irisSwap);
   placeCover(open.photo, 'day', 0, 0, w, h);
-  // iris
   const a0 = Math.hypot(PILL.w, PILL.h) / 2 / Math.cos(Math.PI / 6) * 1.06;
   const a1 = CIRCLE / 2 / Math.cos(Math.PI / 6) * 1.08;
-  const a = track(t, a0, [[O.click, 0, { w: 22, z: 0.92 }], [O.open, a1, SP.snap]]);
-  const rot = 0.26 + 1.25 * (1 - clamp(a / a1));
-  open.iris.set(w, h, Math.max(0, a), rot);
-  // camera: follow the dot as it becomes the pill
-  const cam = [
-    track(t, 720, [[O.squeeze, d.cx, SP.cam]]),
-    track(t, 720, [[O.squeeze, d.cy, SP.cam]]),
-    track(t, 1, [[O.squeeze, 1.22, SP.cam], [O.click, 1.6, SP.soft]]),
-  ];
-  // cursor: glides in, clicks the pill
-  const cx0 = d.cx + 640, cy0 = d.cy + 520;
-  const tgt = [d.cx + 150, d.cy + 34];
-  const cxx = track(t, cx0, [[b(2.6), tgt[0], { w: 7.5, z: 1 }], [O.open + 0.25, tgt[0] + 170, { w: 6, z: 1 }]]);
-  const cyy = track(t, cy0, [[b(2.6), tgt[1], { w: 9, z: 1 }], [O.open + 0.25, tgt[1] + 260, { w: 7, z: 1 }]]);
-  return { cam, cursor: [cxx, cyy, pressAmt(t, [[O.click - 0.05, O.click + 0.1]]), t > b(2.6)] };
+  const a = end ? 1e5 : track(t, a0, [[T.irisClose, 0, { w: 22, z: 0.92 }], [T.irisOpen, a1, SP.snap], [T.square, 1e4, SP.firm]]);
+  open.iris.set(w, h, Math.max(0, a), 0.26 + 1.25 * (1 - clamp(a / a1)));
+  // the grid unfolds from behind the tile like a paper map, then reflows into a bento
+  for (const tl of open.tiles) {
+    const u = spring(t - tl.t0, SP_UNFOLD);
+    const on = !end && u > 0.002;
+    show(tl.e, on);
+    if (!on) continue;
+    const k = spring(t - (T.bento + tl.lag), SP_BENTO);
+    const R = { x: lerp(tl.g.x, tl.bt.x, k), y: lerp(tl.g.y, tl.bt.y, k), w: lerp(tl.g.w, tl.bt.w, k), h: lerp(tl.g.h, tl.bt.h, k) };
+    box(tl.e, R.x, R.y, R.w, R.h);
+    tl.e.style.borderRadius = '26px';
+    tl.e.style.transform = tl.axis === 'x' ? `scaleX(${u})` : `scaleY(${u})`;
+    placeCover(tl.im, tl.key, 0, 0, R.w, R.h);
+  }
 }
 
 // ============================================================================
-// SCENE 2 - GLASS: relight Taipei from day to golden hour with a glass slider
+// SCENE 2 - GLASS (inside the Taipei tile, 1440 local units across)
 // ============================================================================
-const G = { word: b(13), melt: b(14), bar: b(15), adjust: b(16), slider: b(17), press: b(18), drag: b(19), release: b(21) };
-const SL = { x0: 150, x1: 1290, y: 1262, h: 100, t0: 232, t1: 1208 };
+const GL = { dropY: 572, barY: 1262, baseline: 660, word: 'light', size: 330, orbY: 600, orbD: 520 };
+const SL = { w: 1140, h: 100, t0: 232, t1: 1208 };
+const SP_LIQ = { w: 14, z: 0.62 }, SP_ORB = { w: 10, z: 0.8 };
 const glass = {};
-function photoClone(parent) {        // day + golden, same geometry as the scene photo
+function photoClone(parent) {
   const w = el('div', 'abs', parent);
   const d = photoImg('day', w), g = photoImg('golden', w);
   box(d, 0, 0, 1440, 1440); box(g, 0, 0, 1440, 1440);
   return { w, d, g };
 }
+const ICONS = [
+  // crop
+  `<path d="M12 4 V32 H40 M4 12 H32 V40" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>`,
+  // adjust (dial)
+  `<circle cx="22" cy="22" r="11" fill="none" stroke="#fff" stroke-width="3.6"/><circle cx="22" cy="22" r="3.4" fill="#fff"/>` +
+    [...Array(12)].map((_, i) => { const a = i * Math.PI / 6; return `<circle cx="${22 + 18 * Math.cos(a)}" cy="${22 + 18 * Math.sin(a)}" r="1.9" fill="#fff"/>`; }).join(''),
+  // filters
+  `<circle cx="16" cy="17" r="10" fill="none" stroke="#fff" stroke-width="3.2"/><circle cx="28" cy="17" r="10" fill="none" stroke="#fff" stroke-width="3.2"/><circle cx="22" cy="28" r="10" fill="none" stroke="#fff" stroke-width="3.2"/>`,
+  // markup
+  `<path d="M9 35 L12 26 L29 9 L35 15 L18 32 Z" fill="none" stroke="#fff" stroke-width="3.4" stroke-linejoin="round"/><path d="M25 13 L31 19" stroke="#fff" stroke-width="3.4"/>`,
+];
 function buildGlass() {
   const root = el('div', 'scene', world); glass.root = root;
+  const bc = open.bento.day;
+  root.style.transform = `translate(${bc.x}px,${bc.y}px) scale(${bc.w / 1440})`;
   glass.photo = photoClone(root);
-  glass.bar = new Glass(root, { bezel: 22, depth: 9, chroma: 0.06, profile: 2, tint: .12 });
+  glass.photoWrap = glass.photo.w;
+  // glass word + droplet live in one goo container
+  glass.gooBox = el('div', 'abs', root, { width: '1440px', height: '1440px' });
+  glass.goo = new Goo(0, 0, 1440, 1440, 20);
+  const font = `800 ${GL.size}px Archivo`;
+  const cm = document.createElement('canvas').getContext('2d'); cm.font = font; cm.fontStretch = 'expanded';
+  const adv = [...GL.word].map(c => cm.measureText(c).width);
+  const tot = adv.reduce((s, v) => s + v, 0);
+  let x = 720 - tot / 2;
+  glass.letters = [...GL.word].map((c, i) => {
+    const g = new GlassGlyph(glass.gooBox, c, 800, 'Archivo', GL.size, 'expanded', { bezel: 24, depth: 14, chroma: 0.06, profile: 1.5, frost: 0.17, shadow: false });
+    const L = { g, x, adv: adv[i], clone: photoClone(g.bd) }; x += adv[i]; return L;
+  });
+  glass.bar = new Glass(glass.gooBox, { bezel: 22, depth: 12, chroma: 0.06, profile: 2, tint: .12 });
+  glass.bar.el.style.boxShadow = 'none';
   glass.barClone = photoClone(glass.bar.bd);
+  // toolbar icons
+  glass.icons = ICONS.map(inner => svgEl(root, 44, 44, inner, { transformOrigin: '22px 22px' }));
   glass.track = el('div', 'abs', root, { height: '6px', borderRadius: '3px', background: 'rgba(255,255,255,.42)' });
   glass.fill = el('div', 'abs', root, { height: '6px', borderRadius: '3px', background: 'rgba(255,255,255,.96)' });
-  glass.ticks = el('div', 'abs', root);
+  glass.tickClip = el('div', 'clip', root);
+  glass.ticks = el('div', 'abs', glass.tickClip);
   for (let i = 0; i <= 24; i++) el('div', 'abs', glass.ticks, { left: px(i * (SL.t1 - SL.t0) / 24 - 1), top: '0px', width: '2px', height: i % 6 ? '10px' : '18px', borderRadius: '1px', background: 'rgba(255,255,255,.55)' });
   glass.lens = new Glass(root, { lens: true, depth: 30, chroma: 0.05, res: 0.5, tint: .05 });
   glass.lensClone = photoClone(glass.lens.bd);
   glass.lens.rim.style.padding = '2.6px';
-  glass.lens.el.style.boxShadow = '0 16px 34px rgba(24,18,10,.28), 0 3px 8px rgba(24,18,10,.18), inset 0 0 0 1px rgba(255,255,255,.25)';
+  glass.lens.el.style.boxShadow = '0 16px 34px rgba(24,18,10,.28), 0 3px 8px rgba(24,18,10,.18)';
+  glass.orbClip = el('div', 'clip', glass.lens.inner, { borderRadius: '50%' });
+  glass.orbHero = photoImg('hero', glass.orbClip);
   glass.chip = new Glass(root, { bezel: 18, depth: 7, chroma: 0.04, profile: 2, tint: .18 });
   glass.chipClone = photoClone(glass.chip.bd);
-  glass.chipText = el('div', 'ui', root, { font: '600 27px Geist', color: '#fff', letterSpacing: '-0.01em', textShadow: '0 1px 2px rgba(0,0,0,.25)' });
+  glass.chipText = txt(root, '', { font: '600 27px Geist', color: '#fff', letterSpacing: '-0.01em', textShadow: '0 1px 2px rgba(0,0,0,.25)', textAlign: 'center' });
 }
 function setWipe(clone, wx) { clone.g.style.clipPath = `inset(0 ${Math.max(0, 1440 - wx)}px 0 0)`; }
 function fmtTime(mins) { let h = Math.floor(mins / 60), m = Math.round(mins % 60); if (m === 60) { h++; m = 0; } const ap = h >= 12 ? 'PM' : 'AM'; const hh = ((h + 11) % 12) + 1; return `${hh}:${String(m).padStart(2, '0')} ${ap}`; }
+const knobX = t => track(t, SL.t0, [[T.drag, SL.t1, SP.drag]]);
+function orbGeom(t) {             // the knob, the lens and the orb are one glass element
+  const kx = knobX(t);
+  const d = track(t, 0, [[T.slider + 0.12, 58, SP.pop], [T.press, 176, SP.pop], [T.release, GL.orbD, SP_ORB]]);
+  const lift = spring(t - T.release, SP_ORB);
+  return { cx: lerp(kx, 720, lift), cy: lerp(GL.barY, GL.orbY, lift), d };
+}
+function lensGeom(t) {           // glass-local: orb, then the lock screen at its closest
+  const o = orbGeom(t);
+  const k = spring(t - T.lock, { w: 9, z: 0.86 });
+  return { x: lerp(o.cx - o.d / 2, LOCK.x, k), y: lerp(o.cy - o.d / 2, LOCK.y, k), w: lerp(o.d, LOCK.w, k), h: lerp(o.d, LOCK.h, k), r: lerp(o.d / 2, S.r * KS, k) };
+}
+const SP_BEZEL = { w: 14, z: 0.78 };
 function updateGlass(t) {
-  // knob position follows the cursor drag
-  const kx = track(t, SL.t0, [[G.drag, SL.t1, SP.drag]]);
+  const kx = knobX(t);
   const u = inv(SL.t0, SL.t1, kx);
   const wx = u * 1440;
-  for (const c of [glass.photo, glass.barClone, glass.lensClone, glass.chipClone]) setWipe(c, wx);
-  // slider capsule
-  const sw = SL.x1 - SL.x0;
-  glass.bar.set({ x: SL.x0, y: SL.y - SL.h / 2, w: sw, h: SL.h, r: SL.h / 2 });
-  // track
-  box(glass.track, SL.t0, SL.y - 3, SL.t1 - SL.t0, 6);
-  box(glass.fill, SL.t0, SL.y - 3, kx - SL.t0, 6);
-  box(glass.ticks, SL.t0, SL.y + 22, SL.t1 - SL.t0, 20);
-  // knob -> lens while held
-  const held = spring(t - G.press, SP.pop) - spring(t - G.release, SP.ui);
-  const d = lerp(58, 176, clamp(held, 0, 1.3));
-  glass.lens.set({ x: kx - d / 2, y: SL.y - d / 2, w: d, h: d, r: d / 2 });
-  // time-of-day chip above the lens
-  const cw = 196, ch = 62, cy = SL.y - d / 2 - 26 - ch;
-  const chipOn = spring(t - G.press - 0.06, SP.pop) - spring(t - G.release, SP.ui);
-  glass.chip.set({ x: kx - cw / 2, y: cy, w: cw, h: ch, r: ch / 2, s: clamp(chipOn, 0, 1.3) });
+  const clones = [glass.photo, glass.barClone, glass.lensClone, glass.chipClone];
+  // the letters
+  const m = spring(t - T.melt, { w: 12, z: 1 });
+  for (let i = 0; i < glass.letters.length; i++) {
+    const L = glass.letters[i];
+    const s = Math.max(0, spring(t - (T.word + i * 0.055), SP.pop) * (1 - m));
+    const cxL = L.x + L.adv / 2;
+    const penX = L.x + (720 - cxL) * m;
+    const penY = GL.baseline + (GL.dropY + 70 - GL.baseline) * m;
+    L.g.set(penX, penY, s);
+    clones.push(L.clone);
+  }
+  for (const c of clones) setWipe(c, wx);
+  // goo only while the letters melt
+  const gk = inv(T.melt, T.melt + 0.14, t) - inv(T.melt + 0.4, T.melt + 0.56, t);
+  glass.goo.apply(glass.gooBox, gk, 'drop-shadow(0 12px 22px rgba(24,18,10,.24))');
+  // droplet -> toolbar -> slider (one glass element)
+  const bw = track(t, 0, [[T.melt + 0.03, 200, SP.pop], [T.bar, 560, SP_LIQ], [T.slider, SL.w, SP.ui], [T.release, 0, SP.firm]]);
+  const bh = track(t, 0, [[T.melt + 0.03, 200, SP.pop], [T.bar, 112, SP_LIQ], [T.slider, SL.h, SP.ui], [T.release, 0, SP.firm]]);
+  const bcx = track(t, 720, [[T.release, SL.t1, SP.firm]]);
+  const bcy = track(t, GL.dropY, [[T.bar, GL.barY, SP_LIQ]]);
+  glass.bar.set({ x: bcx - bw / 2, y: bcy - bh / 2, w: bw, h: bh, r: Math.min(bw, bh) / 2, bezel: clamp(0.36 * Math.min(bw, bh), 0, 44) });
+  // icons pop from zero, then shrink away as the bar becomes a slider
+  glass.icons.forEach((ic, i) => {
+    let s = spring(t - (T.bar + 0.18 + i * 0.05), SP.pop) * (1 - spring(t - (T.slider - 0.02), SP.firm));
+    if (i === 1) s *= 1 - 0.18 * pressAmt(t, [[T.adjust - 0.03, T.adjust + 0.08]]);
+    show(ic, s > 0.003);
+    ic.style.left = px(720 + (i - 1.5) * 118 - 22); ic.style.top = px(GL.barY - 22);
+    ic.style.transform = `scale(${1.2 * Math.max(0, s)})`;
+  });
+  // track draws across; contracts into the lens on release
+  const dr = spring(t - (T.slider + 0.06), { w: 13, z: 1 });
+  const c = spring(t - T.release, SP.firm);
+  const left = lerp(SL.t0, SL.t1, c), right = lerp(SL.t0 + (SL.t1 - SL.t0) * dr, SL.t1, c);
+  const trOn = right - left > 0.5 && t > T.slider;
+  show(glass.track, trOn); show(glass.fill, trOn); show(glass.tickClip, trOn);
+  box(glass.track, left, GL.barY - 3, right - left, 6);
+  box(glass.fill, left, GL.barY - 3, clamp(kx - left, 0, right - left), 6);
+  box(glass.tickClip, left, GL.barY + 22, right - left, 20);
+  glass.ticks.style.left = px(SL.t0 - left);
+  // knob -> lens -> orb -> lock screen: one element the whole way, so nothing is ever swapped
+  const Lg = lensGeom(t);
+  const covered = t - T.orbPhoto >= crossing(SP.snap);
+  glass.lens.set({ x: Lg.x, y: Lg.y, w: Lg.w, h: Lg.h, r: Lg.r, noMap: covered });
+  let clipX, clipY;
+  if (!covered) {               // the hero opens inside the orb as a circle (2px past its edge)
+    const rh = (Lg.w / 2 + 2) * clamp(spring(t - T.orbPhoto, SP.snap), 0, 1);
+    show(glass.orbClip, rh > 0.5);
+    clipX = Lg.w / 2 - rh; clipY = Lg.h / 2 - rh;
+    box(glass.orbClip, clipX, clipY, 2 * rh, 2 * rh); glass.orbClip.style.borderRadius = px(rh);
+  } else {
+    show(glass.orbClip, true);
+    clipX = -2; clipY = -2;
+    box(glass.orbClip, -2, -2, Lg.w + 4, Lg.h + 4); glass.orbClip.style.borderRadius = px(Lg.r + 2);
+  }
+  const H = stg.heroLocal;     // the hero sits where it will be on the lock screen
+  box(glass.orbHero, H.x - Lg.x - clipX, H.y - Lg.y - clipY, H.w, H.h);
+  // compensate through layout (snapped with the parent), not a float translate, so text never jitters
+  stg.lockWrap.style.left = px(A.x - Lg.x); stg.lockWrap.style.top = px(A.y - Lg.y);
+  stg.lockWrap.style.transform = `scale(${KS})`;
+  glass.lens.rim.style.padding = px(2.6 * (1 - clamp(spring(t - T.phone, SP_BEZEL))));
+  // time-of-day chip
+  const cw = 196, ch = 62, d = track(t, 0, [[T.slider + 0.12, 58, SP.pop], [T.press, 176, SP.pop], [T.release, 176, SP.pop]]);
+  const cyc = GL.barY - d / 2 - 26 - ch;
+  const chipOn = clamp(spring(t - T.press - 0.06, SP.pop) - spring(t - T.release, SP.firm), 0, 1.3);
+  glass.chip.set({ x: kx - cw / 2, y: cyc, w: cw, h: ch, r: ch / 2, s: chipOn });
   glass.chipText.textContent = fmtTime(lerp(14 * 60 + 40, 18 * 60 + 42, u));
-  const tw = 140;
-  box(glass.chipText, kx - tw / 2, cy + 14, tw, 34);
-  glass.chipText.style.textAlign = 'center';
-  glass.chipText.style.transform = `scale(${clamp(chipOn, 0, 1.3)})`;
-  show(glass.chipText, chipOn > 0.01);
-  return { cam: [720, 720, 1], cursor: [kx + 4, SL.y + 6, pressAmt(t, [[G.press - 0.05, G.release]]), true] };
+  box(glass.chipText, kx - 70, cyc + 14, 140, 34);
+  glass.chipText.style.transform = `scale(${chipOn})`;
+  show(glass.chipText, chipOn > 0.004);
+  show(glass.photoWrap, t < T.lock + 0.62);
 }
 
 // ============================================================================
-// SCENE 3 - STAGE: phone + Mac, drag the wallpaper onto a Safari tab
+// SCENE 3 - STAGE (inside the glass scene; units of the phone as drawn at 1x)
+// lock screen -> phone -> island droplet -> Mac window -> Safari -> landing page -> print
 // ============================================================================
-const ST = { press: b(31), drag: b(31.3), drop: b(34) };
 const PH = { x: 96, y: 286, w: 404, h: 876 };
+const S = { x: 111, y: 301, w: 374, h: 846, r: 58 };
 const MAC = { x: 580, y: 300, w: 800, h: 610 };
+const LOCK = { x: -80, y: -150, w: 1600 };          // the lock screen in glass-local units at its closest
+const KS = LOCK.w / S.w;
+LOCK.h = S.h * KS;
+const A = { x: LOCK.x - S.x * KS, y: LOCK.y - S.y * KS };   // stage -> glass-local offset
+const PAGE = { x: MAC.x, y: MAC.y + 99, w: 800, h: 511 };    // Safari content area in stage units
+const SCROLL = 440;
 const stg = {};
 function buildStage() {
-  const root = el('div', 'scene', world); stg.root = root;
-  // phone
-  const P = PH;
-  stg.phone = el('div', 'abs', root, { left: px(P.x), top: px(P.y), width: px(P.w), height: px(P.h), borderRadius: '72px', background: 'linear-gradient(145deg,#3a3a3e,#1a1a1c 40%,#2c2c30)', boxShadow: '0 40px 70px rgba(30,22,10,.22), 0 6px 14px rgba(30,22,10,.18)' });
-  el('div', 'abs', stg.phone, { left: '3px', top: '3px', right: '3px', bottom: '3px', width: 'auto', height: 'auto', borderRadius: '69px', background: '#050506' });
-  const S = { x: 15, y: 15, w: P.w - 30, h: P.h - 30 };
-  stg.screenBox = S;
-  stg.screen = el('div', 'abs', stg.phone, { left: px(S.x), top: px(S.y), width: px(S.w), height: px(S.h), borderRadius: '58px', overflow: 'hidden', background: '#111' });
-  stg.wall = photoImg('hero', stg.screen); placeCover(stg.wall, 'hero', 0, 0, S.w, S.h);
-  // lock screen: date, glass clock, music player, home bar
-  stg.date = el('div', 'ui', stg.screen, { left: '0px', width: px(S.w), top: '88px', textAlign: 'center', font: '600 21px Geist', color: 'rgba(255,255,255,.94)', letterSpacing: '0.005em', textShadow: '0 1px 3px rgba(0,0,0,.25)' });
-  stg.date.textContent = 'Saturday, September 26';
-  stg.clock = [];
-  const font = '800 152px Geist';
-  let x = 0; const digits = ['9', ':', '4', '1'];
-  const cm = document.createElement('canvas').getContext('2d'); cm.font = font;
+  const root = el('div', 'scene', glass.root); stg.root = root;
+  root.style.transform = `translate(${A.x}px,${A.y}px) scale(${KS})`;
+  const hc = cover(PHOTOS.hero, S.w, S.h);
+  stg.heroCover = hc;
+  stg.heroLocal = { x: A.x + KS * (S.x + hc.x), y: A.y + KS * (S.y + hc.y), w: KS * hc.w, h: KS * hc.h };
+  // phone body grows out of the screen edge
+  stg.bodyRoot = el('div', 'scene', null);
+  stg.bodyRoot.style.transform = root.style.transform;
+  glass.root.insertBefore(stg.bodyRoot, glass.lens.el);
+  stg.body = el('div', 'abs', stg.bodyRoot, { background: 'linear-gradient(145deg,#3a3a3e,#1a1a1c 40%,#2c2c30)' });
+  stg.bodyIn = el('div', 'abs', stg.body, { background: '#050506' });
+  // the lock screen (the orb, grown)
+  // the lock screen's contents live inside the orb (in stage units), above its wallpaper
+  stg.lockWrap = el('div', 'abs', glass.lens.inner, { transformOrigin: '0 0' });
+  stg.content = el('div', 'abs', stg.lockWrap, { left: px(S.x), top: px(S.y), width: px(S.w), height: px(S.h) });
+  // date
+  stg.dateMask = el('div', 'clip', stg.content, { left: '0px', top: '84px', width: px(S.w), height: '30px' });
+  stg.date = txt(stg.dateMask, 'Saturday, September 26', { left: '0px', width: px(S.w), top: '2px', textAlign: 'center', font: '600 21px Geist', color: 'rgba(255,255,255,.94)', letterSpacing: '0.005em', textShadow: '0 1px 3px rgba(0,0,0,.25)' });
+  // glass clock
+  const digits = ['9', ':', '4', '1'];
+  const cm = document.createElement('canvas').getContext('2d'); cm.font = '800 152px Geist';
   const widths = digits.map(c => cm.measureText(c).width - (c === ':' ? 8 : 6));
-  const tot = widths.reduce((s, v) => s + v, 0);
-  x = (S.w - tot) / 2;
-  digits.forEach((c, i) => {
-    const g = new GlassGlyph(stg.screen, c, font, 'normal', { bezel: 16, depth: 9, chroma: 0.06, profile: 1.5, frost: .30 });
-    const clone = el('div', 'abs', g.bd); const im = photoImg('hero', clone); placeCover(im, 'hero', 0, 0, S.w, S.h);
-    stg.clock.push({ g, x, c }); x += widths[i];
+  let x = (S.w - widths.reduce((s, v) => s + v, 0)) / 2;
+  stg.clock = digits.map((c, i) => {
+    const g = new GlassGlyph(stg.content, c, 800, 'Geist', 152, 'normal', { bezel: 16, depth: 9, chroma: 0.06, profile: 1.5, frost: .30, res: 4.4 });
+    const im = photoImg('hero', g.bd); box(im, hc.x, hc.y, hc.w, hc.h);
+    const o = { g, x }; x += widths[i]; return o;
   });
-  stg.player = new Glass(stg.screen, { bezel: 26, depth: 11, chroma: 0.05, profile: 2, tint: .06 });
-  stg.player.tint.style.background = 'linear-gradient(rgba(38,34,30,.34), rgba(38,34,30,.42))';
-  const pc = el('div', 'abs', stg.player.bd); const pim = photoImg('hero', pc); placeCover(pim, 'hero', 0, 0, S.w, S.h);
-  const PL = { x: 18, y: S.h - 142, w: S.w - 36, h: 96 };
-  stg.playerBox = PL;
-  stg.player.set({ x: PL.x, y: PL.y, w: PL.w, h: PL.h, r: 34 });
-  const art = el('div', 'abs', stg.screen, { left: px(PL.x + 16), top: px(PL.y + 16), width: '64px', height: '64px', borderRadius: '14px', overflow: 'hidden' });
-  const aim = photoImg('golden', art); placeCover(aim, 'golden', 0, 0, 64, 64, 1.6);
-  el('div', 'ui', stg.screen, { left: px(PL.x + 94), top: px(PL.y + 22), font: '600 20px Geist', color: '#fff' }).textContent = 'Winter Breeze';
-  el('div', 'ui', stg.screen, { left: px(PL.x + 94), top: px(PL.y + 50), font: '500 16px Geist', color: 'rgba(255,255,255,.72)' }).textContent = 'Arulo';
-  const ctl = sv('svg', stg.screen, { width: 76, height: 30, viewBox: '0 0 76 30' });
-  Object.assign(ctl.style, { position: 'absolute', left: px(PL.x + PL.w - 96), top: px(PL.y + 33) });
-  sv('path', ctl, { d: 'M4 3 L4 27 M14 3 L14 27', stroke: '#fff', 'stroke-width': 6, 'stroke-linecap': 'round' });
-  sv('path', ctl, { d: 'M40 5 L54 15 L40 25 Z M56 5 L70 15 L56 25 Z', fill: '#fff' });
-  el('div', 'abs', stg.screen, { left: px(S.w / 2 - 68), top: px(S.h - 22), width: '136px', height: '5px', borderRadius: '3px', background: 'rgba(255,255,255,.9)' });
-  // dynamic island
-  el('div', 'abs', stg.screen, { left: px(S.w / 2 - 62), top: '18px', width: '124px', height: '36px', borderRadius: '18px', background: '#000' });
+  // home bar -> glass music player
+  stg.player = new Glass(stg.content, { bezel: 26, depth: 11, chroma: 0.05, profile: 2, tint: .06, res: 1.2 });
+  const pim = photoImg('hero', stg.player.bd); box(pim, hc.x, hc.y, hc.w, hc.h);
+  stg.playerDark = stg.player.tint;
+  stg.PL = { x: 18, y: S.h - 142, w: S.w - 36, h: 96 };
+  const PL = stg.PL;
+  stg.art = el('div', 'clip', stg.content, { borderRadius: '14px' });
+  const aim = photoImg('golden', stg.art); stg.artImg = aim;
+  stg.ptitleMask = el('div', 'clip', stg.content, { left: px(PL.x + 94), top: px(PL.y + 20), width: '180px', height: '28px' });
+  stg.ptitle = txt(stg.ptitleMask, 'Winter Breeze', { left: '0px', top: '1px', font: '600 20px Geist', color: '#fff' });
+  stg.psubMask = el('div', 'clip', stg.content, { left: px(PL.x + 94), top: px(PL.y + 49), width: '180px', height: '22px' });
+  stg.psub = txt(stg.psubMask, 'Arulo', { left: '0px', top: '1px', font: '500 16px Geist', color: 'rgba(255,255,255,.72)' });
+  stg.ctl = svgEl(stg.content, 76, 30, `<path d="M4 3 L4 27 M14 3 L14 27" stroke="#fff" stroke-width="6" stroke-linecap="round"/><path d="M40 5 L54 15 L40 25 Z M56 5 L70 15 L56 25 Z" fill="#fff"/>`, { left: px(PL.x + PL.w - 96), top: px(PL.y + 33), transformOrigin: '38px 15px' });
+  // dynamic island inside the screen (until it turns to liquid)
+  stg.islandIn = el('div', 'abs', stg.content, { left: px(S.w / 2 - 62), top: '18px', width: '124px', height: '36px', borderRadius: '18px', background: '#000' });
 
-  // Mac window with Safari
-  const M = MAC;
-  stg.mac = el('div', 'abs', root, { left: px(M.x), top: px(M.y), width: px(M.w), height: px(M.h), borderRadius: '24px', overflow: 'hidden', background: '#f7f6f3', boxShadow: '0 40px 80px rgba(30,22,10,.20), 0 0 0 1px rgba(0,0,0,.06), 0 8px 18px rgba(30,22,10,.12)' });
-  const bar = el('div', 'abs', stg.mac, { width: px(M.w), height: '98px', background: '#fbfbfa', borderBottom: '1px solid rgba(0,0,0,.08)' });
-  ['#ff5f57', '#febc2e', '#28c840'].forEach((c, i) => el('div', 'abs', bar, { left: px(22 + i * 22), top: '22px', width: '13px', height: '13px', borderRadius: '50%', background: c, boxShadow: 'inset 0 0 0 .5px rgba(0,0,0,.12)' }));
-  const chev = sv('svg', bar, { width: 60, height: 20, viewBox: '0 0 60 20' });
-  Object.assign(chev.style, { position: 'absolute', left: '112px', top: '19px' });
-  sv('path', chev, { d: 'M10 3 L3 10 L10 17 M36 3 L43 10 L36 17', stroke: '#8e8e93', 'stroke-width': 2.2, fill: 'none', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' });
-  const addr = el('div', 'abs', bar, { left: px(M.w / 2 - 190), top: '12px', width: '380px', height: '34px', borderRadius: '17px', background: 'rgba(0,0,0,.055)' });
-  el('div', 'ui', addr, { left: '0px', width: '380px', top: '8px', textAlign: 'center', font: '500 15px Geist', color: '#8a8a8e' }).textContent = 'Search or enter website name';
-  // tabs
-  const tab1 = el('div', 'abs', bar, { left: '14px', top: '56px', width: '230px', height: '34px', borderRadius: '10px', background: '#fff', boxShadow: '0 1px 2px rgba(0,0,0,.08), 0 0 0 .5px rgba(0,0,0,.06)' });
-  el('div', 'ui', tab1, { left: '44px', top: '8px', font: '500 15px Geist', color: '#1d1d1f' }).textContent = 'Start Page';
-  el('div', 'abs', tab1, { left: '16px', top: '9px', width: '16px', height: '16px', borderRadius: '5px', background: '#d9d6cf' });
-  stg.drop = el('div', 'abs', bar, { left: '252px', top: '56px', width: '230px', height: '34px', borderRadius: '10px', background: 'rgba(10,132,255,.10)', boxShadow: 'inset 0 0 0 2px rgba(10,132,255,.9)' });
-  el('div', 'ui', stg.drop, { left: '96px', top: '8px', font: '600 15px Geist', color: '#0a84ff' }).textContent = 'New Tab';
-  el('div', 'ui', stg.drop, { left: '74px', top: '4px', font: '500 21px Geist', color: '#0a84ff' }).textContent = '+';
-  el('div', 'ui', bar, { left: px(M.w - 44), top: '58px', font: '400 26px Geist', color: '#8e8e93' }).textContent = '+';
-  // start page
-  const page = el('div', 'abs', stg.mac, { left: '0px', top: '99px', width: px(M.w), height: px(M.h - 99) });
-  el('div', 'ui', page, { left: '64px', top: '48px', font: '700 22px Geist', color: '#1d1d1f', letterSpacing: '-0.01em' }).textContent = 'Favorites';
-  const fav = [['#1d1d1f', 'c'], ['#c8553d', 'A'], ['#2f5d8a', 'M'], ['#6f7d5c', 'P'], ['#b08a4a', 'D'], ['#7b6a8f', 'S']];
-  fav.forEach(([c, l], i) => {
-    const t = el('div', 'abs', page, { left: px(64 + i * 112), top: '96px', width: '76px', height: '76px', borderRadius: '18px', background: c });
-    el('div', 'ui', t, { left: '0px', width: '76px', top: '18px', textAlign: 'center', font: '700 32px Geist', color: '#fff' }).textContent = l;
-    el('div', 'abs', page, { left: px(64 + i * 112 + 8), top: '184px', width: '60px', height: '10px', borderRadius: '5px', background: '#dedbd4' });
-  });
-  el('div', 'ui', page, { left: '64px', top: '242px', font: '700 22px Geist', color: '#1d1d1f', letterSpacing: '-0.01em' }).textContent = 'Frequently Visited';
-  for (let i = 0; i < 4; i++) {
-    el('div', 'abs', page, { left: px(64 + i * 172), top: '290px', width: '152px', height: '112px', borderRadius: '14px', background: '#e7e4dd' });
-    el('div', 'abs', page, { left: px(64 + i * 172), top: '414px', width: '110px', height: '10px', borderRadius: '5px', background: '#dedbd4' });
-  }
+  // island goo group: island, droplet, the black shape that becomes the blind
+  stg.winShadow = el('div', 'abs', root);
+  stg.mac = el('div', 'clip', root, { left: px(MAC.x), top: px(MAC.y), width: px(MAC.w), height: px(MAC.h), borderRadius: '24px', background: '#f7f6f3' });
+  buildSafari();
+  stg.gooBox = el('div', 'abs', root, { width: '1600px', height: '1200px' });
+  stg.goo = new Goo(0, 0, 1600, 1200, 10);
+  stg.island = el('div', 'abs', stg.gooBox, { background: '#000', borderRadius: '18px' });
+  stg.blob = el('div', 'abs', stg.gooBox, { background: '#0b0b0c' });
+  stg.roll = el('div', 'abs', root, { background: 'linear-gradient(180deg,#303034,#0b0b0c 45%,#1e1e21 80%,#0b0b0c)', borderRadius: '7px' });
   // the lifted wallpaper card
-  stg.card = el('div', 'abs', root, { borderRadius: '30px', overflow: 'hidden', boxShadow: '0 30px 60px rgba(20,14,6,.32), 0 6px 14px rgba(20,14,6,.2)', transformOrigin: '50% 12%' });
+  stg.card = el('div', 'clip', root, { transformOrigin: '50% 12%' });
   stg.cardImg = photoImg('hero', stg.card);
+  buildOrder();
+}
+function buildSafari() {
+  const M = MAC, mac = stg.mac;
+  const bar = el('div', 'abs', mac, { width: px(M.w), height: '98px', background: '#fbfbfa', borderBottom: '1px solid rgba(0,0,0,.08)' });
+  ['#ff5f57', '#febc2e', '#28c840'].forEach((c, i) => el('div', 'abs', bar, { left: px(22 + i * 22), top: '22px', width: '13px', height: '13px', borderRadius: '50%', background: c, boxShadow: 'inset 0 0 0 .5px rgba(0,0,0,.12)' }));
+  svgEl(bar, 60, 20, `<path d="M10 3 L3 10 L10 17 M36 3 L43 10 L36 17" stroke="#8e8e93" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>`, { left: '112px', top: '19px' });
+  const addr = el('div', 'abs', bar, { left: px(M.w / 2 - 190), top: '12px', width: '380px', height: '34px', borderRadius: '17px', background: 'rgba(0,0,0,.055)' });
+  stg.addrMask = el('div', 'clip', addr, { left: '0px', top: '5px', width: '380px', height: '24px' });
+  stg.addr0 = txt(stg.addrMask, 'Search or enter website name', { left: '0px', width: '380px', top: '3px', textAlign: 'center', font: '500 15px Geist', color: '#8a8a8e' });
+  stg.addr1 = txt(stg.addrMask, 'constrivo.com', { left: '0px', width: '380px', top: '3px', textAlign: 'center', font: '500 15px Geist', color: '#1d1d1f' });
+  const tab1 = el('div', 'abs', bar, { left: '14px', top: '56px', width: '230px', height: '34px', borderRadius: '10px', background: '#fff', boxShadow: '0 1px 2px rgba(0,0,0,.08), 0 0 0 .5px rgba(0,0,0,.06)' });
+  txt(tab1, 'Start Page', { left: '44px', top: '8px', font: '500 15px Geist', color: '#1d1d1f' });
+  el('div', 'abs', tab1, { left: '16px', top: '9px', width: '16px', height: '16px', borderRadius: '5px', background: '#d9d6cf' });
+  // drop slot that becomes the new tab
+  stg.slot = el('div', 'clip', bar, { left: '252px', top: '56px', height: '34px', borderRadius: '10px', background: 'rgba(10,132,255,.10)', boxShadow: 'inset 0 0 0 2px rgba(10,132,255,.9)' });
+  stg.slotTxt = el('div', 'abs', stg.slot, { width: '230px', height: '34px' });
+  txt(stg.slotTxt, 'New Tab', { left: '96px', top: '8px', font: '600 15px Geist', color: '#0a84ff' });
+  txt(stg.slotTxt, '+', { left: '74px', top: '4px', font: '500 21px Geist', color: '#0a84ff' });
+  stg.slotFill = el('div', 'abs', stg.slot, { height: '34px', background: '#fff' });
+  stg.tab2Mask = el('div', 'clip', stg.slot, { left: '0px', top: '0px', width: '230px', height: '34px' });
+  stg.tab2 = el('div', 'abs', stg.tab2Mask, { width: '230px', height: '34px' });
+  el('div', 'abs', stg.tab2, { left: '16px', top: '9px', width: '16px', height: '16px', borderRadius: '5px', background: '#0b0b0c' });
+  txt(stg.tab2, 'constrivo', { left: '44px', top: '8px', font: '500 15px Geist', color: '#1d1d1f' });
+  txt(bar, '+', { left: px(M.w - 44), top: '58px', font: '400 26px Geist', color: '#8e8e93' });
+  // content area with the two pages that push
+  stg.pageArea = el('div', 'clip', mac, { left: '0px', top: '99px', width: px(M.w), height: px(M.h - 99) });
+  const sp = stg.startPage = el('div', 'abs', stg.pageArea, { width: px(M.w), height: px(M.h - 99), background: '#f7f6f3' });
+  txt(sp, 'Favorites', { left: '64px', top: '48px', font: '700 22px Geist', color: '#1d1d1f', letterSpacing: '-0.01em' });
+  [['#1d1d1f', 'c'], ['#c8553d', 'A'], ['#2f5d8a', 'M'], ['#6f7d5c', 'P'], ['#b08a4a', 'D'], ['#7b6a8f', 'S']].forEach(([c, l], i) => {
+    const t = el('div', 'abs', sp, { left: px(64 + i * 112), top: '96px', width: '76px', height: '76px', borderRadius: '18px', background: c });
+    txt(t, l, { left: '0px', width: '76px', top: '18px', textAlign: 'center', font: '700 32px Geist', color: '#fff' });
+    el('div', 'abs', sp, { left: px(64 + i * 112 + 8), top: '184px', width: '60px', height: '10px', borderRadius: '5px', background: '#dedbd4' });
+  });
+  txt(sp, 'Frequently Visited', { left: '64px', top: '242px', font: '700 22px Geist', color: '#1d1d1f', letterSpacing: '-0.01em' });
+  for (let i = 0; i < 4; i++) {
+    el('div', 'abs', sp, { left: px(64 + i * 172), top: '290px', width: '152px', height: '112px', borderRadius: '14px', background: '#e7e4dd' });
+    el('div', 'abs', sp, { left: px(64 + i * 172), top: '414px', width: '110px', height: '10px', borderRadius: '5px', background: '#dedbd4' });
+  }
+  // landing page
+  const lp = stg.landing = el('div', 'abs', stg.pageArea, { width: px(M.w), height: px(M.h - 99), background: '#f7f6f3' });
+  stg.scrollBox = el('div', 'abs', lp, { width: px(M.w), height: '1000px' });
+  const sc = stg.scrollBox;
+  stg.heroSlot = el('div', 'abs', sc, { left: '32px', top: '72px', width: '736px', height: '300px', borderRadius: '18px', background: '#ebe7df', boxShadow: 'inset 0 0 0 1.5px #d6d0c5' });
+  txt(stg.heroSlot, 'Drop a photo', { left: '0px', width: '736px', top: '138px', textAlign: 'center', font: '500 15px Geist', color: '#8a857c' });
+  txt(sc, 'Make it real.', { left: '32px', top: '392px', font: '800 40px Archivo', fontStretch: '125%', color: '#0b0b0c' });
+  txt(sc, 'Museum-grade prints of your photos, framed by hand.', { left: '32px', top: '446px', font: '500 16px Geist', color: '#6b665e' });
+  el('div', 'abs', sc, { left: '32px', top: '516px', width: '372px', height: '380px', borderRadius: '16px', background: '#e9e4db' });
+  const col = 436, top = 516;
+  txt(sc, 'FRAMED PRINT', { left: px(col), top: px(top + 18), font: '600 12px Geist', letterSpacing: '0.12em', color: '#8a857c' });
+  txt(sc, 'Fins, No. 1', { left: px(col), top: px(top + 38), font: '800 30px Archivo', fontStretch: '125%', color: '#0b0b0c' });
+  txt(sc, '€89', { left: px(col), top: px(top + 84), font: '600 20px Geist', color: '#0b0b0c' });
+  txt(sc, 'Frame', { left: px(col), top: px(top + 132), font: '600 13px Geist', color: '#6b665e' });
+  stg.swatches = [['#a47c55', 'Oak'], ['#111112', 'Black'], ['#f3f1ec', 'White']].map(([c], i) => {
+    const s = el('div', 'abs', sc, { left: px(col + i * 40), top: px(top + 156), width: '28px', height: '28px', borderRadius: '50%', background: c, boxShadow: 'inset 0 0 0 1px rgba(0,0,0,.14)' });
+    return { x: col + i * 40 + 14, y: top + 170 };
+  });
+  stg.ring = el('div', 'abs', sc, { width: '38px', height: '38px', borderRadius: '50%', boxShadow: 'inset 0 0 0 2px #0b0b0c' });
+  txt(sc, 'Size', { left: px(col), top: px(top + 206), font: '600 13px Geist', color: '#6b665e' });
+  const sizes = ['30 × 40', '50 × 70', '70 × 100'];
+  stg.chips = sizes.map((s, i) => ({ x: col + i * 96, y: top + 230, w: 86, h: 34 }));
+  stg.chips.forEach((c, i) => {
+    el('div', 'abs', sc, { left: px(c.x), top: px(c.y), width: px(c.w), height: px(c.h), borderRadius: '17px', boxShadow: 'inset 0 0 0 1.5px #cfc9be' });
+    txt(sc, sizes[i], { left: px(c.x), width: px(c.w), top: px(c.y + 8), textAlign: 'center', font: '600 14px Geist', color: '#1d1d1f' });
+  });
+  stg.chipSel = el('div', 'clip', sc, { borderRadius: '17px', background: '#0b0b0c' });
+  stg.chipSelTxt = el('div', 'abs', stg.chipSel);
+  stg.chips.forEach((c, i) => txt(stg.chipSelTxt, sizes[i], { left: px(c.x), width: px(c.w), top: px(c.y + 8), textAlign: 'center', font: '600 14px Geist', color: '#fff' }));
+  stg.orderSlot = { x: col, y: top + 300, w: 332, h: 48 };
+  // nav (sticky)
+  const nav = el('div', 'abs', lp, { width: px(M.w), height: '56px', background: '#f7f6f3', borderBottom: '1px solid rgba(0,0,0,.06)' });
+  txt(nav, 'constrivo.', { left: '32px', top: '15px', font: '800 21px Archivo', fontStretch: '125%', color: '#0b0b0c' });
+  ['Prints', 'Frames', 'Studio'].forEach((s, i) => txt(nav, s, { left: px(318 + i * 70), top: '19px', font: '500 14px Geist', color: '#6b665e' }));
+  // the print that the hero becomes (lives in the content area, above the scrolling page)
+  stg.print = el('div', 'abs', stg.pageArea);
+  stg.mold = el('div', 'abs', stg.print, { background: 'linear-gradient(135deg,#b88f63,#8e6843 60%,#a47c55)', boxShadow: '0 10px 18px rgba(46,38,26,.22)' });
+  stg.moldBlack = el('div', 'abs', stg.mold, { width: '100%', height: '100%', background: 'linear-gradient(135deg,#2a2a2c,#0b0b0c 60%,#1a1a1c)' });
+  stg.matEl = el('div', 'abs', stg.print, { background: '#f7f5f0', boxShadow: 'inset 0 1px 3px rgba(0,0,0,.18)' });
+  stg.hero = el('div', 'clip', stg.print);
+  stg.heroIn = el('div', 'abs', stg.hero);       // undoes the clip's own offset (snapped together with it)
+  stg.heroImg = photoImg('hero', stg.heroIn);
+  // Buy button (in the page; becomes Order print)
+  stg.buy = el('div', 'clip', lp, { background: '#0b0b0c' });
+  stg.buyTxt0 = el('div', 'clip', stg.buy); txt(stg.buyTxt0, 'Buy', { left: '0px', top: '0px', width: '100%', textAlign: 'center', font: '600 14px Geist', color: '#fff' });
+  stg.buyTxt1 = el('div', 'clip', stg.buy); txt(stg.buyTxt1, 'Order print', { left: '0px', top: '0px', width: '100%', textAlign: 'center', font: '600 17px Geist', color: '#fff' });
+}
+// ---------------------------------------------------------------------------
+// ORDER: one black shape keeps morphing
+// ---------------------------------------------------------------------------
+const order = {};
+const OC = { x: 980, y: 640 };
+function buildOrder() {
+  const root = stg.root;
+  order.shape = el('div', 'clip', root, { background: '#0b0b0c' });
+  const mk = (w, h) => { const m = el('div', 'clip', order.shape, { width: px(w), height: px(h) }); const inner = el('div', 'abs', m, { width: px(w), height: px(h) }); return { m, inner, w, h }; };
+  order.s0 = mk(332, 30); txt(order.s0.inner, 'Order print', { left: '0px', top: '4px', width: '332px', textAlign: 'center', font: '600 17px Geist', color: '#fff' });
+  order.s1 = mk(300, 60);
+  order.check1 = svgEl(order.s1.inner, 52, 52, `<circle cx="26" cy="26" r="22" fill="none" stroke="#fff" stroke-width="3.5"/><path d="M15 27 L23 35 L38 18" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1"/>`, { left: '8px', top: '4px' });
+  txt(order.s1.inner, 'Ordered', { left: '80px', top: '4px', font: '600 42px Geist', color: '#fff', letterSpacing: '-0.015em' });
+  order.s2 = mk(380, 60);
+  txt(order.s2.inner, 'Printing', { left: '0px', top: '4px', font: '600 42px Geist', color: '#fff', letterSpacing: '-0.015em' });
+  order.pct = txt(order.s2.inner, '0%', { left: '260px', width: '120px', top: '4px', textAlign: 'right', font: '600 42px Geist', color: 'rgba(255,255,255,.62)', letterSpacing: '-0.015em' });
+  order.pct.classList.add('num');
+  order.bar = el('div', 'abs', order.shape, { height: '5px', borderRadius: '3px', background: '#fff' });
+  order.barTrack = el('div', 'abs', order.shape, { height: '5px', borderRadius: '3px', background: 'rgba(255,255,255,.18)' });
+  order.s3 = mk(460, 44);
+  txt(order.s3.inner, 'On its way', { left: '0px', top: '2px', font: '600 34px Geist', color: '#fff', letterSpacing: '-0.015em' });
+  order.route = svgEl(order.shape, 460, 70, `<path id="rt" d="M14 50 C 120 50, 150 12, 240 22 S 380 58, 446 30" fill="none" stroke="rgba(255,255,255,.22)" stroke-width="4" stroke-linecap="round" stroke-dasharray="2 10"/><path d="M14 50 C 120 50, 150 12, 240 22 S 380 58, 446 30" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1" class="rp"/><circle cx="14" cy="50" r="7" fill="#fff"/><path d="M446 14 C 438 14 434 20 434 25 C 434 33 446 44 446 44 C 446 44 458 33 458 25 C 458 20 454 14 446 14 Z" fill="#fff"/><circle cx="446" cy="25" r="4" fill="#0b0b0c"/>`);
+  order.routePath = order.route.querySelector('#rt');
+  order.routeProg = order.route.querySelector('.rp');
+  order.van = svgEl(order.shape, 46, 28, `<path d="M2 4 H27 V22 H2 Z" fill="#fff"/><path d="M27 9 H36 L43 16 V22 H27 Z" fill="#fff"/><path d="M30 11 H35 L39 15.5 H30 Z" fill="#0b0b0c"/><circle cx="11" cy="23" r="4.5" fill="#fff" stroke="#0b0b0c" stroke-width="2.5"/><circle cx="35" cy="23" r="4.5" fill="#fff" stroke="#0b0b0c" stroke-width="2.5"/>`, { transformOrigin: '23px 14px' });
+  order.s4 = mk(220, 150);
+  order.check4 = svgEl(order.s4.inner, 84, 84, `<path d="M14 44 L34 64 L70 22" fill="none" stroke="#fff" stroke-width="8" stroke-linecap="round" stroke-linejoin="round" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1"/>`, { left: '68px', top: '0px' });
+  txt(order.s4.inner, 'Delivered', { left: '0px', width: '220px', top: '98px', textAlign: 'center', font: '600 30px Geist', color: '#fff', letterSpacing: '-0.01em' });
 }
 function updateStage(t) {
-  const S = stg.screenBox;
-  stg.clock.forEach(({ g, x }) => g.set(x, 300, 1, 1));
-  // lifted card follows the cursor from the phone to the tab
-  const start = [PH.x + PH.w / 2, PH.y + PH.h / 2];
-  const tab = [MAC.x + 252 + 60, MAC.y + 73];
-  const cx = track(t, start[0], [[ST.drag, tab[0], { w: 6.4, z: 1 }]]);
-  const cy = track(t, start[1], [[ST.drag, tab[1], { w: 6.6, z: 1 }]]);
-  const lift = spring(t - ST.press, SP.pop);
-  const shrink = spring(t - ST.drag - 0.25, SP.ui);           // the preview tightens once it leaves the phone
-  const cw = lerp(lerp(S.w, 176, clamp(lift)), 132, shrink), chh = cw * S.h / S.w;
-  const hang = lerp(0.12, 0, shrink);
-  box(stg.card, cx - cw * lerp(0.5, 0.18, shrink), cy - chh * hang + lerp(0, 26, shrink), cw, chh);
-  stg.card.style.transform = `rotate(${lerp(0, -4, clamp(lift))}deg)`;
-  placeCover(stg.cardImg, 'hero', 0, 0, cw, chh);
-  show(stg.card, t >= ST.press);
-  const hover = inv(ST.drag + 0.45, ST.drag + 0.62, t);
-  stg.drop.style.opacity = hover;
-  return { cam: [742, 700, 1.07], cursor: [cx - 4, cy - 2, pressAmt(t, [[ST.press - 0.05, ST.drop]]), true] };
+  const bz = 15 * spring(t - T.phone, SP_BEZEL);
+  const bk = clamp(bz / 15, 0, 1.2);
+  // phone body
+  show(stg.body, bz > 0.02);
+  box(stg.body, S.x - bz, S.y - bz, S.w + 2 * bz, S.h + 2 * bz);
+  stg.body.style.borderRadius = px(S.r + bz);
+  stg.body.style.boxShadow = `0 ${40 * bk}px ${70 * bk}px rgba(30,22,10,${.22 * clamp(bk)}), 0 ${6 * bk}px ${14 * bk}px rgba(30,22,10,.18)`;
+  box(stg.bodyIn, bz * 0.2, bz * 0.2, S.w + 1.6 * bz, S.h + 1.6 * bz);
+  stg.bodyIn.style.borderRadius = px(S.r + bz * 0.8);
+  // date + glass clock
+  stg.date.style.transform = `translateY(${riseY(t, 30, T.date)}px)`;
+  stg.clock.forEach(({ g: gg, x }, i) => gg.set(x, 300, spring(t - (T.lock + 0.14 + i * 0.06), SP.pop)));
+  // home bar stretches into the glass music player
+  const PL = stg.PL;
+  const pk = spring(t - (T.pullback + 0.1), { w: 13, z: 0.72 });
+  const pw = lerp(136, PL.w, pk), ph = lerp(5, PL.h, pk);
+  const pcx = lerp(S.w / 2, PL.x + PL.w / 2, pk), pcy = lerp(S.h - 19.5, PL.y + PL.h / 2, pk);
+  stg.player.set({ x: pcx - pw / 2, y: pcy - ph / 2, w: pw, h: ph, r: lerp(2.5, 34, clamp(pk)) });
+  const thin = clamp(5 / Math.max(5, ph));
+  stg.player.tint.style.background = `linear-gradient(rgba(255,255,255,${0.9 * thin}), rgba(255,255,255,${0.9 * thin})), linear-gradient(rgba(38,34,30,${0.34 * (1 - thin)}), rgba(38,34,30,${0.42 * (1 - thin)}))`;
+  const ap = spring(t - (T.pullback + 0.28), SP.pop);
+  show(stg.art, ap > 0.003);
+  cbox(stg.art, PL.x + 48, PL.y + 48, 64 * ap, 64 * ap, 14 * ap);
+  placeCover(stg.artImg, 'golden', 0, 0, 64 * ap, 64 * ap, 1.6);
+  stg.ptitle.style.transform = `translateY(${riseY(t, 28, T.pullback + 0.34)}px)`;
+  stg.psub.style.transform = `translateY(${riseY(t, 22, T.pullback + 0.4)}px)`;
+  const cs = spring(t - (T.pullback + 0.38), SP.pop);
+  show(stg.ctl, cs > 0.003); stg.ctl.style.transform = `scale(${cs})`;
+  // island: liquid stretch, pinch-off, flight, window, blind
+  const inIsland = t < T.island - 0.05;
+  show(stg.islandIn, inIsland);
+  const s1 = spring(t - T.island, { w: 11, z: 0.7 }), s2 = spring(t - T.pinch, { w: 12, z: 0.8 });
+  const ix = S.x + S.w / 2 - 62, iy = S.y + 18;
+  const iw = 124 + 150 * s1 - 150 * s2;
+  show(stg.island, !inIsland);
+  box(stg.island, ix, iy, iw, 36);
+  const rad0 = 18 + 12 * clamp(s1, 0, 1.2);
+  const sx0 = ix + 124 + 150 * s1 - rad0, sy0 = iy + 18;
+  const fx1 = spring(t - T.pinch, { w: 7.5, z: 0.95 }), fy1 = spring(t - T.pinch, { w: 10, z: 0.7 });
+  const MC = { x: MAC.x + MAC.w / 2, y: MAC.y + MAC.h / 2 };
+  const bx = lerp(sx0, MC.x, fx1), by = lerp(sy0, MC.y, fy1);
+  const gw = spring(t - T.window, { w: 16, z: 0.8 });
+  let W = lerp(2 * rad0, MAC.w, gw), Hh = lerp(2 * rad0, MAC.h, gw), R = lerp(rad0, 24, gw);
+  let top = by - Hh / 2;
+  const bl = spring(t - T.blind, { w: 10, z: 1 });
+  if (t > T.blind) { top = MAC.y; Hh = MAC.h * (1 - bl); }
+  show(stg.blob, !inIsland && Hh > 0.3);
+  box(stg.blob, bx - W / 2, top, W, Hh);
+  stg.blob.style.borderRadius = px(Math.min(R, W / 2, Math.max(Hh, 0) / 2));
+  stg.goo.apply(stg.gooBox, inv(T.island - 0.02, T.island + 0.1, t) - inv(T.pinch + 0.42, T.pinch + 0.62, t));
+  // the rolled-up part of the blind
+  const rollOn = t > T.blind && Hh > 0.3;
+  show(stg.roll, rollOn);
+  const rh = Math.min(14, Hh);
+  box(stg.roll, MAC.x - 4, MAC.y + Hh - rh / 2, MAC.w + 8, rh);
+  // window shadow follows the black shape, then belongs to the window
+  const shOn = t > T.pinch;
+  show(stg.winShadow, shOn);
+  const sk = clamp(Math.min(W, 800) / 800);
+  const shH = t > T.blind ? MAC.h : Hh;
+  box(stg.winShadow, bx - W / 2, t > T.blind ? MAC.y : top, W, shH);
+  stg.winShadow.style.borderRadius = px(Math.min(R, W / 2, shH / 2));
+  stg.winShadow.style.boxShadow = `0 ${40 * sk}px ${80 * sk}px rgba(30,22,10,.20), 0 ${8 * sk}px ${18 * sk}px rgba(30,22,10,.12)`;
+  show(stg.mac, t > T.blind - 0.02);
+  updateSafari(t);
+}
+function updateSafari(t) {
+  // lifted card
+  const cur = cursorAt;
+  const lift = spring(t - T.lift, SP.pop);
+  const shrink = spring(t - T.dragCard - 0.25, SP.ui);
+  const cardDrag = tt => {
+    const [cx, cy] = cur(tt);
+    const lf = spring(tt - T.lift, SP.pop), sh = spring(tt - T.dragCard - 0.25, SP.ui);
+    const lp = clamp(lf);
+    const home = { x: S.x + S.w / 2, y: S.y + S.h / 2 };
+    const ax = lerp(home.x, cx, clamp(spring(tt - T.dragCard, SP.crit) * 1.02)), ay = lerp(home.y, cy, clamp(spring(tt - T.dragCard, SP.crit) * 1.02));
+    const w = lerp(lerp(S.w, 176, clamp(lf, 0, 1.25)), 132, sh), h = w * S.h / S.w;
+    return { x: ax - w * lerp(0.5, 0.18, sh), y: ay - h * lerp(0.5, 0, sh) + lerp(0, 26, sh), w, h, rot: lerp(0, -4, lp), r: lerp(S.r, 30, lp) * lerp(1, 0.75, sh) };
+  };
+  let c = cardDrag(Math.min(t, T.dropCard));
+  const q = spring(t - T.dropCard, { w: 15, z: 0.82 });
+  const slotR = { x: PAGE.x + 32, y: PAGE.y + 56 + 72, w: 736, h: 300 };
+  c = { x: lerp(c.x, slotR.x, q), y: lerp(c.y, slotR.y, q), w: lerp(c.w, slotR.w, q), h: lerp(c.h, slotR.h, q), rot: lerp(c.rot, 0, q), r: lerp(c.r, 18, q) };
+  const cardOn = t >= T.lift && t < T.cardSwap;
+  show(stg.card, cardOn);
+  box(stg.card, c.x, c.y, c.w, c.h);
+  stg.card.style.borderRadius = px(c.r);
+  stg.card.style.transform = `rotate(${c.rot}deg)`;
+  const ck = clamp(lift) * (1 - q);
+  stg.card.style.boxShadow = `0 ${30 * ck}px ${60 * ck}px rgba(20,14,6,.32), 0 ${6 * ck}px ${14 * ck}px rgba(20,14,6,.2)`;
+  placeCover(stg.cardImg, 'hero', 0, 0, c.w, c.h);
+  // drop slot grows in the tab bar, then becomes the new tab
+  const sg = spring(t - T.tabHover, SP.pop);
+  show(stg.slot, sg > 0.003);
+  stg.slot.style.width = px(230 * clamp(sg, 0, 1.15));
+  const fillP = spring(t - T.push, { w: 16, z: 1 });
+  box(stg.slotFill, 0, 0, 230 * fillP, 34);
+  stg.tab2.style.transform = `translateY(${riseY(t, 34, T.push + 0.08)}px)`;
+  show(stg.tab2Mask, t > T.push);
+  stg.addr0.style.transform = `translateY(${riseY(t, 24, null, T.push)}px)`;
+  stg.addr1.style.transform = `translateY(${riseY(t, 24, T.push + 0.06)}px)`;
+  // pages push
+  const p = spring(t - T.push, { w: 13, z: 1 });
+  stg.startPage.style.transform = `translateX(${-MAC.w * 0.3 * p}px)`;
+  stg.landing.style.transform = `translateX(${MAC.w * (1 - p)}px)`;
+  show(stg.landing, t > T.push);
+  // scroll
+  const sc = spring(t - T.scroll, { w: 11, z: 1 }) * SCROLL;
+  stg.scrollBox.style.top = px(56 - sc);
+  // hero -> framed print (page-area coordinates)
+  const m = spring(t - (T.scroll + 0.05), { w: 12, z: 0.85 });
+  const grow = 1 + 0.1 * spring(t - T.size, { w: 18, z: 0.72 });
+  const pc = { x: 32 + 186, y: 56 + 516 - SCROLL + 190 };
+  const pw = 150 * grow, phh = 188 * grow;
+  const from = { x: 32, y: 56 + 72 - sc, w: 736, h: 300 };
+  const H = { x: lerp(from.x, pc.x - pw / 2, m), y: lerp(from.y, pc.y - phh / 2, m), w: lerp(from.w, pw, m), h: lerp(from.h, phh, m) };
+  show(stg.print, t >= T.cardSwap);
+  box(stg.hero, H.x, H.y, H.w, H.h);
+  stg.hero.style.borderRadius = px(lerp(18, 0, clamp(m)));
+  stg.heroIn.style.left = px(-H.x); stg.heroIn.style.top = px(-H.y);
+  placeCover(stg.heroImg, 'hero', H.x, H.y, H.w, H.h);
+  const matW = 20 * grow * spring(t - T.mat, { w: 16, z: 0.7 });
+  const moldW = 12 * grow * spring(t - T.molding, SP.pop);
+  box(stg.matEl, H.x - matW, H.y - matW, H.w + 2 * matW, H.h + 2 * matW);
+  show(stg.matEl, matW > 0.05);
+  box(stg.mold, H.x - matW - moldW, H.y - matW - moldW, H.w + 2 * (matW + moldW), H.h + 2 * (matW + moldW));
+  show(stg.mold, moldW > 0.05);
+  const paint = spring(t - (T.color + 0.04), { w: 12, z: 1 });
+  stg.moldBlack.style.clipPath = `inset(0 ${100 * (1 - paint)}% 0 0)`;
+  // swatch ring and size selection slide
+  const sw = stg.swatches;
+  const rx = track(t, sw[0].x, [[T.color, sw[1].x, SP.ui]]);
+  cbox(stg.ring, rx, sw[0].y, 38, 38);
+  const ch = stg.chips;
+  const selX = track(t, ch[0].x, [[T.size, ch[1].x, SP.ui]]);
+  box(stg.chipSel, selX, ch[0].y, ch[0].w, ch[0].h);
+  stg.chipSelTxt.style.left = px(-selX); stg.chipSelTxt.style.top = px(-ch[0].y);
+  // the nav button flies down into "Order print"
+  const os = stg.orderSlot;
+  const fxk = spring(t - T.buyFly, { w: 10, z: 0.9 }), fyk = spring(t - T.buyFly, { w: 13, z: 0.78 }), fwk = spring(t - T.buyFly - 0.05, { w: 14, z: 0.75 });
+  const bw = lerp(68, os.w, fwk), bh = lerp(32, os.h, fwk);
+  const bcx = lerp(700 + 34, os.x + os.w / 2, fxk), bcy = lerp(12 + 16, 56 + os.y - SCROLL + os.h / 2, fyk);
+  cbox(stg.buy, bcx, bcy, bw, bh, bh / 2);
+  show(stg.buy, t < T.ordered);
+  box(stg.buyTxt0, 0, bh / 2 - 10, bw, 20);
+  box(stg.buyTxt1, 0, bh / 2 - 12, bw, 24);
+  stg.buyTxt0.firstChild.style.transform = `translateY(${riseY(t, 20, null, T.buyFly + 0.1)}px)`;
+  stg.buyTxt1.firstChild.style.transform = `translateY(${riseY(t, 24, T.buyFly + 0.22)}px)`;
+  stg.buyStage = { x: PAGE.x + bcx, y: PAGE.y + bcy, w: bw, h: bh };
+  updateOrder(t);
+}
+function updateOrder(t) {
+  const on = t >= T.ordered;
+  show(order.shape, on);
+  if (!on) return;
+  const b0 = stg.buyStage;
+  const SPO = { w: 14, z: 0.78 };
+  const cx = track(t, b0.x, [[T.ordered, OC.x, SPO]]);
+  const cy = track(t, b0.y, [[T.ordered, OC.y, SPO], [T.way, OC.y - 10, SPO], [T.delivered, OC.y, SPO]]);
+  const flood = spring(t - T.flood1, { w: 16, z: 1 });
+  let w = track(t, b0.w, [[T.ordered, 460, SPO], [T.way, 560, SPO], [T.delivered, 250, SPO]]);
+  let h = track(t, b0.h, [[T.ordered, 140, SPO], [T.way, 210, SPO], [T.delivered, 250, SPO]]);
+  let r = track(t, b0.h / 2, [[T.ordered, 70, SPO], [T.way, 48, SPO], [T.delivered, 125, SPO]]);
+  w += flood * 1700; h += flood * 1700; r += flood * 850;
+  cbox(order.shape, cx, cy, w, h, r);
+  const place = (s, dx, dy) => { s.m.style.left = px(w / 2 + dx - s.w / 2); s.m.style.top = px(h / 2 + dy - s.h / 2); };
+  place(order.s0, 0, 0);
+  order.s0.inner.style.transform = `translateY(${riseY(t, 30, null, T.ordered)}px)`;
+  place(order.s1, 0, 0);
+  order.s1.inner.style.transform = `translateY(${riseY(t, 60, T.ordered + 0.1, T.printing)}px)`;
+  order.check1.lastChild.setAttribute('stroke-dashoffset', 1 - clamp(spring(t - (T.ordered + 0.2), { w: 14, z: 1 })));
+  place(order.s2, 0, -10);
+  order.s2.inner.style.transform = `translateY(${riseY(t, 60, T.printing + 0.06, T.way)}px)`;
+  const pc = clamp(inv(T.printing + 0.1, T.printing + 0.46, t));
+  order.pct.textContent = Math.round(pc * 100) + '%';
+  const barOn = t > T.printing && t < T.way + 0.12;
+  const bshr = spring(t - T.way, SP.firm);
+  const bwid = 380 * (1 - bshr);
+  show(order.bar, barOn); show(order.barTrack, barOn);
+  box(order.barTrack, w / 2 - bwid / 2, h / 2 + 40, bwid, 5);
+  box(order.bar, w / 2 - bwid / 2, h / 2 + 40, bwid * pc * spring(t - T.printing - 0.08, { w: 20, z: 1 }), 5);
+  place(order.s3, -40, -62);
+  order.s3.inner.style.transform = `translateY(${riseY(t, 44, T.way + 0.06, T.delivered)}px)`;
+  const rOn = t > T.way && t < T.delivered + 0.2;
+  const rk = spring(t - (T.way + 0.04), { w: 14, z: 0.9 }) * (1 - spring(t - T.delivered, SP.firm));
+  show(order.route, rOn && rk > 0.003); show(order.van, rOn && rk > 0.003);
+  order.route.style.left = px(w / 2 - 230); order.route.style.top = px(h / 2 - 12);
+  order.route.style.transform = `scale(${rk})`; order.route.style.transformOrigin = '230px 35px';
+  const vp = clamp(inv(T.way + 0.1, T.way + 0.45, t));
+  const ve = vp * vp * (3 - 2 * vp);
+  order.routeProg.setAttribute('stroke-dashoffset', 1 - ve);
+  const L = order.routePath.getTotalLength(), pt = order.routePath.getPointAtLength(ve * L), pt2 = order.routePath.getPointAtLength(Math.min(L, ve * L + 1));
+  const ang = Math.atan2(pt2.y - pt.y, pt2.x - pt.x) * 180 / Math.PI;
+  order.van.style.left = px(w / 2 - 230 + pt.x - 23); order.van.style.top = px(h / 2 - 12 + pt.y - 26);
+  order.van.style.transform = `rotate(${ang * 0.6}deg) scale(${rk})`;
+  place(order.s4, 0, 0);
+  order.s4.inner.style.transform = `translateY(${riseY(t, 150, T.delivered + 0.05, T.flood1)}px)`;
+  order.check4.firstChild.setAttribute('stroke-dashoffset', 1 - clamp(spring(t - (T.delivered + 0.16), { w: 14, z: 1 })));
 }
 
 // ============================================================================
 // SCENE 6 - WALL: the framed print on the real wall (all-intra footage)
 // ============================================================================
-const WL = { start: b(45), clip0: 1.6 };
 const PR = { cx: 720, cy: 612, w: 520, h: 660, mold: 24, mat: 60 };
 const wall = {};
 async function loadWall() {
-  const blob = await (await fetch('assets/video/wall-intra.webm')).blob();
+  const blob = await (await fetch('assets/video/wall-intra60.webm')).blob();
   const v = document.createElement('video');
   v.muted = true; v.preload = 'auto'; v.playsInline = true;
   v.src = URL.createObjectURL(blob);
@@ -760,26 +1224,17 @@ async function loadWall() {
 function buildWall() {
   const root = el('div', 'scene', world); wall.root = root;
   wall.canvas = el('canvas', 'abs', root); wall.canvas.width = 1440; wall.canvas.height = 1440;
-  const P = PR;
-  const x = P.cx - P.w / 2, y = P.cy - P.h / 2;
-  wall.frame = el('div', 'abs', root, { left: px(x), top: px(y), width: px(P.w), height: px(P.h),
-    background: 'linear-gradient(135deg,#232325,#101011 55%,#1b1b1d)',
-    boxShadow: '0 30px 44px rgba(46,38,26,.30), 0 8px 12px rgba(46,38,26,.22), 0 1px 2px rgba(46,38,26,.3), inset 0 0 0 1px rgba(255,255,255,.07)' });
-  wall.mat = el('div', 'abs', wall.frame, { left: px(P.mold), top: px(P.mold), width: px(P.w - 2 * P.mold), height: px(P.h - 2 * P.mold), background: '#f7f5f0',
-    boxShadow: 'inset 0 2px 5px rgba(0,0,0,.28), inset 0 0 0 1px rgba(0,0,0,.18)' });
-  const iw = P.w - 2 * (P.mold + P.mat), ih = P.h - 2 * (P.mold + P.mat);
-  wall.win = el('div', 'abs', wall.mat, { left: px(P.mat), top: px(P.mat), width: px(iw), height: px(ih), overflow: 'hidden', background: '#0b0b0c',
-    boxShadow: '0 0 0 1px rgba(0,0,0,.06)' });
-  wall.photo = photoImg('hero', wall.win); placeCover(wall.photo, 'hero', 0, 0, iw, ih);
-  wall.iris = new Iris(wall.win);
-  wall.bevel = el('div', 'abs', wall.mat, { left: px(P.mat - 3), top: px(P.mat - 3), width: px(iw + 6), height: px(ih + 6), boxShadow: 'inset 0 0 0 3px #fbfaf6, inset 0 0 0 4px rgba(0,0,0,.08)' });
-  wall.win.style.zIndex = 1;
-  // the plant shadow falls across the print too: multiply the (levelled) footage over it
-  wall.over = el('canvas', 'abs', root, { mixBlendMode: 'multiply', left: px(x), top: px(y) });
-  wall.over.width = P.w; wall.over.height = P.h;
-  wall.winSize = { w: iw, h: ih };
+  wall.frame = el('div', 'abs', root, { background: '#0b0b0c' });
+  wall.mat = el('div', 'abs', wall.frame, { background: '#f7f5f0', boxShadow: 'inset 0 2px 5px rgba(0,0,0,.28), inset 0 0 0 1px rgba(0,0,0,.18)', overflow: 'hidden' });
+  wall.win = el('div', 'clip', wall.mat);
+  wall.photo = photoImg('hero', wall.win);
+  wall.bevel = el('div', 'abs', wall.mat, { boxShadow: 'inset 0 0 0 3px #fbfaf6, inset 0 0 0 4px rgba(0,0,0,.08)' });
+  // the plant shadow falls on the mat and photo too (under the blades, so black stays black)
+  wall.over = el('canvas', 'abs', wall.mat, { mixBlendMode: 'multiply' });
+  wall.over.width = PR.w - 2 * PR.mold; wall.over.height = PR.h - 2 * PR.mold;
+  wall.iris = new Iris(wall.mat, true);
 }
-function wallLevel() {                  // brightness that maps the bare wall to white
+function wallLevel() {
   const c = document.createElement('canvas'); c.width = 64; c.height = 64;
   const ctx = c.getContext('2d'); ctx.drawImage(wall.video, 0, 0, 1800, 600, 0, 0, 64, 64);
   const d = ctx.getImageData(0, 0, 64, 64).data; let s = 0;
@@ -792,50 +1247,141 @@ async function seekVideo(v, time) {
   await new Promise(res => { v.onseeked = () => res(); v.currentTime = tt; });
 }
 async function updateWall(t) {
-  const ft = WL.clip0 + (t - WL.start);
-  await seekVideo(wall.video, ft);
+  await seekVideo(wall.video, 1.2 + (t - T.seg2));
   const ctx = wall.canvas.getContext('2d');
   ctx.drawImage(wall.video, 0, 0, 1440, 1440);
-  const P = PR, x = P.cx - P.w / 2, y = P.cy - P.h / 2, k = 1440 / 1800;
+  const P = PR;
+  // the black flood contracts into the frame, and later floods out of it
+  const SPC = { w: 15, z: 0.9 }, SPF = { w: 16, z: 1 };
+  const w = track(t, 3000, [[T.contract, P.w, SPC], [T.flood2, 3300, SPF]]);
+  const h = track(t, 3000, [[T.contract, P.h, SPC], [T.flood2, 3300, SPF]]);
+  const r = track(t, 1500, [[T.contract, 0, SPC]]);
+  cbox(wall.frame, P.cx, P.cy, w, h, r);
+  const sk = clamp(1 - (Math.max(w, h) - P.h) / 800);
+  wall.frame.style.boxShadow = sk > 0 ? `0 ${30 * sk}px ${44 * sk}px rgba(46,38,26,${.30 * sk}), 0 ${8 * sk}px ${12 * sk}px rgba(46,38,26,${.22 * sk}), 0 1px 2px rgba(46,38,26,${.3 * sk})` : 'none';
+  const inner = t >= T.contract + 0.5;
+  show(wall.mat, inner);
+  const mw = w - 2 * P.mold, mh = h - 2 * P.mold;
+  box(wall.mat, P.mold, P.mold, mw, mh);
+  const iw = mw - 2 * P.mat, ih = mh - 2 * P.mat;
+  box(wall.win, P.mat, P.mat, iw, ih); placeCover(wall.photo, 'hero', 0, 0, iw, ih);
+  box(wall.bevel, P.mat - 3, P.mat - 3, iw + 6, ih + 6);
+  const a1 = Math.hypot(mw, mh) / 2 / Math.cos(Math.PI / 6) * 1.08;
+  const aMax = Math.hypot(P.w - 2 * P.mold, P.h - 2 * P.mold) / 2 / Math.cos(Math.PI / 6) * 1.08;
+  const a = track(t, 0, [[T.wallIris, aMax, SP.snap], [T.wallClose, 0, { w: 22, z: 0.92 }]]);
+  wall.iris.set(mw, mh, a, 0.26 + 1.25 * (1 - clamp(a / aMax)), clamp(a / aMax));
+  // the plant shadow falls across the print too: multiply the levelled footage over the mat
+  const k = 1440 / 1800, OW = wall.over.width, OH = wall.over.height;
+  const x = P.cx - w / 2 + P.mold, y = P.cy - h / 2 + P.mold;
+  box(wall.over, 0, 0, mw, mh);
   const o = wall.over.getContext('2d');
-  o.clearRect(0, 0, P.w, P.h);
+  o.clearRect(0, 0, OW, OH);
   o.filter = `brightness(${wall.lev}) contrast(1.08)`;
-  // the frame stands off the wall, so its shadow lands a little lower and to the left
-  const sx = (x + 10) / k, sy = (y - 14) / k;
-  o.drawImage(wall.video, sx, sy, P.w / k, P.h / k, 0, 0, P.w, P.h);
+  o.drawImage(wall.video, (x + 10) / k, (y - 14) / k, mw / k, mh / k, 0, 0, OW, OH);
   o.filter = 'none';
-  const ws = wall.winSize;
-  const a1 = Math.hypot(ws.w, ws.h) / 2 / Math.cos(Math.PI / 6) * 1.08;
-  const a = track(t, 0, [[b(46), a1, SP.snap], [b(48), 0, { w: 22, z: 0.92 }]]);
-  wall.iris.set(ws.w, ws.h, a, 0.26 + 1.25 * (1 - clamp(a / a1)));
-  return { cam: [720, 720, 1], cursor: [0, 0, 0, false] };
+}
+
+// ============================================================================
+// camera and cursor: one continuous track per segment; segments meet under a full black flood
+// ============================================================================
+const FR = {};
+function Wp(fr, x, y) { return [fr.ox + fr.k * x, fr.oy + fr.k * y]; }
+function Wc(fr, x, y, s) { const [a, c] = Wp(fr, x, y); return [a, c, s / fr.k]; }
+let CAM, CUR;
+function buildTracks() {
+  const d = open.dot, bc = open.bento.day, tc = open.tc;
+  FR.world = { ox: 0, oy: 0, k: 1 };
+  FR.glass = { ox: bc.x, oy: bc.y, k: bc.w / 1440 };
+  FR.stage = { ox: FR.glass.ox + FR.glass.k * A.x, oy: FR.glass.oy + FR.glass.k * A.y, k: FR.glass.k * KS };
+  const G = (x, y, s) => Wc(FR.glass, x, y, s), St = (x, y, s) => Wc(FR.stage, x, y, s);
+  CAM = [
+    { t0: 0, c0: [720, 720, 1], keys: [
+      [T.squeeze, [d.cx, d.cy, 1.22], SP.cam],
+      [T.irisClose, [d.cx, d.cy, 1.6], SP.soft],
+      [T.shrink, [d.cx, d.cy, 1.42], SP.soft],
+      [T.plus, [d.cx, d.cy, 1.27], SP.soft],
+      [T.drop - 0.46, [tc.x, tc.y, 1440 / bc.w], landing(0.75, 0.46)],
+      [T.bar, G(720, 1030, 1.4), { w: 7, z: 1 }],
+      [T.slider, G(720, 720, 1), { w: 7, z: 1 }],
+      [T.pullback, G(720, LOCK.y + LOCK.h / 2, 1320 / LOCK.h), { w: 6.5, z: 1 }],
+      [T.phone, St(298, 724, 1.3), { w: 6.5, z: 1 }],
+      [T.pinch, St(742, 700, 1.07), { w: 5.5, z: 1 }],
+      [T.dropCard, St(MAC.x + MAC.w / 2, MAC.y + MAC.h / 2 + 10, 1.62), { w: 6, z: 1 }],
+      [T.ordered, St(OC.x, OC.y, 1.95), { w: 7, z: 1 }],
+      [T.way, St(OC.x, OC.y - 8, 1.75), { w: 8, z: 1 }],
+    ] },
+    { t0: T.seg2, c0: [720, 720, 1], keys: [[T.pushIn, [720, 650, 1.07], { w: 4, z: 1 }]] },
+    { t0: T.seg3, c0: [d.cx, d.cy, 1.22], keys: [[T.letters - 0.55, [720, 720, 1], { w: 8.5, z: 1 }]] },
+  ];
+  const sl = SL, slotC = [PAGE.x + 400, PAGE.y + 56 + 72 + 150];
+  const sw = stg.swatches[1], chip = stg.chips[1], os = stg.orderSlot;
+  const pg = (x, y) => [PAGE.x + x, PAGE.y + 56 + y - SCROLL];
+  CUR = [
+    { t0: 0, fr: FR.world, base: 1, p0: [d.cx + 700, d.cy + 560], press: [[T.irisClose - 0.05, T.irisClose + 0.1], [T.tileClick - 0.05, T.tileClick + 0.06]], keys: [
+      [b(2.6), [d.cx + 150, d.cy + 34], { w: 7.5, z: 1 }, { w: 9, z: 1 }],
+      [T.irisOpen + 0.25, [d.cx + 330, d.cy + 300], { w: 6, z: 1 }],
+      [b(8.8), [tc.x + 60, tc.y + 50], { w: 6.5, z: 1 }, { w: 7.5, z: 1 }],
+      [T.tileClick + 0.12, [tc.x + 520, tc.y + 560], { w: 5, z: 1 }],
+    ] },
+    { t0: 6.3, fr: FR.glass, base: FR.glass.k, p0: [1680, 1560], press: [[T.adjust - 0.03, T.adjust + 0.08], [T.press - 0.02, T.release]], keys: [
+      [T.bar - 0.15, [720 - 59 + 4, GL.barY + 8], { w: 7, z: 1 }, { w: 8, z: 1 }],
+      [T.adjust + 0.25, [sl.t0 + 4, GL.barY + 6], { w: 7, z: 1 }],
+      [T.drag, [sl.t1 + 4, GL.barY + 6], SP.drag],
+      [T.release + 0.12, [1700, 1520], { w: 6, z: 1 }],
+    ] },
+    { t0: 11.2, fr: FR.stage, base: FR.stage.k, p0: [1700, 980], press: [[T.longpress, T.dropCard], [T.color - 0.03, T.color + 0.07], [T.size - 0.03, T.size + 0.07], [T.ordered - 0.03, T.ordered + 0.08]], keys: [
+      [T.longpress - 0.52, [S.x + S.w / 2, S.y + S.h / 2 + 40], { w: 7, z: 1 }],
+      [T.dragCard, [MAC.x + 312, MAC.y + 73], { w: 6.6, z: 1 }],
+      [T.push + 0.1, slotC, { w: 8, z: 1 }],
+      [T.scroll - 0.1, [slotC[0] + 20, slotC[1] + 30], { w: 9, z: 1 }],
+      [T.color - 0.55, pg(sw.x, sw.y), { w: 8, z: 1 }],
+      [T.size - 0.4, pg(chip.x + chip.w / 2, chip.y + chip.h / 2), { w: 8, z: 1 }],
+      [T.buyFly + 0.1, pg(os.x + os.w / 2 + 40, os.y + os.h / 2 + 4), { w: 7, z: 1 }],
+      [T.ordered + 0.18, [1560, 1150], { w: 5, z: 1 }],
+    ] },
+    { t0: T.seg2, fr: FR.world, base: 1, p0: [1700, 1650], press: [[T.wallIris - 0.03, T.wallIris + 0.07]], keys: [
+      [T.contract + 0.1, [790, 700], { w: 7, z: 1 }],
+      [T.wallIris + 0.2, [1700, 1500], { w: 4.5, z: 1 }],
+    ] },
+  ];
+}
+function camAt(t) {
+  let seg = CAM[0]; for (const s of CAM) if (t >= s.t0) seg = s;
+  return camTrack(t, seg.c0, seg.keys);
+}
+let curSeg = null;
+function cursorAt(t) {                  // in the current segment's own units
+  let seg = CUR[0]; for (const s of CUR) if (t >= s.t0) seg = s;
+  curSeg = seg;
+  return track2(t, seg.p0, seg.keys);
 }
 
 // ============================================================================
 // seek(t): every style is computed from time; nothing carries over between frames
 // ============================================================================
-const SCENES = [
-  { name: 'open',  t0: 0,     t1: 6,     root: () => open.root,  update: updateOpen },
-  { name: 'glass', t0: 6,     t1: 13,    root: () => glass.root, update: updateGlass },
-  { name: 'stage', t0: 13,    t1: 20,    root: () => stg.root,   update: updateStage },
-  { name: 'wall',  t0: 22,    t1: 24.5,  root: () => wall.root,  update: updateWall },
-];
 async function seek(t) {
+  t = clamp(t, 0, DURATION);
   pending = [];
-  let out = { cam: [720, 720, 1], cursor: [0, 0, 0, false] };
-  for (const s of SCENES) {
-    const on = t >= s.t0 && t < s.t1;
-    show(s.root(), on);
-    if (on) out = await s.update(t);
-  }
-  const [cx, cy, cs] = out.cam;
+  const openOn = t < 6.4 || t >= T.seg3;
+  const glassOn = t >= T.drop && t < T.seg2;
+  const wallOn = t >= T.seg2 && t < T.seg3;
+  show(open.root, openOn);
+  show(glass.root, glassOn);
+  show(wall.root, wallOn);
+  if (openOn) updateOpen(t);
+  if (glassOn) { updateGlass(t); updateStage(t); }
+  if (wallOn) await updateWall(t);
+  let [cx, cy, cs] = camAt(t);
+  if (Math.abs(cs - 1) < 1e-4 && Math.abs(cx - 720) < 0.02 && Math.abs(cy - 720) < 0.02) { cx = 720; cy = 720; cs = 1; }
   setCamera(cx, cy, cs);
-  const [ux, uy, up, uv] = out.cursor;
-  setCursor(ux, uy, up, uv);
+  const p = cursorAt(t), seg = curSeg;
+  const [wx, wy] = Wp(seg.fr, p[0], p[1]);
+  setCursor(wx, wy, pressAmt(t, seg.press), seg.base);
   await Promise.all(pending);
   await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
 }
 window.seek = seek;
+window.T = T;
 
 window.filmReady = (async () => {
   await Promise.all([document.fonts.load('800 170px Archivo'), document.fonts.load('600 20px Geist'), document.fonts.load('800 150px Geist')]);
@@ -845,10 +1391,10 @@ window.filmReady = (async () => {
   buildGlass();
   buildStage();
   buildWall();
+  buildTracks();
   world.appendChild(cursor);
   wall.lev = wallLevel();
-  const glyphs = stg.clock.map(c => c.g.ready);
-  await Promise.all(glyphs);
+  await Promise.all([...stg.clock.map(c => c.g.ready), ...glass.letters.map(l => l.g.ready)]);
   await seek(0);
 })();
 </script>
